@@ -4,6 +4,9 @@ function now() {
   return new Date().toLocaleString('sv').replace('T', ' ');
 }
 
+const withId = doc => doc ? { ...doc, id: doc._id } : doc;
+const withIds = arr => arr.map(withId);
+
 async function recalcularPagos(subrubroId) {
   const iid = Number(subrubroId);
   const movs = await Movimiento.find({ subrubro_id: iid }).lean();
@@ -55,11 +58,11 @@ async function recalcularPagos(subrubroId) {
 const db = {
   // --- LOCALES ---
   async getLocales() {
-    return Local.find().sort({ nombre: 1 }).lean();
+    return withIds(await Local.find().sort({ nombre: 1 }).lean());
   },
   async createLocal(nombre, icon = '🏠') {
     const id = await Counter.next('locales');
-    return Local.create({ _id: id, nombre, icon, created_at: now() });
+    return withId((await Local.create({ _id: id, nombre, icon, created_at: now() })).toObject());
   },
   async updateLocal(id, nombre, icon) {
     const upd = {};
@@ -85,13 +88,13 @@ const db = {
   // --- RUBROS ---
   async getRubros(localId) {
     const filter = localId !== undefined ? { local_id: Number(localId) } : {};
-    return Rubro.find(filter).sort({ nombre: 1 }).lean();
+    return withIds(await Rubro.find(filter).sort({ nombre: 1 }).lean());
   },
   async createRubro(nombre, localId) {
     const existing = await Rubro.findOne({ local_id: Number(localId), nombre: { $regex: new RegExp(`^${nombre}$`, 'i') } });
     if (existing) throw new Error('El rubro ya existe en este local');
     const id = await Counter.next('rubros');
-    return Rubro.create({ _id: id, nombre, local_id: Number(localId), created_at: now() });
+    return withId((await Rubro.create({ _id: id, nombre, local_id: Number(localId), created_at: now() })).toObject());
   },
   async updateRubro(id, nombre, icon) {
     const upd = {};
@@ -126,11 +129,11 @@ const db = {
 
   // --- CAMPOS ---
   async getCampos(rubroId) {
-    return Campo.find({ rubro_id: Number(rubroId) }).sort({ orden: 1 }).lean();
+    return withIds(await Campo.find({ rubro_id: Number(rubroId) }).sort({ orden: 1 }).lean());
   },
   async createCampo(rubroId, nombre, tipo = 'texto', orden = 0) {
     const id = await Counter.next('campos_rubro');
-    return Campo.create({ _id: id, rubro_id: Number(rubroId), nombre, tipo, orden: Number(orden) });
+    return withId((await Campo.create({ _id: id, rubro_id: Number(rubroId), nombre, tipo, orden: Number(orden) })).toObject());
   },
   async updateCampo(id, nombre, tipo, orden) {
     const upd = { nombre, tipo };
@@ -143,11 +146,11 @@ const db = {
 
   // --- CATEGORIAS ---
   async getCategorias(rubroId) {
-    return Categoria.find({ rubro_id: Number(rubroId) }).lean();
+    return withIds(await Categoria.find({ rubro_id: Number(rubroId) }).lean());
   },
   async createCategoria(rubroId, nombre, operacion, tipo_calculo = 'fijo', porcentaje_default = null) {
     const id = await Counter.next('categorias_movimiento');
-    return Categoria.create({ _id: id, rubro_id: Number(rubroId), nombre, operacion, tipo_calculo, porcentaje_default: porcentaje_default ? Number(porcentaje_default) : null });
+    return withId((await Categoria.create({ _id: id, rubro_id: Number(rubroId), nombre, operacion, tipo_calculo, porcentaje_default: porcentaje_default ? Number(porcentaje_default) : null })).toObject());
   },
   async updateCategoria(id, nombre, operacion, tipo_calculo = 'fijo', porcentaje_default = null) {
     await Categoria.findByIdAndUpdate(Number(id), { nombre, operacion, tipo_calculo, porcentaje_default: porcentaje_default ? Number(porcentaje_default) : null });
@@ -158,11 +161,11 @@ const db = {
 
   // --- SUBRUBROS ---
   async getSubrubros(rubroId) {
-    return Subrubro.find({ rubro_id: Number(rubroId) }).sort({ nombre: 1 }).lean();
+    return withIds(await Subrubro.find({ rubro_id: Number(rubroId) }).sort({ nombre: 1 }).lean());
   },
   async createSubrubro(rubroId, nombre, montoBase = 0) {
     const id = await Counter.next('subrubros');
-    return Subrubro.create({ _id: id, rubro_id: Number(rubroId), nombre, monto_base: Number(montoBase), created_at: now() });
+    return withId((await Subrubro.create({ _id: id, rubro_id: Number(rubroId), nombre, monto_base: Number(montoBase), created_at: now() })).toObject());
   },
   async updateSubrubro(id, nombre, montoBase, icon) {
     const upd = {};
@@ -188,12 +191,12 @@ const db = {
       filter.fecha = { $regex: `^${prefix}` };
     }
     const movs = await Movimiento.find(filter).lean();
-    return movs.sort((a, b) => {
+    return withIds(movs.sort((a, b) => {
       if (!a.fecha && !b.fecha) return a._id - b._id;
       if (!a.fecha) return 1;
       if (!b.fecha) return -1;
       return a.fecha.localeCompare(b.fecha) || a._id - b._id;
-    });
+    }));
   },
 
   async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '' }) {
@@ -210,7 +213,7 @@ const db = {
       _ajuste_pago_id: null, created_at: now()
     });
     await recalcularPagos(subrubroId);
-    return Movimiento.findById(id).lean();
+    return withId(await Movimiento.findById(id).lean());
   },
 
   async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '' }) {
@@ -225,7 +228,7 @@ const db = {
     if (concepto !== undefined) mov.concepto = concepto;
     await mov.save();
     await recalcularPagos(mov.subrubro_id);
-    return mov.toObject();
+    return withId(mov.toObject());
   },
 
   async deleteMovimiento(id) {
@@ -284,7 +287,7 @@ const db = {
     }
 
     await recalcularPagos(subrubroId);
-    return Movimiento.findById(id).lean();
+    return withId(await Movimiento.findById(id).lean());
   },
 
   async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {} }) {
@@ -315,7 +318,7 @@ const db = {
     }
 
     await recalcularPagos(mov.subrubro_id);
-    return mov.toObject();
+    return withId(mov.toObject());
   },
 
   async getSaldoTotal(subrubroId) {
