@@ -108,6 +108,7 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
     const mapping = JSON.parse(req.body.mapping || '{}');
     const mode = req.body.mode || 'skip_duplicates';
     const sheetsFilter = req.body.sheets ? new Set(JSON.parse(req.body.sheets)) : null;
+    const skipRows = Number(req.body.skipRows) || 0;
 
     const roleCols = {};
     const montoCols = [];
@@ -137,8 +138,8 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
     const subrubroIdsAfectados = new Set();
 
     for (const sheetName of workbook.SheetNames.filter(n => !sheetsFilter || sheetsFilter.has(n))) {
-      const sheet = workbook.Sheets[sheetName];
-      const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: null })
+      const sheet = expandirCeldasFusionadas(workbook.Sheets[sheetName]);
+      const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: null, range: skipRows })
         .map(row => Object.fromEntries(Object.entries(row).map(([k, v]) => [k.toLowerCase().trim(), v])));
       const rows = inferirAniosSheet(rawRows, roleCols.fecha || []);
 
@@ -213,6 +214,22 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
 });
 
 // --- Helpers ---
+function expandirCeldasFusionadas(sheet) {
+  const merges = sheet['!merges'] || [];
+  for (const merge of merges) {
+    const origen = XLSX.utils.encode_cell(merge.s);
+    const valorOrigen = sheet[origen];
+    if (!valorOrigen) continue;
+    for (let r = merge.s.r; r <= merge.e.r; r++) {
+      for (let c = merge.s.c; c <= merge.e.c; c++) {
+        const celda = XLSX.utils.encode_cell({ r, c });
+        if (!sheet[celda]) sheet[celda] = { ...valorOrigen };
+      }
+    }
+  }
+  return sheet;
+}
+
 function toStr(val) {
   if (val === null || val === undefined) return null;
   const s = String(val).trim();
