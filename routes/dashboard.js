@@ -88,4 +88,38 @@ router.get('/tendencia/:rubroId', asyncHandler(async (req, res) => {
   res.json({ tendencia });
 }));
 
+// Tendencia mensual de un subrubro específico (últimos N meses)
+router.get('/tendencia-subrubro/:subrubroId', asyncHandler(async (req, res) => {
+  const subrubroId = Number(req.params.subrubroId);
+  const meses = Math.min(Number(req.query.meses) || 6, 24);
+
+  const tendencia = await Movimiento.aggregate([
+    {
+      $match: {
+        subrubro_id: subrubroId,
+        fecha: { $exists: true, $type: 'string', $ne: '' },
+      }
+    },
+    {
+      $group: {
+        _id: { $substr: ['$fecha', 0, 7] },
+        facturado: { $sum: { $cond: [{ $eq: ['$tipo', 'factura'] }, '$monto', 0] } },
+        pagado: { $sum: '$pago' },
+      }
+    },
+    { $sort: { _id: 1 } },
+    {
+      $project: {
+        _id: 0,
+        mes: '$_id',
+        facturado: 1,
+        pagado: 1,
+        diferencia: { $subtract: ['$facturado', '$pagado'] },
+      }
+    }
+  ]).then(data => data.slice(-meses));
+
+  res.json({ tendencia });
+}));
+
 module.exports = router;
