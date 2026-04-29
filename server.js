@@ -35,6 +35,7 @@ app.use((req, res, next) => {
   }
 });
 
+app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/locales', require('./routes/locales'));
 app.use('/api/rubros', require('./routes/rubros'));
 app.use('/api/campos', require('./routes/campos'));
