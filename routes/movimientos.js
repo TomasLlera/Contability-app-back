@@ -4,47 +4,47 @@ const db = require('../db');
 const XLSX = require('xlsx');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
+const { asyncHandler } = require('../middleware/errorHandler');
 
-router.get('/vencimientos/proximos', async (req, res) => {
-  try {
-    const dias = Number(req.query.dias) || 30;
-    res.json(await db.getVencimientos(dias));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+router.get('/vencimientos/proximos', asyncHandler(async (req, res) => {
+  const dias = Number(req.query.dias) || 30;
+  res.json(await db.getVencimientos(dias));
+}));
 
-router.get('/:subrubroId', async (req, res) => {
-  try {
-    const { anio, mes } = req.query;
-    const movs = await db.getMovimientos(req.params.subrubroId, anio, mes);
-    const sub = await db.getSubrubro(req.params.subrubroId);
-    const saldo_total = await db.getSaldoTotal(req.params.subrubroId);
-    res.json({ movimientos: movs, monto_base: sub?.monto_base ?? 0, saldo_total });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+router.get('/:subrubroId', asyncHandler(async (req, res) => {
+  const { anio, mes } = req.query;
+  const [movs, sub, saldo_total] = await Promise.all([
+    db.getMovimientos(req.params.subrubroId, anio, mes),
+    db.getSubrubro(req.params.subrubroId),
+    db.getSaldoTotal(req.params.subrubroId),
+  ]);
+  res.json({ movimientos: movs, monto_base: sub?.monto_base ?? 0, saldo_total });
+}));
 
-router.post('/:subrubroId', async (req, res) => {
-  try { res.json(await db.createMovimiento(req.params.subrubroId, req.body)); } catch (e) { res.status(400).json({ error: e.message }); }
-});
+router.post('/:subrubroId', asyncHandler(async (req, res) => {
+  res.json(await db.createMovimiento(req.params.subrubroId, req.body));
+}));
 
-router.post('/:subrubroId/pago-vinculado', async (req, res) => {
-  try { res.json(await db.crearPagoVinculado(req.params.subrubroId, req.body)); } catch (e) { res.status(400).json({ error: e.message }); }
-});
+router.post('/:subrubroId/pago-vinculado', asyncHandler(async (req, res) => {
+  res.json(await db.crearPagoVinculado(req.params.subrubroId, req.body));
+}));
 
-router.put('/:id', async (req, res) => {
-  try { res.json(await db.updateMovimiento(req.params.id, req.body)); } catch (e) { res.status(400).json({ error: e.message }); }
-});
+router.put('/:id', asyncHandler(async (req, res) => {
+  res.json(await db.updateMovimiento(req.params.id, req.body));
+}));
 
-router.put('/:id/pago-vinculado', async (req, res) => {
-  try { res.json(await db.actualizarPagoVinculado(req.params.id, req.body)); } catch (e) { res.status(400).json({ error: e.message }); }
-});
+router.put('/:id/pago-vinculado', asyncHandler(async (req, res) => {
+  res.json(await db.actualizarPagoVinculado(req.params.id, req.body));
+}));
 
-router.delete('/:id', async (req, res) => {
-  try { await db.deleteMovimiento(req.params.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
-});
+router.delete('/:id', asyncHandler(async (req, res) => {
+  await db.deleteMovimiento(req.params.id);
+  res.json({ ok: true });
+}));
 
-router.delete('/:subrubroId/movimientos', async (req, res) => {
-  try { res.json(await db.clearMovimientos(req.params.subrubroId)); } catch (e) { res.status(400).json({ error: e.message }); }
-});
+router.delete('/:subrubroId/movimientos', asyncHandler(async (req, res) => {
+  res.json(await db.clearMovimientos(req.params.subrubroId));
+}));
 
 // Export Excel
 router.get('/export/:subrubroId', async (req, res) => {

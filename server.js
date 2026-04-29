@@ -2,11 +2,24 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { errorHandler } = require('./middleware/errorHandler');
 
 const app = express();
+app.use(helmet());
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  message: { error: 'Demasiados intentos. Intentá de nuevo en 15 minutos.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth', require('./routes/auth'));
 
 // JWT middleware — protege todas las rutas siguientes
@@ -36,6 +49,8 @@ if (!MONGODB_URI) {
   console.error('ERROR: MONGODB_URI no está definida en .env');
   process.exit(1);
 }
+
+app.use(errorHandler);
 
 mongoose.connect(MONGODB_URI)
   .then(() => {

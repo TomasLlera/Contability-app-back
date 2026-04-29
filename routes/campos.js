@@ -1,23 +1,26 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const { asyncHandler } = require('../middleware/errorHandler');
 
-router.get('/:rubroId', async (req, res) => {
-  try { res.json(await db.getCampos(req.params.rubroId)); } catch (e) { res.status(500).json({ error: e.message }); }
-});
+router.get('/:rubroId', asyncHandler(async (req, res) => {
+  res.json(await db.getCampos(req.params.rubroId));
+}));
 
-router.post('/:rubroId', async (req, res) => {
+router.post('/:rubroId', asyncHandler(async (req, res) => {
   const { nombre, tipo = 'texto', orden = 0 } = req.body;
-  try { res.json(await db.createCampo(req.params.rubroId, nombre, tipo, orden)); } catch (e) { res.status(400).json({ error: e.message }); }
-});
+  res.json(await db.createCampo(req.params.rubroId, nombre, tipo, orden));
+}));
 
-router.put('/:id', async (req, res) => {
+router.put('/:id', asyncHandler(async (req, res) => {
   const { nombre, tipo, orden } = req.body;
-  try { await db.updateCampo(req.params.id, nombre, tipo, orden); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
-});
+  await db.updateCampo(req.params.id, nombre, tipo, orden);
+  res.json({ ok: true });
+}));
 
-router.delete('/:id', async (req, res) => {
-  try { await db.deleteCampo(req.params.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
-});
+router.delete('/:id', asyncHandler(async (req, res) => {
+  await db.deleteCampo(req.params.id);
+  res.json({ ok: true });
+}));
 
 module.exports = router;
