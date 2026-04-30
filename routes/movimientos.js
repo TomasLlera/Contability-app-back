@@ -156,15 +156,10 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
 
       const { nros: nrosExistentes, fechaMontos: fechaMontoExistentes } = await db.getMovsForDedup(subrubro._id);
 
-      // Resolver fechas: fill-forward luego fill-backward para filas sin fecha
+      // Resolver fechas: fill-forward (si una fila no tiene fecha, hereda la de la fila anterior)
       const fechasResueltas = rows.map(r => parseDate(getCol(r, 'fecha')) ?? null);
       let last = null;
       for (let i = 0; i < fechasResueltas.length; i++) {
-        if (fechasResueltas[i]) last = fechasResueltas[i];
-        else if (last) fechasResueltas[i] = last;
-      }
-      last = null;
-      for (let i = fechasResueltas.length - 1; i >= 0; i--) {
         if (fechasResueltas[i]) last = fechasResueltas[i];
         else if (last) fechasResueltas[i] = last;
       }
