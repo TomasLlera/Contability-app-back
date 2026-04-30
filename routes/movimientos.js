@@ -156,10 +156,24 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
 
       const { nros: nrosExistentes, fechaMontos: fechaMontoExistentes } = await db.getMovsForDedup(subrubro._id);
 
+      // Resolver fechas: fill-forward luego fill-backward para filas sin fecha
+      const fechasResueltas = rows.map(r => parseDate(getCol(r, 'fecha')) ?? null);
+      let last = null;
+      for (let i = 0; i < fechasResueltas.length; i++) {
+        if (fechasResueltas[i]) last = fechasResueltas[i];
+        else if (last) fechasResueltas[i] = last;
+      }
+      last = null;
+      for (let i = fechasResueltas.length - 1; i >= 0; i--) {
+        if (fechasResueltas[i]) last = fechasResueltas[i];
+        else if (last) fechasResueltas[i] = last;
+      }
+
       let created = 0, skipped = 0, duplicates = 0;
 
-      for (const row of rows) {
-        const fecha = parseDate(getCol(row, 'fecha')) ?? null;
+      for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+        const row = rows[rowIdx];
+        const fecha = fechasResueltas[rowIdx];
         const fecha_vencimiento = parseDate(getCol(row, 'fecha_vencimiento'));
         const pago = parseMonto(getCol(row, 'pago')) || 0;
 
@@ -242,8 +256,10 @@ function parseDate(val) {
   const str = String(val).trim();
   if (!str) return null;
   if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.substring(0, 10);
-  const m = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
-  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  const m4 = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (m4) return `${m4[3]}-${m4[2].padStart(2, '0')}-${m4[1].padStart(2, '0')}`;
+  const m2 = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
+  if (m2) return `${2000 + parseInt(m2[3])}-${m2[2].padStart(2, '0')}-${m2[1].padStart(2, '0')}`;
   return null;
 }
 
@@ -254,6 +270,9 @@ function parsePartialDate(val) {
   const s = String(val).trim().toLowerCase();
   const m1 = s.match(/^(\d{1,2})[-\/\s]([a-záéíóú]+)/);
   if (m1) { const month = MESES_ES[m1[2].substring(0, 3)]; if (month) return { day: parseInt(m1[1]), month }; }
+  // DD/MM/YY o DD-MM-YY: ignorar año de 2 dígitos, dejar que inferirAniosSheet asigne el año correcto por contexto
+  const m3 = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-]\d{2}$/);
+  if (m3) return { day: parseInt(m3[1]), month: parseInt(m3[2]) };
   const m2 = s.match(/^(\d{1,2})[-\/](\d{1,2})$/);
   if (m2) return { day: parseInt(m2[1]), month: parseInt(m2[2]) };
   return null;
