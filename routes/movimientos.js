@@ -270,9 +270,6 @@ function parsePartialDate(val) {
   const s = String(val).trim().toLowerCase();
   const m1 = s.match(/^(\d{1,2})[-\/\s]([a-záéíóú]+)/);
   if (m1) { const month = MESES_ES[m1[2].substring(0, 3)]; if (month) return { day: parseInt(m1[1]), month }; }
-  // DD/MM/YY o DD-MM-YY: ignorar año de 2 dígitos, dejar que inferirAniosSheet asigne el año correcto por contexto
-  const m3 = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-]\d{2}$/);
-  if (m3) return { day: parseInt(m3[1]), month: parseInt(m3[2]) };
   const m2 = s.match(/^(\d{1,2})[-\/](\d{1,2})$/);
   if (m2) return { day: parseInt(m2[1]), month: parseInt(m2[2]) };
   return null;
