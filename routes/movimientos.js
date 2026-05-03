@@ -11,6 +11,12 @@ router.get('/vencimientos/proximos', asyncHandler(async (req, res) => {
   res.json(await db.getVencimientos(dias));
 }));
 
+router.get('/search', asyncHandler(async (req, res) => {
+  const { q, limit } = req.query;
+  if (!q || String(q).trim().length < 2) return res.json([]);
+  res.json(await db.searchMovimientos(q, limit));
+}));
+
 router.get('/:subrubroId', asyncHandler(async (req, res) => {
   const { anio, mes } = req.query;
   const [movs, sub, saldo_total] = await Promise.all([

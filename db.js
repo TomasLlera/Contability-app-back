@@ -351,15 +351,15 @@ const db = {
     const subs = await Subrubro.find({ _id: { $in: subIds } }).lean();
     const rubroIds = [...new Set(subs.map(s => s.rubro_id))];
     const rubros = await Rubro.find({ _id: { $in: rubroIds } }).lean();
-    const subMap = Object.fromEntries(subs.map(s => [s._id, s]));
-    const rubroMap = Object.fromEntries(rubros.map(r => [r._id, r]));
+    const subMap = Object.fromEntries(subs.map(s => [s._id, { ...s, id: s._id }]));
+    const rubroMap = Object.fromEntries(rubros.map(r => [r._id, { ...r, id: r._id }]));
     return movs
       .map(m => {
         const venc = new Date(m.fecha_vencimiento + 'T00:00:00');
         const diasRestantes = Math.ceil((venc - hoy) / (1000 * 60 * 60 * 24));
         const sub = subMap[m.subrubro_id];
         const rubro = sub ? rubroMap[sub.rubro_id] : null;
-        return { ...m, subrubro: sub, rubro, dias_restantes: diasRestantes };
+        return { ...m, id: m._id, subrubro: sub, rubro, dias_restantes: diasRestantes };
       })
       .filter(m => m.dias_restantes <= diasAdelante)
       .sort((a, b) => a.fecha_vencimiento.localeCompare(b.fecha_vencimiento));
@@ -397,6 +397,73 @@ const db = {
 
   async recalcularPagosMultiple(subrubroIds) {
     for (const id of subrubroIds) await recalcularPagos(id);
+  },
+
+  async searchMovimientos(q, limit = 25) {
+    const query = String(q).trim();
+    if (query.length < 2) return [];
+    const re = { $regex: query, $options: 'i' };
+    const matchingSubs = await Subrubro.find({ nombre: re }, { _id: 1 }).lean();
+    const matchingSubIds = matchingSubs.map(s => s._id);
+    const camposExtra = [
+      'nro_factura','descripcion','razon_social','proveedor','detalle',
+      'numero','factura','numero_factura','importe','referencia','concepto_extra',
+    ];
+    const movs = await Movimiento.find({
+      $or: [
+        { concepto: re },
+        { subrubro_id: { $in: matchingSubIds } },
+        ...camposExtra.map(k => ({ [`campos_extra.${k}`]: re })),
+      ]
+    })
+    .sort({ fecha: -1 })
+    .limit(Math.min(Number(limit), 50))
+    .lean();
+    if (movs.length === 0) return [];
+    const subIds = [...new Set(movs.map(m => m.subrubro_id))];
+    const subs = await Subrubro.find({ _id: { $in: subIds } }).lean();
+    const rubroIds = [...new Set(subs.map(s => s.rubro_id))];
+    const rubros = await Rubro.find({ _id: { $in: rubroIds } }).lean();
+    const subMap = Object.fromEntries(subs.map(s => [s._id, { ...s, id: s._id }]));
+    const rubroMap = Object.fromEntries(rubros.map(r => [r._id, { ...r, id: r._id }]));
+    return movs.map(m => ({
+      ...m, id: m._id,
+      subrubro: subMap[m.subrubro_id] || null,
+      rubro: subMap[m.subrubro_id] ? rubroMap[subMap[m.subrubro_id].rubro_id] || null : null,
+    }));
+  },
+
+  async getComparacionSubrubros(rubroId) {
+    const subs = await Subrubro.find({ rubro_id: Number(rubroId) }).lean();
+    if (subs.length === 0) return [];
+    const subIds = subs.map(s => s._id);
+    const agg = await Movimiento.aggregate([
+      { $match: { subrubro_id: { $in: subIds } } },
+      {
+        $group: {
+          _id: '$subrubro_id',
+          facturado: { $sum: { $cond: [{ $eq: ['$tipo', 'factura'] }, '$monto', 0] } },
+          pagado: { $sum: '$pago' },
+        }
+      }
+    ]);
+    const aggMap = Object.fromEntries(agg.map(d => [d._id, d]));
+    return subs.map(s => {
+      const facturado = aggMap[s._id]?.facturado ?? 0;
+      const pagado = aggMap[s._id]?.pagado ?? 0;
+      const pendiente = facturado - pagado;
+      const saldo = (s.monto_base || 0) + pendiente;
+      return {
+        id: s._id,
+        nombre: s.nombre,
+        icon: s.icon || null,
+        facturado,
+        pagado,
+        pendiente,
+        saldo,
+        diferencia: pendiente,
+      };
+    }).sort((a, b) => b.saldo - a.saldo);
   },
 };
 

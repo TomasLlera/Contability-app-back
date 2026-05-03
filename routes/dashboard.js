@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { asyncHandler } = require('../middleware/errorHandler');
 const { Movimiento, Subrubro } = require('../models');
+const db = require('../db');
 
 // Mes actual en formato YYYY-MM
 function mesActual() {
@@ -120,6 +121,12 @@ router.get('/tendencia-subrubro/:subrubroId', asyncHandler(async (req, res) => {
   ]).then(data => data.slice(-meses));
 
   res.json({ tendencia });
+}));
+
+// Comparación acumulada de todos los subrubros de un rubro
+router.get('/comparacion/:rubroId', asyncHandler(async (req, res) => {
+  const comparacion = await db.getComparacionSubrubros(req.params.rubroId);
+  res.json({ comparacion });
 }));
 
 module.exports = router;
