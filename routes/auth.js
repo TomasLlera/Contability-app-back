@@ -5,8 +5,8 @@ const router = express.Router();
 
 router.post('/login', async (req, res) => {
   const { usuario, password } = req.body;
-  const userOk = usuario === process.env.ADMIN_USER;
-  const storedPass = process.env.ADMIN_PASSWORD || '';
+  const userOk = usuario?.trim() === (process.env.ADMIN_USER || '').trim();
+  const storedPass = (process.env.ADMIN_PASSWORD || '').trim();
   const passOk = userOk && (
     storedPass.startsWith('$2b$') || storedPass.startsWith('$2a$')
       ? await bcrypt.compare(password, storedPass)
