@@ -4,6 +4,14 @@ function now() {
   return new Date().toLocaleString('sv').replace('T', ' ');
 }
 
+function hoy() {
+  return new Date().toISOString().split('T')[0];
+}
+
+function validarFecha(fecha) {
+  if (fecha && fecha > hoy()) throw new Error(`La fecha ${fecha} no puede ser posterior a hoy`);
+}
+
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;
 const withIds = arr => arr.map(withId);
 
@@ -202,6 +210,7 @@ const db = {
   async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '' }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
+    validarFecha(fecha);
     const tipoFinal = tipo || (Number(monto) > 0 ? 'factura' : 'pago');
     const id = await Counter.next('movimientos');
     await Movimiento.create({
@@ -219,6 +228,7 @@ const db = {
   async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '' }) {
     const mov = await Movimiento.findById(Number(id));
     if (!mov) throw new Error('Movimiento no encontrado');
+    validarFecha(fecha);
     mov.monto = Number(monto) || 0;
     mov.pago = Number(pago) || 0;
     mov.fecha = fecha;
@@ -328,6 +338,34 @@ const db = {
     const camposSuma = new Set(campos.filter(c => c.tipo === 'suma').map(c => c.nombre));
     const camposResta = new Set(campos.filter(c => c.tipo === 'resta').map(c => c.nombre));
     const movs = await Movimiento.find({ subrubro_id: Number(subrubroId) }).lean();
+    let saldo = sub.monto_base || 0;
+    for (const m of movs) {
+      saldo += (m.monto || 0);
+      saldo -= (m.pago || 0);
+      for (const [k, v] of Object.entries(m.campos_extra || {})) {
+        const n = Number(v);
+        if (!isNaN(n) && n !== 0) {
+          if (camposSuma.has(k)) saldo += n;
+          if (camposResta.has(k)) saldo -= n;
+        }
+      }
+    }
+    return saldo;
+  },
+
+  // Saldo acumulado de todos los movimientos ANTERIORES al mes indicado
+  async getSaldoAnterior(subrubroId, anio, mes) {
+    const sub = await Subrubro.findById(Number(subrubroId)).lean();
+    if (!sub) return 0;
+    const campos = await Campo.find({ rubro_id: sub.rubro_id }).lean();
+    const camposSuma = new Set(campos.filter(c => c.tipo === 'suma').map(c => c.nombre));
+    const camposResta = new Set(campos.filter(c => c.tipo === 'resta').map(c => c.nombre));
+    const prefix = `${anio}-${String(mes).padStart(2, '0')}`;
+    // Movimientos anteriores al mes: fecha existe y es menor al primer día del mes
+    const movs = await Movimiento.find({
+      subrubro_id: Number(subrubroId),
+      fecha: { $lt: `${prefix}-01` },
+    }).lean();
     let saldo = sub.monto_base || 0;
     for (const m of movs) {
       saldo += (m.monto || 0);

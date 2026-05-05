@@ -24,7 +24,10 @@ router.get('/:subrubroId', asyncHandler(async (req, res) => {
     db.getSubrubro(req.params.subrubroId),
     db.getSaldoTotal(req.params.subrubroId),
   ]);
-  res.json({ movimientos: movs, monto_base: sub?.monto_base ?? 0, saldo_total });
+  const saldo_anterior = (anio && mes)
+    ? await db.getSaldoAnterior(req.params.subrubroId, anio, mes)
+    : (sub?.monto_base ?? 0);
+  res.json({ movimientos: movs, monto_base: sub?.monto_base ?? 0, saldo_total, saldo_anterior });
 }));
 
 router.post('/:subrubroId', asyncHandler(async (req, res) => {
@@ -55,38 +58,63 @@ router.delete('/:subrubroId/movimientos', asyncHandler(async (req, res) => {
 // Export Excel
 router.get('/export/:subrubroId', async (req, res) => {
   try {
+    const { desde, hasta } = req.query;
     const sub = await db.getSubrubro(req.params.subrubroId);
     if (!sub) return res.status(404).json({ error: 'No encontrado' });
     const rubro = await db.getRubro(sub.rubro_id);
     const campos = rubro ? await db.getCampos(rubro._id) : [];
-    const movs = await db.getMovimientos(req.params.subrubroId);
-    const wb = XLSX.utils.book_new();
+    const camposSuma = new Set(campos.filter(c => c.tipo === 'suma').map(c => c.nombre));
+    const camposResta = new Set(campos.filter(c => c.tipo === 'resta').map(c => c.nombre));
 
+    const todosMovs = await db.getMovimientos(req.params.subrubroId);
+
+    // Saldo acumulado hasta el día anterior a "desde" (punto de partida del running total)
+    let saldoInicial = sub.monto_base || 0;
+    if (desde) {
+      for (const m of todosMovs) {
+        if (!m.fecha || m.fecha >= desde) continue;
+        saldoInicial += (m.monto || 0) - (m.pago || 0);
+        for (const [k, v] of Object.entries(m.campos_extra || {})) {
+          const n = Number(v);
+          if (!isNaN(n) && n !== 0) {
+            if (camposSuma.has(k)) saldoInicial += n;
+            if (camposResta.has(k)) saldoInicial -= n;
+          }
+        }
+      }
+    }
+
+    // Filtrar por rango
+    const movs = todosMovs.filter(m => {
+      if (!m.fecha) return !desde && !hasta;
+      if (desde && m.fecha < desde) return false;
+      if (hasta && m.fecha > hasta) return false;
+      return true;
+    });
+
+    const wb = XLSX.utils.book_new();
     const porMes = {};
     for (const m of movs) {
-      if (!m.fecha) continue;
-      const key = m.fecha.substring(0, 7);
+      const key = m.fecha ? m.fecha.substring(0, 7) : 'Sin fecha';
       if (!porMes[key]) porMes[key] = [];
       porMes[key].push(m);
     }
 
+    let saldoAcum = saldoInicial;
     for (const [mes, movsMes] of Object.entries(porMes).sort()) {
-      let saldoAcum = sub.monto_base || 0;
       const rows = movsMes.map(m => {
-        const camposSuma = new Set(campos.filter(c => c.tipo === 'suma').map(c => c.nombre));
-        const camposResta = new Set(campos.filter(c => c.tipo === 'resta').map(c => c.nombre));
         const extra = m.campos_extra || {};
         let extraEfecto = 0;
         for (const [k, v] of Object.entries(extra)) {
           const n = Number(v);
-          if (!isNaN(n)) {
+          if (!isNaN(n) && n !== 0) {
             if (camposSuma.has(k)) extraEfecto += n;
             if (camposResta.has(k)) extraEfecto -= n;
           }
         }
         saldoAcum += (m.monto || 0) - (m.pago || 0) + extraEfecto;
         const tipoLabel = { factura: 'Factura', pago: 'Pago', nota_credito: 'Nota de Crédito', ajuste: 'Ajuste' }[m.tipo] || m.tipo;
-        const row = { Fecha: m.fecha, Tipo: tipoLabel, Monto: m.monto || '', Pago: m.pago || '', Estado: m.tipo === 'factura' ? (m.pagado ? 'Pagada' : 'Pendiente') : '', Concepto: m.concepto || '', Total: saldoAcum };
+        const row = { Fecha: m.fecha || '', Tipo: tipoLabel, Monto: m.monto || '', Pago: m.pago || '', Estado: m.tipo === 'factura' ? (m.pagado ? 'Pagada' : 'Pendiente') : '', Concepto: m.concepto || '', Total: saldoAcum };
         for (const c of campos) row[c.nombre] = extra[c.nombre] ?? '';
         if (m.fecha_vencimiento) row['Vencimiento'] = m.fecha_vencimiento;
         return row;
@@ -115,6 +143,8 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
     const mode = req.body.mode || 'skip_duplicates';
     const sheetsFilter = req.body.sheets ? new Set(JSON.parse(req.body.sheets)) : null;
     const skipRows = Number(req.body.skipRows) || 0;
+    const fechaDesde = req.body.fechaDesde || null;
+    const fechaHasta = req.body.fechaHasta || null;
 
     const roleCols = {};
     const montoCols = [];
@@ -138,6 +168,7 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
       return null;
     }
 
+    const fechaHoy = new Date().toISOString().split('T')[0];
     const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
     const results = { sheets: [], totalCreated: 0, totalSkipped: 0 };
     const allMovsToInsert = [];
@@ -162,19 +193,20 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
 
       const { nros: nrosExistentes, fechaMontos: fechaMontoExistentes } = await db.getMovsForDedup(subrubro._id);
 
-      // Resolver fechas: fill-forward (si una fila no tiene fecha, hereda la de la fila anterior)
-      const fechasResueltas = rows.map(r => parseDate(getCol(r, 'fecha')) ?? null);
+      // Resolver fechas: fill-forward + corrección de picos atípicos
+      const fechasBase = rows.map(r => parseDate(getCol(r, 'fecha')) ?? null);
       let last = null;
-      for (let i = 0; i < fechasResueltas.length; i++) {
-        if (fechasResueltas[i]) last = fechasResueltas[i];
-        else if (last) fechasResueltas[i] = last;
+      for (let i = 0; i < fechasBase.length; i++) {
+        if (fechasBase[i]) last = fechasBase[i];
+        else if (last) fechasBase[i] = last;
       }
+      const fechasResueltas = corregirPicos(fechasBase);
 
       let created = 0, skipped = 0, duplicates = 0;
 
       for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
         const row = rows[rowIdx];
-        const fecha = fechasResueltas[rowIdx];
+        let fecha = fechasResueltas[rowIdx];
         const fecha_vencimiento = parseDate(getCol(row, 'fecha_vencimiento'));
         const pago = parseMonto(getCol(row, 'pago')) || 0;
 
@@ -189,6 +221,23 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
         }
 
         if (montos.length === 0 && pago === 0) { skipped++; continue; }
+
+        // Fecha futura → corregir restando años hasta que no sea futura
+        if (fecha && fecha > fechaHoy) {
+          const [y, m, d] = fecha.split('-');
+          let yr = parseInt(y);
+          while (yr > 1900 && `${yr}-${m}-${d}` > fechaHoy) yr--;
+          fecha = `${yr}-${m}-${d}`;
+        }
+
+        // Filtro de rango de fechas
+        if (fecha) {
+          if (fechaDesde && fecha < fechaDesde) { skipped++; continue; }
+          if (fechaHasta && fecha > fechaHasta) { skipped++; continue; }
+        } else if (fechaDesde || fechaHasta) {
+          // Sin fecha y hay filtro activo → omitir
+          skipped++; continue;
+        }
 
         if (montos.length > 0) {
           for (const { monto } of montos) {
@@ -257,10 +306,21 @@ function parseDate(val) {
   const str = String(val).trim();
   if (!str) return null;
   if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.substring(0, 10);
+  // DD/MM/AAAA o DD-MM-AAAA
   const m4 = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
   if (m4) return `${m4[3]}-${m4[2].padStart(2, '0')}-${m4[1].padStart(2, '0')}`;
+  // DD/MM/AA o DD-MM-AA (año 2 dígitos)
   const m2 = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
   if (m2) return `${2000 + parseInt(m2[3])}-${m2[2].padStart(2, '0')}-${m2[1].padStart(2, '0')}`;
+  // DD-MON-AAAA o DD-MON-AA  (ej: "15-mar-25", "5/abr/2025")
+  const mMon = str.match(/^(\d{1,2})[-\/\s]([a-záéíóúA-ZÁÉÍÓÚ]+)[-\/\s](\d{2,4})$/);
+  if (mMon) {
+    const month = MESES_ES[mMon[2].toLowerCase().substring(0, 3)];
+    if (month) {
+      const yr = parseInt(mMon[3]);
+      return `${yr < 100 ? 2000 + yr : yr}-${String(month).padStart(2, '0')}-${mMon[1].padStart(2, '0')}`;
+    }
+  }
   return null;
 }
 
@@ -269,8 +329,12 @@ const MESES_ES = { ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,
 function parsePartialDate(val) {
   if (!val || val instanceof Date) return null;
   const s = String(val).trim().toLowerCase();
-  const m1 = s.match(/^(\d{1,2})[-\/\s]([a-záéíóú]+)/);
+  // Primero intentar parseDate: si tiene año completo, no es fecha parcial
+  if (parseDate(val)) return null;
+  // DD-MON sin año: "15-mar", "5/abr"
+  const m1 = s.match(/^(\d{1,2})[-\/\s]([a-záéíóú]+)\s*$/);
   if (m1) { const month = MESES_ES[m1[2].substring(0, 3)]; if (month) return { day: parseInt(m1[1]), month }; }
+  // DD/MM sin año: "15/03" o "15-03"
   const m2 = s.match(/^(\d{1,2})[-\/](\d{1,2})$/);
   if (m2) return { day: parseInt(m2[1]), month: parseInt(m2[2]) };
   return null;
@@ -292,6 +356,12 @@ function inferirAniosSheet(rows, dateCols) {
   if (ultimoIdx === -1) return rows;
 
   let anio = anioActual;
+  // Si asignar el año actual al último registro generaría una fecha futura, retroceder un año
+  const ultimoParcial = parciales[ultimoIdx];
+  if (ultimoParcial) {
+    const tentativa = `${anio}-${String(ultimoParcial.month).padStart(2,'0')}-${String(ultimoParcial.day).padStart(2,'0')}`;
+    if (tentativa > new Date().toISOString().split('T')[0]) anio--;
+  }
   aniosAsignados[ultimoIdx] = anio;
   for (let i = ultimoIdx - 1; i >= 0; i--) {
     if (!parciales[i]) { aniosAsignados[i] = anio; continue; }
@@ -307,6 +377,22 @@ function inferirAniosSheet(rows, dateCols) {
     const y = aniosAsignados[i] ?? anioActual;
     return { ...row, [dateCol]: `${y}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}` };
   });
+}
+
+// Detecta fechas que "saltan adelante" más de 60 días y luego retroceden (pico atípico)
+// Ej: (2025-03, 2025-04, 2026-12, 2025-05) → anula 2026-12
+function corregirPicos(fechas) {
+  const res = [...fechas];
+  for (let i = 0; i < res.length; i++) {
+    if (!res[i]) continue;
+    let prev = null, next = null;
+    for (let j = i - 1; j >= 0; j--) { if (res[j]) { prev = res[j]; break; } }
+    for (let j = i + 1; j < res.length; j++) { if (res[j]) { next = res[j]; break; } }
+    if (!prev || !next) continue;
+    const diasDesdePrev = (new Date(res[i]) - new Date(prev)) / 86400000;
+    if (diasDesdePrev > 60 && res[i] > next) res[i] = null;
+  }
+  return res;
 }
 
 function parseMonto(val) {

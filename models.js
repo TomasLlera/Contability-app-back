@@ -3,12 +3,12 @@ const mongoose = require('mongoose');
 // --- Counter (auto-increment) ---
 const counterSchema = new mongoose.Schema({ _id: String, seq: { type: Number, default: 0 } });
 counterSchema.statics.next = async function (name) {
-  const r = await this.findByIdAndUpdate(name, { $inc: { seq: 1 } }, { new: true, upsert: true });
+  const r = await this.findByIdAndUpdate(name, { $inc: { seq: 1 } }, { returnDocument: 'after', upsert: true });
   return r.seq;
 };
 counterSchema.statics.nextBatch = async function (name, count) {
   if (count === 0) return 1;
-  const r = await this.findByIdAndUpdate(name, { $inc: { seq: count } }, { new: true, upsert: true });
+  const r = await this.findByIdAndUpdate(name, { $inc: { seq: count } }, { returnDocument: 'after', upsert: true });
   return r.seq - count + 1;
 };
 const Counter = mongoose.model('Counter', counterSchema);
