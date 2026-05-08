@@ -14,4 +14,4 @@ API REST para la aplicación de contabilidad. Gestiona locales, rubros, subrubro
 
 ## Frontend
 
-[https://contability-app-front-nhncolmyn-tomaslleras-projects.vercel.app/](https://contability-app-front-nhncolmyn-tomaslleras-projects.vercel.app/)
+[https://contability-app-front.vercel.app/](https://contability-app-front.vercel.app/)
