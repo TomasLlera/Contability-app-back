@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { CajaMovimiento, Counter } = require('../models');
+const { CajaMovimiento, CajaConfig, Counter } = require('../models');
 
 const now = () => new Date().toISOString();
 
@@ -10,6 +10,27 @@ function withId(doc) {
   return { ...o, id: o._id };
 }
 function withIds(docs) { return docs.map(withId); }
+
+// GET /api/caja/config  (antes de /:id para que no colisione)
+router.get('/config', async (req, res) => {
+  try {
+    const cfg = await CajaConfig.findById('main').lean();
+    res.json(cfg || { empleados: [], proveedores: [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/caja/config
+router.put('/config', async (req, res) => {
+  try {
+    const { empleados, proveedores } = req.body;
+    await CajaConfig.findByIdAndUpdate(
+      'main',
+      { $set: { empleados, proveedores } },
+      { upsert: true }
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // GET /api/caja?fecha=YYYY-MM-DD
 router.get('/', async (req, res) => {
@@ -36,13 +57,15 @@ router.get('/rango', async (req, res) => {
 // POST /api/caja
 router.post('/', async (req, res) => {
   try {
-    const { fecha, tipo, concepto, monto, metodo, subrubro_id } = req.body;
+    const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial } = req.body;
     if (!fecha || !tipo || !concepto || !monto) return res.status(400).json({ error: 'Faltan campos' });
     const id = await Counter.next('caja');
     const mov = await CajaMovimiento.create({
       _id: id, fecha, tipo, concepto,
       monto: Number(monto), metodo: metodo || 'efectivo',
-      subrubro_id: subrubro_id || null, created_at: now(),
+      subrubro_id: subrubro_id || null,
+      es_especial: !!es_especial,
+      created_at: now(),
     });
     res.json(withId(mov.toObject()));
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -51,7 +74,7 @@ router.post('/', async (req, res) => {
 // PUT /api/caja/:id
 router.put('/:id', async (req, res) => {
   try {
-    const { fecha, tipo, concepto, monto, metodo, subrubro_id } = req.body;
+    const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial } = req.body;
     const upd = {};
     if (fecha !== undefined) upd.fecha = fecha;
     if (tipo !== undefined) upd.tipo = tipo;
@@ -59,6 +82,7 @@ router.put('/:id', async (req, res) => {
     if (monto !== undefined) upd.monto = Number(monto);
     if (metodo !== undefined) upd.metodo = metodo;
     if (subrubro_id !== undefined) upd.subrubro_id = subrubro_id;
+    if (es_especial !== undefined) upd.es_especial = !!es_especial;
     await CajaMovimiento.findByIdAndUpdate(Number(req.params.id), upd);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }

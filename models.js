@@ -76,6 +76,13 @@ const CajaMovimiento = mongoose.model('CajaMovimiento', new mongoose.Schema({
   created_at: String,
 }));
 
+// --- Caja Config ---
+const CajaConfig = mongoose.model('CajaConfig', new mongoose.Schema({
+  _id: { type: String, default: 'main' },
+  empleados: [{ nombre: String }],
+  proveedores: [{ nombre: String, subrubro_id: { type: Number, default: null } }],
+}));
+
 // --- Import Config ---
 const ImportConfig = mongoose.model('ImportConfig', new mongoose.Schema({
   rubro_id: { type: Number, unique: true },
@@ -84,4 +91,4 @@ const ImportConfig = mongoose.model('ImportConfig', new mongoose.Schema({
   updated_at: String
 }));
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig };
