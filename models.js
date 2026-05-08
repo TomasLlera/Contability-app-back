@@ -67,7 +67,7 @@ const CajaMovimiento = mongoose.model('CajaMovimiento', new mongoose.Schema({
   // ingreso_extra: plata extra que entró (no de empleados)
   // empleado: caja de un empleado
   // gasto: gasto de proveedor u otro
-  tipo: { type: String, enum: ['saldo_inicial', 'ingreso_extra', 'empleado', 'gasto'], default: 'gasto' },
+  tipo: { type: String, enum: ['saldo_inicial', 'saldo_cuenta', 'ingreso_extra', 'empleado', 'gasto'], default: 'gasto' },
   concepto: String,
   monto: { type: Number, default: 0 },
   metodo: { type: String, enum: ['efectivo', 'transferencia'], default: 'efectivo' },
