@@ -59,6 +59,23 @@ const Categoria = mongoose.model('Categoria', new mongoose.Schema({
   porcentaje_default: { type: Number, default: null }
 }));
 
+// --- Caja ---
+const CajaMovimiento = mongoose.model('CajaMovimiento', new mongoose.Schema({
+  _id: Number,
+  fecha: String,
+  // saldo_inicial: saldo del día anterior ingresado manualmente
+  // ingreso_extra: plata extra que entró (no de empleados)
+  // empleado: caja de un empleado
+  // gasto: gasto de proveedor u otro
+  tipo: { type: String, enum: ['saldo_inicial', 'ingreso_extra', 'empleado', 'gasto'], default: 'gasto' },
+  concepto: String,
+  monto: { type: Number, default: 0 },
+  metodo: { type: String, enum: ['efectivo', 'transferencia'], default: 'efectivo' },
+  subrubro_id: { type: Number, default: null },  // link a proveedor/movimiento
+  es_especial: { type: Boolean, default: false }, // para identificar en gráficos
+  created_at: String,
+}));
+
 // --- Import Config ---
 const ImportConfig = mongoose.model('ImportConfig', new mongoose.Schema({
   rubro_id: { type: Number, unique: true },
@@ -67,4 +84,4 @@ const ImportConfig = mongoose.model('ImportConfig', new mongoose.Schema({
   updated_at: String
 }));
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento };
