@@ -384,7 +384,7 @@ const db = {
   async getVencimientos(diasAdelante = 30) {
     const hoy = new Date();
     hoy.setHours(0, 0, 0, 0);
-    const movs = await Movimiento.find({ fecha_vencimiento: { $exists: true, $ne: null }, tipo: 'factura' }).lean();
+    const movs = await Movimiento.find({ fecha_vencimiento: { $exists: true, $ne: null }, tipo: 'factura', pagado: { $ne: true } }).lean();
     const subIds = [...new Set(movs.map(m => m.subrubro_id))];
     const subs = await Subrubro.find({ _id: { $in: subIds } }).lean();
     const rubroIds = [...new Set(subs.map(s => s.rubro_id))];
