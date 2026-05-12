@@ -403,6 +403,21 @@ const db = {
       .sort((a, b) => a.fecha_vencimiento.localeCompare(b.fecha_vencimiento));
   },
 
+  async getVencimientosDia(fecha) {
+    const movs = await Movimiento.find({ fecha_vencimiento: fecha, tipo: 'factura', pagado: { $ne: true } }).lean();
+    const subIds = [...new Set(movs.map(m => m.subrubro_id))];
+    const subs = await Subrubro.find({ _id: { $in: subIds } }).lean();
+    const rubroIds = [...new Set(subs.map(s => s.rubro_id))];
+    const rubros = await Rubro.find({ _id: { $in: rubroIds } }).lean();
+    const subMap = Object.fromEntries(subs.map(s => [s._id, { ...s, id: s._id }]));
+    const rubroMap = Object.fromEntries(rubros.map(r => [r._id, { ...r, id: r._id }]));
+    return movs.map(m => ({
+      ...m, id: m._id,
+      subrubro: subMap[m.subrubro_id],
+      rubro: subMap[m.subrubro_id] ? rubroMap[subMap[m.subrubro_id].rubro_id] : null,
+    }));
+  },
+
   // --- IMPORT BATCH ---
   async findOrCreateSubrubroForImport(rubroId, nombre) {
     const n = nombre.trim();

@@ -11,6 +11,12 @@ router.get('/vencimientos/proximos', asyncHandler(async (req, res) => {
   res.json(await db.getVencimientos(dias));
 }));
 
+router.get('/vencimientos/dia', asyncHandler(async (req, res) => {
+  const { fecha } = req.query;
+  if (!fecha) return res.status(400).json({ error: 'fecha requerida' });
+  res.json(await db.getVencimientosDia(fecha));
+}));
+
 router.get('/search', asyncHandler(async (req, res) => {
   const { q, limit } = req.query;
   if (!q || String(q).trim().length < 2) return res.json([]);
