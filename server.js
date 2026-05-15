@@ -21,7 +21,6 @@ const loginLimiter = rateLimit({
 
 app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth', require('./routes/auth'));
-
 // JWT middleware — protege todas las rutas siguientes
 const jwt = require('jsonwebtoken');
 app.use((req, res, next) => {

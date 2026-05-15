@@ -63,16 +63,14 @@ const Categoria = mongoose.model('Categoria', new mongoose.Schema({
 const CajaMovimiento = mongoose.model('CajaMovimiento', new mongoose.Schema({
   _id: Number,
   fecha: String,
-  // saldo_inicial: saldo del día anterior ingresado manualmente
-  // ingreso_extra: plata extra que entró (no de empleados)
-  // empleado: caja de un empleado
-  // gasto: gasto de proveedor u otro
   tipo: { type: String, enum: ['saldo_inicial', 'saldo_cuenta', 'ingreso_extra', 'empleado', 'gasto'], default: 'gasto' },
   concepto: String,
   monto: { type: Number, default: 0 },
   metodo: { type: String, enum: ['efectivo', 'transferencia'], default: 'efectivo' },
-  subrubro_id: { type: Number, default: null },  // link a proveedor/movimiento
-  es_especial: { type: Boolean, default: false }, // para identificar en gráficos
+  subrubro_id: { type: Number, default: null },
+  movimiento_id: { type: Number, default: null },
+  confirmado: { type: Boolean, default: null }, // null = registro viejo (se trata como confirmado); false = pendiente; true = confirmado
+  es_especial: { type: Boolean, default: false },
   created_at: String,
 }));
 
@@ -81,6 +79,8 @@ const CajaConfig = mongoose.model('CajaConfig', new mongoose.Schema({
   _id: { type: String, default: 'main' },
   empleados: [{ nombre: String }],
   proveedores: [{ nombre: String, subrubro_id: { type: Number, default: null } }],
+  rubros_sync: { type: [Number], default: [] },       // rubros cuyos vencimientos se sincronizan
+  dias_anticipacion_caja: { type: Number, default: 3 }, // días hacia adelante para mostrar vencimientos
 }));
 
 // --- Import Config ---
