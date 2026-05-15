@@ -91,4 +91,12 @@ const ImportConfig = mongoose.model('ImportConfig', new mongoose.Schema({
   updated_at: String
 }));
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig };
+// --- App Config (configuración global de la app) ---
+const AppConfig = mongoose.model('AppConfig', new mongoose.Schema({
+  _id: { type: String, default: 'main' },
+  email_alertas: { type: String, default: '' },
+  alertas_activas: { type: Boolean, default: false },
+  dias_anticipacion: { type: Number, default: 7 },
+}));
+
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig };

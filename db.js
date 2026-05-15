@@ -1,4 +1,4 @@
-const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig } = require('./models');
+const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig } = require('./models');
 
 function now() {
   return new Date().toLocaleString('sv').replace('T', ' ');
@@ -502,6 +502,17 @@ const db = {
         diferencia: pendiente,
       };
     }).sort((a, b) => b.saldo - a.saldo);
+  },
+
+  async getConfig() {
+    let cfg = await AppConfig.findById('main').lean();
+    if (!cfg) cfg = await AppConfig.create({ _id: 'main' }).then(d => d.toObject());
+    return { ...cfg, id: cfg._id };
+  },
+
+  async updateConfig(data) {
+    const cfg = await AppConfig.findByIdAndUpdate('main', { $set: data }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean();
+    return { ...cfg, id: cfg._id };
   },
 };
 

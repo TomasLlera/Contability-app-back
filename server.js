@@ -43,6 +43,7 @@ app.use('/api/categorias', require('./routes/categorias'));
 app.use('/api/subrubros', require('./routes/subrubros'));
 app.use('/api/movimientos', require('./routes/movimientos'));
 app.use('/api/caja', require('./routes/caja'));
+app.use('/api/config', require('./routes/config'));
 
 const PORT = process.env.PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI;
