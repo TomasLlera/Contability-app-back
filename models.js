@@ -129,6 +129,8 @@ const MovimientoStock = mongoose.model('MovimientoStock', new mongoose.Schema({
   producto_id: Number,
   tipo: { type: String, enum: ['entrada', 'salida', 'ajuste'], default: 'entrada' },
   cantidad: Number,
+  precio_costo: { type: Number, default: null },
+  precio_venta: { type: Number, default: null },
   observacion: { type: String, default: '' },
   fecha: String,
   created_at: String,
