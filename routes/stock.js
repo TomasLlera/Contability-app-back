@@ -38,6 +38,33 @@ router.post('/productos', requireAdmin, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// PUT /api/stock/productos/bulk-precio
+router.put('/productos/bulk-precio', requireAdmin, async (req, res, next) => {
+  try {
+    const { ids, campo, tipo, valor } = req.body;
+    if (!ids?.length || !campo || !tipo || valor === undefined) return res.status(400).json({ error: 'Faltan campos' });
+    const v = Number(valor);
+    const productos = await Producto.find({ _id: { $in: ids.map(Number) }, activo: true }).lean();
+
+    const aplicar = (precio) => {
+      if (!precio) return precio;
+      if (tipo === 'porcentaje') return Math.round(precio * (1 + v / 100));
+      if (tipo === 'monto') return Math.round(precio + v);
+      if (tipo === 'fijar') return v;
+      return precio;
+    };
+
+    await Promise.all(productos.map(p => {
+      const upd = {};
+      if (campo === 'costo' || campo === 'ambos') upd.precio_costo = aplicar(p.precio_costo);
+      if (campo === 'venta' || campo === 'ambos') upd.precio_venta = aplicar(p.precio_venta);
+      return Producto.findByIdAndUpdate(p._id, upd);
+    }));
+
+    res.json({ ok: true, updated: productos.length });
+  } catch (err) { next(err); }
+});
+
 // PUT /api/stock/productos/:id
 router.put('/productos/:id', requireAdmin, async (req, res, next) => {
   try {
