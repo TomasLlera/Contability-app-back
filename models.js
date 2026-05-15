@@ -91,6 +91,16 @@ const ImportConfig = mongoose.model('ImportConfig', new mongoose.Schema({
   updated_at: String
 }));
 
+// --- User ---
+const User = mongoose.model('User', new mongoose.Schema({
+  _id: Number,
+  usuario: { type: String, unique: true },
+  password_hash: String,
+  role: { type: String, enum: ['admin', 'viewer'], default: 'viewer' },
+  activo: { type: Boolean, default: true },
+  created_at: String,
+}));
+
 // --- App Config (configuración global de la app) ---
 const AppConfig = mongoose.model('AppConfig', new mongoose.Schema({
   _id: { type: String, default: 'main' },
@@ -99,4 +109,29 @@ const AppConfig = mongoose.model('AppConfig', new mongoose.Schema({
   dias_anticipacion: { type: Number, default: 7 },
 }));
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig };
+// --- Stock ---
+const Producto = mongoose.model('Producto', new mongoose.Schema({
+  _id: Number,
+  nombre: String,
+  categoria: { type: String, default: '' },
+  descripcion: { type: String, default: '' },
+  unidad: { type: String, default: 'unidad' },
+  precio_costo: { type: Number, default: 0 },
+  precio_venta: { type: Number, default: 0 },
+  stock_actual: { type: Number, default: 0 },
+  stock_minimo: { type: Number, default: 0 },
+  activo: { type: Boolean, default: true },
+  created_at: String,
+}));
+
+const MovimientoStock = mongoose.model('MovimientoStock', new mongoose.Schema({
+  _id: Number,
+  producto_id: Number,
+  tipo: { type: String, enum: ['entrada', 'salida', 'ajuste'], default: 'entrada' },
+  cantidad: Number,
+  observacion: { type: String, default: '' },
+  fecha: String,
+  created_at: String,
+}));
+
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig, User, Producto, MovimientoStock };

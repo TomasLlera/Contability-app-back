@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { CajaMovimiento, CajaConfig, Counter } = require('../models');
+const requireAdmin = require('../middleware/requireAdmin');
 
 const now = () => new Date().toISOString();
 
@@ -20,7 +21,7 @@ router.get('/config', async (req, res) => {
 });
 
 // PUT /api/caja/config
-router.put('/config', async (req, res) => {
+router.put('/config', requireAdmin, async (req, res) => {
   try {
     const { empleados, proveedores } = req.body;
     await CajaConfig.findByIdAndUpdate(
@@ -55,7 +56,7 @@ router.get('/rango', async (req, res) => {
 });
 
 // POST /api/caja
-router.post('/', async (req, res) => {
+router.post('/', requireAdmin, async (req, res) => {
   try {
     const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial } = req.body;
     if (!fecha || !tipo || !concepto || !monto) return res.status(400).json({ error: 'Faltan campos' });
@@ -72,7 +73,7 @@ router.post('/', async (req, res) => {
 });
 
 // PUT /api/caja/:id
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireAdmin, async (req, res) => {
   try {
     const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial } = req.body;
     const upd = {};
@@ -89,7 +90,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // DELETE /api/caja/:id
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireAdmin, async (req, res) => {
   try {
     await CajaMovimiento.findByIdAndDelete(Number(req.params.id));
     res.json({ ok: true });
