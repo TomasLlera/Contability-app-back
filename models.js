@@ -70,6 +70,7 @@ const CajaMovimiento = mongoose.model('CajaMovimiento', new mongoose.Schema({
   subrubro_id: { type: Number, default: null },
   movimiento_id: { type: Number, default: null },
   confirmado: { type: Boolean, default: null }, // null = registro viejo (se trata como confirmado); false = pendiente; true = confirmado
+  pago_mov_id: { type: Number, default: null }, // ID del movimiento de pago creado en el subrubro al confirmar
   es_especial: { type: Boolean, default: false },
   created_at: String,
 }));

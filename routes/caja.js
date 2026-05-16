@@ -160,7 +160,7 @@ router.post('/', requireAdmin, async (req, res) => {
 // PUT /api/caja/:id
 router.put('/:id', requireAdmin, async (req, res) => {
   try {
-    const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial, confirmado } = req.body;
+    const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial, confirmado, pago_mov_id } = req.body;
     const upd = {};
     if (fecha !== undefined) upd.fecha = fecha;
     if (tipo !== undefined) upd.tipo = tipo;
@@ -170,6 +170,7 @@ router.put('/:id', requireAdmin, async (req, res) => {
     if (subrubro_id !== undefined) upd.subrubro_id = subrubro_id;
     if (es_especial !== undefined) upd.es_especial = !!es_especial;
     if (confirmado !== undefined) upd.confirmado = confirmado;
+    if (pago_mov_id !== undefined) upd.pago_mov_id = pago_mov_id !== null ? Number(pago_mov_id) : null;
     await CajaMovimiento.findByIdAndUpdate(Number(req.params.id), upd);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
