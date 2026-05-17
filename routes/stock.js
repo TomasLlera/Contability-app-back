@@ -4,6 +4,7 @@ const multer = require('multer');
 const XLSX = require('xlsx');
 const { Producto, MovimientoStock, Counter, Subrubro, Rubro } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
+const { audit } = require('../middleware/audit');
 const upload = multer({ storage: multer.memoryStorage() });
 
 const now = () => new Date().toISOString().split('T')[0];
@@ -22,15 +23,16 @@ router.get('/productos', async (req, res, next) => {
 });
 
 // POST /api/stock/productos
-router.post('/productos', requireAdmin, async (req, res, next) => {
+router.post('/productos', requireAdmin, audit('producto'), async (req, res, next) => {
   try {
-    const { nombre, categoria, descripcion, unidad, precio_costo, precio_venta, stock_actual, stock_minimo, subrubro_id } = req.body;
+    const { nombre, codigo_barra, categoria, descripcion, unidad, precio_costo, iva, precio_venta, stock_actual, stock_minimo, subrubro_id } = req.body;
     if (!nombre) return res.status(400).json({ error: 'Nombre requerido' });
     const id = await Counter.next('productos');
     const p = await Producto.create({
-      _id: id, nombre, categoria: categoria || '', descripcion: descripcion || '',
+      _id: id, nombre, codigo_barra: codigo_barra || '', categoria: categoria || '', descripcion: descripcion || '',
       unidad: unidad || 'unidad',
       precio_costo: Number(precio_costo) || 0,
+      iva: Number(iva) || 0,
       precio_venta: Number(precio_venta) || 0,
       stock_actual: Number(stock_actual) || 0,
       stock_minimo: Number(stock_minimo) || 0,
@@ -42,7 +44,7 @@ router.post('/productos', requireAdmin, async (req, res, next) => {
 });
 
 // PUT /api/stock/productos/bulk-precio
-router.put('/productos/bulk-precio', requireAdmin, async (req, res, next) => {
+router.put('/productos/bulk-precio', requireAdmin, audit('producto_bulk_precio'), async (req, res, next) => {
   try {
     const { ids, campo, tipo, valor } = req.body;
     if (!ids?.length || !campo || !tipo || valor === undefined) return res.status(400).json({ error: 'Faltan campos' });
@@ -59,8 +61,15 @@ router.put('/productos/bulk-precio', requireAdmin, async (req, res, next) => {
 
     await Promise.all(productos.map(p => {
       const upd = {};
-      if (campo === 'costo' || campo === 'ambos') upd.precio_costo = aplicar(p.precio_costo);
-      if (campo === 'venta' || campo === 'ambos') upd.precio_venta = aplicar(p.precio_venta);
+      if (campo === 'costo') {
+        const nuevoCosto = aplicar(p.precio_costo);
+        upd.precio_costo = nuevoCosto;
+        if (p.precio_costo > 0 && p.precio_venta > 0) {
+          upd.precio_venta = Math.round(p.precio_venta * (nuevoCosto / p.precio_costo));
+        }
+      } else if (campo === 'venta') {
+        upd.precio_venta = aplicar(p.precio_venta);
+      }
       return Producto.findByIdAndUpdate(p._id, upd);
     }));
 
@@ -69,11 +78,12 @@ router.put('/productos/bulk-precio', requireAdmin, async (req, res, next) => {
 });
 
 // PUT /api/stock/productos/:id
-router.put('/productos/:id', requireAdmin, async (req, res, next) => {
+router.put('/productos/:id', requireAdmin, audit('producto'), async (req, res, next) => {
   try {
-    const allowed = ['nombre', 'categoria', 'descripcion', 'unidad', 'precio_costo', 'precio_venta', 'stock_minimo', 'subrubro_id'];
+    const allowed = ['nombre', 'codigo_barra', 'categoria', 'descripcion', 'unidad', 'precio_costo', 'iva', 'precio_venta', 'stock_minimo', 'subrubro_id'];
     const upd = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
     if (upd.precio_costo !== undefined) upd.precio_costo = Number(upd.precio_costo);
+    if (upd.iva !== undefined) upd.iva = Number(upd.iva);
     if (upd.precio_venta !== undefined) upd.precio_venta = Number(upd.precio_venta);
     if (upd.stock_minimo !== undefined) upd.stock_minimo = Number(upd.stock_minimo);
     if (upd.subrubro_id !== undefined) upd.subrubro_id = upd.subrubro_id ? Number(upd.subrubro_id) : null;
@@ -83,7 +93,7 @@ router.put('/productos/:id', requireAdmin, async (req, res, next) => {
 });
 
 // DELETE /api/stock/productos/:id (soft delete)
-router.delete('/productos/:id', requireAdmin, async (req, res, next) => {
+router.delete('/productos/:id', requireAdmin, audit('producto'), async (req, res, next) => {
   try {
     await Producto.findByIdAndUpdate(Number(req.params.id), { activo: false });
     res.json({ ok: true });
@@ -99,7 +109,7 @@ router.get('/movimientos/:productoId', async (req, res, next) => {
 });
 
 // POST /api/stock/movimientos — entrada, salida o ajuste
-router.post('/movimientos', requireAdmin, async (req, res, next) => {
+router.post('/movimientos', requireAdmin, audit('stock_movimiento'), async (req, res, next) => {
   try {
     const { producto_id, tipo, cantidad, observacion, fecha } = req.body;
     if (!producto_id || !tipo || !cantidad) return res.status(400).json({ error: 'Faltan campos' });
@@ -164,7 +174,7 @@ router.get('/export-productos', async (req, res, next) => {
 });
 
 // POST /api/stock/import-productos — importa productos desde Excel
-router.post('/import-productos', requireAdmin, upload.single('file'), async (req, res, next) => {
+router.post('/import-productos', requireAdmin, audit('producto_import'), upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Archivo requerido' });
     const wb = XLSX.read(req.file.buffer, { type: 'buffer' });

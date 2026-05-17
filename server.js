@@ -5,11 +5,47 @@ const mongoose = require('mongoose');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { errorHandler } = require('./middleware/errorHandler');
+const logger = require('./logger');
+
+const REQUIRED_ENV = ['MONGODB_URI', 'JWT_SECRET'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length) {
+  logger.error({ missing }, 'Faltan variables de entorno requeridas');
+  process.exit(1);
+}
+if (process.env.JWT_SECRET.length < 32) {
+  logger.error('JWT_SECRET debe tener al menos 32 caracteres');
+  process.exit(1);
+}
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(helmet());
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const corsOptions = allowedOrigins.length
+  ? {
+      origin(origin, cb) {
+        if (!origin) return cb(null, true);
+        if (allowedOrigins.includes(origin)) return cb(null, true);
+        cb(new Error(`Origin ${origin} no permitido por CORS`));
+      },
+      credentials: true,
+    }
+  : { origin: '*' };
+app.use(cors(corsOptions));
+
+app.use(express.json({ limit: '2mb' }));
+
+app.get('/api/health', async (req, res) => {
+  const dbState = mongoose.connection.readyState; // 1 = connected
+  res.status(dbState === 1 ? 200 : 503).json({
+    status: dbState === 1 ? 'ok' : 'degraded',
+    db: ['disconnected', 'connected', 'connecting', 'disconnecting'][dbState] || 'unknown',
+    uptime: Math.round(process.uptime()),
+  });
+});
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -21,13 +57,14 @@ const loginLimiter = rateLimit({
 
 app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth', require('./routes/auth'));
+
 // JWT middleware — protege todas las rutas siguientes
 const jwt = require('jsonwebtoken');
 app.use((req, res, next) => {
   const auth = req.headers.authorization;
   if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No autorizado' });
   try {
-    jwt.verify(auth.slice(7), process.env.JWT_SECRET);
+    req.user = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
     next();
   } catch {
     res.status(401).json({ error: 'Token inválido o expirado' });
@@ -45,23 +82,34 @@ app.use('/api/caja', require('./routes/caja'));
 app.use('/api/config', require('./routes/config'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/stock', require('./routes/stock'));
+app.use('/api/audit', require('./routes/audit'));
 
 const PORT = process.env.PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI;
 
-if (!MONGODB_URI) {
-  console.error('ERROR: MONGODB_URI no está definida en .env');
-  process.exit(1);
-}
-
 app.use(errorHandler);
 
-mongoose.connect(MONGODB_URI)
-  .then(() => {
-    console.log('MongoDB conectado');
-    app.listen(PORT, () => console.log(`Backend corriendo en http://localhost:${PORT}`));
-  })
-  .catch(err => {
-    console.error('Error conectando a MongoDB:', err.message);
+async function start() {
+  try {
+    await mongoose.connect(MONGODB_URI);
+    logger.info('MongoDB conectado');
+    const server = app.listen(PORT, () => logger.info(`Backend corriendo en http://localhost:${PORT}`));
+
+    const shutdown = async (signal) => {
+      logger.info({ signal }, 'Cerrando servidor');
+      server.close(() => mongoose.connection.close(false).then(() => process.exit(0)));
+      setTimeout(() => process.exit(1), 10000).unref();
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+  } catch (err) {
+    logger.error({ err: err.message }, 'Error conectando a MongoDB');
     process.exit(1);
-  });
+  }
+}
+
+if (process.env.NODE_ENV !== 'test') {
+  start();
+}
+
+module.exports = app;

@@ -6,6 +6,7 @@ const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
 const { asyncHandler } = require('../middleware/errorHandler');
 const requireAdmin = require('../middleware/requireAdmin');
+const { audit } = require('../middleware/audit');
 
 router.get('/vencimientos/proximos', asyncHandler(async (req, res) => {
   const dias = Number(req.query.dias) || 30;
@@ -31,28 +32,28 @@ router.get('/:subrubroId', asyncHandler(async (req, res) => {
   res.json({ movimientos: movs, monto_base: sub?.monto_base ?? 0, saldo_total, saldo_anterior });
 }));
 
-router.post('/:subrubroId', requireAdmin, asyncHandler(async (req, res) => {
+router.post('/:subrubroId', requireAdmin, audit('movimiento'), asyncHandler(async (req, res) => {
   res.json(await db.createMovimiento(req.params.subrubroId, req.body));
 }));
 
-router.post('/:subrubroId/pago-vinculado', requireAdmin, asyncHandler(async (req, res) => {
+router.post('/:subrubroId/pago-vinculado', requireAdmin, audit('movimiento_pago_vinculado'), asyncHandler(async (req, res) => {
   res.json(await db.crearPagoVinculado(req.params.subrubroId, req.body));
 }));
 
-router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
+router.put('/:id', requireAdmin, audit('movimiento'), asyncHandler(async (req, res) => {
   res.json(await db.updateMovimiento(req.params.id, req.body));
 }));
 
-router.put('/:id/pago-vinculado', requireAdmin, asyncHandler(async (req, res) => {
+router.put('/:id/pago-vinculado', requireAdmin, audit('movimiento_pago_vinculado'), asyncHandler(async (req, res) => {
   res.json(await db.actualizarPagoVinculado(req.params.id, req.body));
 }));
 
-router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
+router.delete('/:id', requireAdmin, audit('movimiento'), asyncHandler(async (req, res) => {
   await db.deleteMovimiento(req.params.id);
   res.json({ ok: true });
 }));
 
-router.delete('/:subrubroId/movimientos', requireAdmin, asyncHandler(async (req, res) => {
+router.delete('/:subrubroId/movimientos', requireAdmin, audit('movimientos_bulk'), asyncHandler(async (req, res) => {
   res.json(await db.clearMovimientos(req.params.subrubroId));
 }));
 

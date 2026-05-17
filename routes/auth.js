@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
 const { User, Counter } = require('../models');
+const { writeAudit } = require('../middleware/audit');
 
 // Seed del admin desde env vars si no hay usuarios en la DB
 async function seedAdminIfNeeded() {
@@ -24,10 +25,17 @@ router.post('/login', async (req, res) => {
     await seedAdminIfNeeded();
     const { usuario, password } = req.body;
     const user = await User.findOne({ usuario: usuario?.trim(), activo: true });
-    if (!user) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    if (!user) {
+      await writeAudit({ usuario: usuario || 'desconocido', accion: 'login_failed', recurso: 'auth', ip: req.ip, diff: { motivo: 'usuario_no_encontrado' } });
+      return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    }
     const passOk = await bcrypt.compare(password, user.password_hash);
-    if (!passOk) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    if (!passOk) {
+      await writeAudit({ usuario: user.usuario, user_id: user._id, accion: 'login_failed', recurso: 'auth', ip: req.ip, diff: { motivo: 'password_invalido' } });
+      return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    }
     const token = jwt.sign({ usuario: user.usuario, role: user.role, userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    await writeAudit({ usuario: user.usuario, user_id: user._id, accion: 'login', recurso: 'auth', ip: req.ip });
     res.json({ token, role: user.role });
   } catch (err) {
     res.status(500).json({ error: err.message });

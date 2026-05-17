@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const requireAdmin = require('../middleware/requireAdmin');
+const { audit } = require('../middleware/audit');
 
 async function sendVencimientosEmail(to, vencimientos) {
   const { Resend } = require('resend');
@@ -64,7 +66,7 @@ router.get('/', async (req, res, next) => {
 });
 
 // PUT /api/config
-router.put('/', async (req, res, next) => {
+router.put('/', requireAdmin, audit('app_config'), async (req, res, next) => {
   try {
     const allowed = ['email_alertas', 'alertas_activas', 'dias_anticipacion'];
     const data = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
@@ -74,7 +76,7 @@ router.put('/', async (req, res, next) => {
 });
 
 // POST /api/config/test-email — envía un email de prueba con los vencimientos actuales
-router.post('/test-email', async (req, res, next) => {
+router.post('/test-email', requireAdmin, async (req, res, next) => {
   try {
     const cfg = await db.getConfig();
     if (!cfg.email_alertas) return res.status(400).json({ error: 'No hay email configurado' });

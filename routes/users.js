@@ -3,6 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { User, Counter } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
+const { audit } = require('../middleware/audit');
 
 // GET /api/users — lista de usuarios (solo admin)
 router.get('/', requireAdmin, async (req, res, next) => {
@@ -13,7 +14,7 @@ router.get('/', requireAdmin, async (req, res, next) => {
 });
 
 // POST /api/users — crear usuario (solo admin)
-router.post('/', requireAdmin, async (req, res, next) => {
+router.post('/', requireAdmin, audit('user'), async (req, res, next) => {
   try {
     const { usuario, password, role = 'viewer' } = req.body;
     if (!usuario || !password) return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
@@ -28,7 +29,7 @@ router.post('/', requireAdmin, async (req, res, next) => {
 });
 
 // DELETE /api/users/:id — eliminar usuario (solo admin)
-router.delete('/:id', requireAdmin, async (req, res, next) => {
+router.delete('/:id', requireAdmin, audit('user'), async (req, res, next) => {
   try {
     const user = await User.findById(Number(req.params.id));
     if (!user) return res.status(404).json({ error: 'No encontrado' });
@@ -42,7 +43,7 @@ router.delete('/:id', requireAdmin, async (req, res, next) => {
 });
 
 // PUT /api/users/:id/password — cambiar contraseña (solo admin)
-router.put('/:id/password', requireAdmin, async (req, res, next) => {
+router.put('/:id/password', requireAdmin, audit('user_password'), async (req, res, next) => {
   try {
     const { password } = req.body;
     if (!password || password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
