@@ -23,15 +23,18 @@ function addDaysToStr(dateStr, n) {
 // GET /api/caja/config
 router.get('/config', asyncHandler(async (req, res) => {
   const cfg = await CajaConfig.findById('main').lean();
-  res.json(cfg || { empleados: [], proveedores: [], rubros_sync: [], dias_anticipacion_caja: 3 });
+  res.json(cfg || { empleados: [], proveedores: [], rubros_sync: [], dias_anticipacion_caja: 3, retencion_debito: 0, retencion_credito: 0, retencion_prepagas: 0 });
 }));
 
 // PUT /api/caja/config
 router.put('/config', requireAdmin, audit('caja_config'), asyncHandler(async (req, res) => {
-  const { empleados, proveedores, rubros_sync, dias_anticipacion_caja } = req.body;
+  const { empleados, proveedores, rubros_sync, dias_anticipacion_caja, retencion_debito, retencion_credito, retencion_prepagas } = req.body;
   const upd = { empleados, proveedores };
   if (rubros_sync !== undefined) upd.rubros_sync = rubros_sync;
   if (dias_anticipacion_caja !== undefined) upd.dias_anticipacion_caja = Number(dias_anticipacion_caja);
+  if (retencion_debito  !== undefined) upd.retencion_debito  = Number(retencion_debito);
+  if (retencion_credito !== undefined) upd.retencion_credito = Number(retencion_credito);
+  if (retencion_prepagas !== undefined) upd.retencion_prepagas = Number(retencion_prepagas);
   await CajaConfig.findByIdAndUpdate('main', { $set: upd }, { upsert: true });
   res.json({ ok: true });
 }));
@@ -101,6 +104,18 @@ router.get('/facturas-pendientes', asyncHandler(async (req, res) => {
     fecha_vencimiento: m.fecha_vencimiento,
     concepto: m.concepto || '',
   })));
+}));
+
+// GET /api/caja/pendientes?hasta=YYYY-MM-DD
+router.get('/pendientes', asyncHandler(async (req, res) => {
+  const { hasta } = req.query;
+  if (!hasta) return res.status(400).json({ error: 'hasta requerida' });
+  const movs = await CajaMovimiento.find({
+    tipo: 'gasto',
+    confirmado: false,
+    fecha: { $lt: hasta },
+  }).sort({ fecha: 1, _id: 1 }).lean();
+  res.json(withIds(movs));
 }));
 
 // GET /api/caja?fecha=YYYY-MM-DD

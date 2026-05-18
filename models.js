@@ -96,8 +96,20 @@ const CajaConfig = mongoose.model('CajaConfig', new mongoose.Schema({
   _id: { type: String, default: 'main' },
   empleados: [{ nombre: String }],
   proveedores: [{ nombre: String, subrubro_id: { type: Number, default: null } }],
-  rubros_sync: { type: [Number], default: [] },       // rubros cuyos vencimientos se sincronizan
-  dias_anticipacion_caja: { type: Number, default: 3 }, // días hacia adelante para mostrar vencimientos
+  rubros_sync: { type: [Number], default: [] },
+  dias_anticipacion_caja: { type: Number, default: 3 },
+  retencion_debito:   { type: Number, default: 0 },
+  retencion_credito:  { type: Number, default: 0 },
+  retencion_prepagas: { type: Number, default: 0 },
+}));
+
+// --- Recaudacion diaria ---
+const Recaudacion = mongoose.model('Recaudacion', new mongoose.Schema({
+  _id:      String,          // YYYY-MM-DD
+  qr:       { type: Number, default: 0 },
+  debito:   { type: Number, default: 0 },
+  credito:  { type: Number, default: 0 },
+  prepagas: { type: Number, default: 0 },
 }));
 
 // --- Import Config ---
@@ -177,4 +189,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig, User, Producto, MovimientoStock, Audit };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig, User, Producto, MovimientoStock, Audit, Recaudacion };
