@@ -10,13 +10,14 @@ router.get('/:rubroId', asyncHandler(async (req, res) => {
 }));
 
 router.post('/:rubroId', requireAdmin, audit('subrubro'), asyncHandler(async (req, res) => {
-  const { nombre, monto_base = 0 } = req.body;
-  res.json(await db.createSubrubro(req.params.rubroId, nombre, monto_base));
+  const { nombre, monto_base = 0, cuit, cbu, alias, razon_social, notas, dia_vencimiento } = req.body;
+  res.json(await db.createSubrubro(req.params.rubroId, nombre, monto_base, {
+    cuit, cbu, alias, razon_social, notas, dia_vencimiento,
+  }));
 }));
 
 router.put('/:id', requireAdmin, audit('subrubro'), asyncHandler(async (req, res) => {
-  const { nombre, monto_base, icon } = req.body;
-  await db.updateSubrubro(req.params.id, nombre, monto_base, icon);
+  await db.updateSubrubro(req.params.id, req.body || {});
   res.json({ ok: true });
 }));
 

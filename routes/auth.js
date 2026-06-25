@@ -9,7 +9,7 @@ const { writeAudit } = require('../middleware/audit');
 async function seedAdminIfNeeded() {
   const count = await User.countDocuments();
   if (count > 0) return;
-  const envUser = (process.env.ADMIN_USER || '').trim();
+  const envUser = (process.env.ADMIN_USER || '').trim().toLowerCase();
   const envPass = (process.env.ADMIN_PASSWORD || '').trim();
   if (!envUser || !envPass) return;
   const hash = envPass.startsWith('$2b$') || envPass.startsWith('$2a$')
@@ -24,7 +24,7 @@ router.post('/login', async (req, res) => {
   try {
     await seedAdminIfNeeded();
     const { usuario, password } = req.body;
-    const user = await User.findOne({ usuario: usuario?.trim(), activo: true });
+    const user = await User.findOne({ usuario: usuario?.trim().toLowerCase(), activo: true });
     if (!user) {
       await writeAudit({ usuario: usuario || 'desconocido', accion: 'login_failed', recurso: 'auth', ip: req.ip, diff: { motivo: 'usuario_no_encontrado' } });
       return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });

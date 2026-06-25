@@ -28,7 +28,15 @@ const Rubro = mongoose.model('Rubro', rubroSchema);
 // --- Subrubro ---
 const subrubroSchema = new mongoose.Schema({
   _id: Number, rubro_id: Number, nombre: String,
-  monto_base: { type: Number, default: 0 }, icon: String, created_at: String
+  monto_base: { type: Number, default: 0 }, icon: String, created_at: String,
+  // Metadata fiscal/bancaria
+  cuit: { type: String, default: '' },
+  cbu: { type: String, default: '' },
+  alias: { type: String, default: '' },
+  razon_social: { type: String, default: '' },
+  notas: { type: String, default: '' },
+  // Días de plazo desde la fecha de cada factura hasta su vencimiento (1-365). null = sin plazo definido.
+  dia_vencimiento: { type: Number, default: null, min: 1, max: 365 },
 });
 subrubroSchema.index({ rubro_id: 1 });
 const Subrubro = mongoose.model('Subrubro', subrubroSchema);
@@ -46,6 +54,10 @@ const movimientoSchema = new mongoose.Schema({
   fecha_vencimiento: String,
   campos_extra: { type: mongoose.Schema.Types.Mixed, default: {} },
   concepto: { type: String, default: '' },
+  // Método de pago: efectivo, transferencia o null (sin definir)
+  metodo_pago: { type: String, enum: ['efectivo', 'transferencia', null], default: null },
+  // Link inverso a la entrada de caja que originó este pago (si vino de caja)
+  caja_mov_id: { type: Number, default: null },
   _ajuste_pago_id: { type: Number, default: null },
   created_at: String
 });
@@ -53,6 +65,7 @@ movimientoSchema.index({ subrubro_id: 1, fecha: 1 });
 movimientoSchema.index({ subrubro_id: 1, tipo: 1, pagado: 1 });
 movimientoSchema.index({ fecha_vencimiento: 1, pagado: 1 });
 movimientoSchema.index({ _ajuste_pago_id: 1 });
+movimientoSchema.index({ caja_mov_id: 1 });
 const Movimiento = mongoose.model('Movimiento', movimientoSchema);
 
 // --- Campo de Rubro ---
@@ -79,7 +92,8 @@ const cajaSchema = new mongoose.Schema({
   tipo: { type: String, enum: ['saldo_inicial', 'saldo_cuenta', 'ingreso_extra', 'empleado', 'gasto'], default: 'gasto' },
   concepto: String,
   monto: { type: Number, default: 0 },
-  metodo: { type: String, enum: ['efectivo', 'transferencia'], default: 'efectivo' },
+  // null = sin método (típicamente auto-sync de vencimientos; el usuario lo define al confirmar)
+  metodo: { type: String, enum: ['efectivo', 'transferencia', null], default: null },
   subrubro_id: { type: Number, default: null },
   movimiento_id: { type: Number, default: null },
   confirmado: { type: Boolean, default: null }, // null = registro viejo (se trata como confirmado); false = pendiente; true = confirmado

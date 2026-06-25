@@ -1,4 +1,4 @@
-const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig } = require('./models');
+const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento } = require('./models');
 
 function now() {
   return new Date().toLocaleString('sv').replace('T', ' ');
@@ -10,6 +10,25 @@ function hoy() {
 
 function validarFecha(fecha) {
   if (fecha && fecha > hoy()) throw new Error(`La fecha ${fecha} no puede ser posterior a hoy`);
+}
+
+// Normaliza el método de pago a 'efectivo' | 'transferencia' | null.
+function normalizarMetodoPago(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const s = String(v).trim().toLowerCase();
+  if (s === 'efectivo' || s === 'transferencia') return s;
+  throw new Error(`metodo_pago inválido: ${v}`);
+}
+
+// Dada una fecha 'YYYY-MM-DD' y un plazo en días (N), devuelve la fecha + N días.
+// El campo `dia_vencimiento` del subrubro representa la cantidad de días que
+// transcurren desde la fecha de la factura hasta su vencimiento.
+function calcularProximoVencimiento(fechaStr, dias) {
+  const d = Number(dias);
+  if (!d) return null;
+  const date = new Date(fechaStr + 'T00:00:00');
+  date.setDate(date.getDate() + d);
+  return date.toISOString().split('T')[0];
 }
 
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;
@@ -171,15 +190,43 @@ const db = {
   async getSubrubros(rubroId) {
     return withIds(await Subrubro.find({ rubro_id: Number(rubroId) }).sort({ nombre: 1 }).lean());
   },
-  async createSubrubro(rubroId, nombre, montoBase = 0) {
+  async createSubrubro(rubroId, nombre, montoBase = 0, extra = {}) {
     const id = await Counter.next('subrubros');
-    return withId((await Subrubro.create({ _id: id, rubro_id: Number(rubroId), nombre, monto_base: Number(montoBase), created_at: now() })).toObject());
+    const doc = {
+      _id: id, rubro_id: Number(rubroId), nombre,
+      monto_base: Number(montoBase), created_at: now(),
+    };
+    if (extra.cuit !== undefined) doc.cuit = String(extra.cuit || '').trim();
+    if (extra.cbu !== undefined) doc.cbu = String(extra.cbu || '').trim();
+    if (extra.alias !== undefined) doc.alias = String(extra.alias || '').trim();
+    if (extra.razon_social !== undefined) doc.razon_social = String(extra.razon_social || '').trim();
+    if (extra.notas !== undefined) doc.notas = String(extra.notas || '').trim();
+    if (extra.dia_vencimiento !== undefined && extra.dia_vencimiento !== null && extra.dia_vencimiento !== '') {
+      const d = Number(extra.dia_vencimiento);
+      if (!Number.isInteger(d) || d < 1 || d > 365) throw new Error('dia_vencimiento debe ser un entero entre 1 y 365');
+      doc.dia_vencimiento = d;
+    }
+    return withId((await Subrubro.create(doc)).toObject());
   },
-  async updateSubrubro(id, nombre, montoBase, icon) {
+  async updateSubrubro(id, fields = {}) {
     const upd = {};
-    if (nombre !== undefined) upd.nombre = nombre;
-    if (montoBase !== undefined) upd.monto_base = Number(montoBase);
-    if (icon !== undefined) upd.icon = icon;
+    if (fields.nombre !== undefined) upd.nombre = fields.nombre;
+    if (fields.monto_base !== undefined) upd.monto_base = Number(fields.monto_base);
+    if (fields.icon !== undefined) upd.icon = fields.icon;
+    if (fields.cuit !== undefined) upd.cuit = String(fields.cuit || '').trim();
+    if (fields.cbu !== undefined) upd.cbu = String(fields.cbu || '').trim();
+    if (fields.alias !== undefined) upd.alias = String(fields.alias || '').trim();
+    if (fields.razon_social !== undefined) upd.razon_social = String(fields.razon_social || '').trim();
+    if (fields.notas !== undefined) upd.notas = String(fields.notas || '').trim();
+    if (fields.dia_vencimiento !== undefined) {
+      if (fields.dia_vencimiento === null || fields.dia_vencimiento === '') {
+        upd.dia_vencimiento = null;
+      } else {
+        const d = Number(fields.dia_vencimiento);
+        if (!Number.isInteger(d) || d < 1 || d > 365) throw new Error('dia_vencimiento debe ser un entero entre 1 y 365');
+        upd.dia_vencimiento = d;
+      }
+    }
     await Subrubro.findByIdAndUpdate(Number(id), upd);
   },
   async deleteSubrubro(id) {
@@ -207,25 +254,35 @@ const db = {
     }));
   },
 
-  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '' }) {
+  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
     validarFecha(fecha);
     const tipoFinal = tipo || (Number(monto) > 0 ? 'factura' : 'pago');
+    // Auto-vencimiento: si es una factura sin fecha_vencimiento y el subrubro tiene dia_vencimiento configurado,
+    // calcular el próximo día N del mes (en el mes corriente si todavía no pasó, sino el mes siguiente).
+    let venc = fecha_vencimiento || null;
+    if (!venc && tipoFinal === 'factura' && sub.dia_vencimiento && fecha) {
+      venc = calcularProximoVencimiento(fecha, sub.dia_vencimiento);
+    }
+    // Validación de método_pago
+    const metodo = normalizarMetodoPago(metodo_pago);
     const id = await Counter.next('movimientos');
     await Movimiento.create({
       _id: id, subrubro_id: Number(subrubroId), fecha,
       monto: Number(monto) || 0, pago: Number(pago) || 0,
       tipo: tipoFinal, facturas_vinculadas_ids: [], pagado: false,
-      fecha_vencimiento: fecha_vencimiento || null,
+      fecha_vencimiento: venc,
       campos_extra: campos_extra || {}, concepto: concepto || '',
+      metodo_pago: metodo,
+      caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
       _ajuste_pago_id: null, created_at: now()
     });
     await recalcularPagos(subrubroId);
     return withId(await Movimiento.findById(id).lean());
   },
 
-  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '' }) {
+  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago }) {
     const mov = await Movimiento.findById(Number(id));
     if (!mov) throw new Error('Movimiento no encontrado');
     validarFecha(fecha);
@@ -236,6 +293,7 @@ const db = {
     mov.campos_extra = campos_extra || {};
     if (tipo) mov.tipo = tipo;
     if (concepto !== undefined) mov.concepto = concepto;
+    if (metodo_pago !== undefined) mov.metodo_pago = normalizarMetodoPago(metodo_pago);
     await mov.save();
     await recalcularPagos(mov.subrubro_id);
     return withId(mov.toObject());
@@ -248,6 +306,21 @@ const db = {
     if (mov.tipo === 'pago' || mov.tipo === 'nota_credito') {
       await Movimiento.deleteMany({ _ajuste_pago_id: Number(id) });
     }
+    // Sync inverso: si este pago vino de una entrada de caja, desconfirmarla.
+    // No la borramos — el gasto queda registrado en caja pero como pendiente, así el
+    // usuario puede volver a confirmarlo o decidir qué hacer con él.
+    if (mov.caja_mov_id) {
+      await CajaMovimiento.updateOne(
+        { _id: Number(mov.caja_mov_id), pago_mov_id: Number(id) },
+        { $set: { confirmado: false, pago_mov_id: null } }
+      );
+    }
+    // Defensa adicional: por si el caja_mov_id quedó suelto, buscar cualquier
+    // CajaMovimiento que apunte a este pago y limpiarlo.
+    await CajaMovimiento.updateMany(
+      { pago_mov_id: Number(id) },
+      { $set: { confirmado: false, pago_mov_id: null } }
+    );
     await Movimiento.findByIdAndDelete(Number(id));
     await recalcularPagos(subrubroId);
   },
@@ -268,13 +341,14 @@ const db = {
     return { deleted: deletedCount };
   },
 
-  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {} }) {
+  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
     const idsNum = facturas_vinculadas_ids.map(Number);
     const facturas = await Movimiento.find({ _id: { $in: idsNum }, tipo: 'factura' }).lean();
     const totalFacturas = facturas.reduce((s, f) => s + (f.monto || 0), 0);
     const diferencia = Math.round((totalFacturas - Number(monto_pago)) * 100) / 100;
+    const metodo = tipo === 'pago' ? normalizarMetodoPago(metodo_pago) : null;
 
     const id = await Counter.next('movimientos');
     await Movimiento.create({
@@ -282,7 +356,9 @@ const db = {
       monto: 0, pago: Number(monto_pago), tipo,
       facturas_vinculadas_ids: idsNum, pagado: false,
       fecha_vencimiento: null, campos_extra: campos_extra || {},
-      concepto: '', _ajuste_pago_id: null, created_at: now()
+      concepto: '', metodo_pago: metodo,
+      caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
+      _ajuste_pago_id: null, created_at: now()
     });
 
     if (diferencia > 0.005) {
@@ -300,7 +376,7 @@ const db = {
     return withId(await Movimiento.findById(id).lean());
   },
 
-  async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {} }) {
+  async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago }) {
     const mov = await Movimiento.findById(Number(movId));
     if (!mov) throw new Error('Movimiento no encontrado');
     await Movimiento.deleteMany({ _ajuste_pago_id: Number(movId) });
@@ -314,6 +390,9 @@ const db = {
     mov.pago = Number(monto_pago);
     mov.facturas_vinculadas_ids = idsNum;
     mov.campos_extra = campos_extra || {};
+    if (metodo_pago !== undefined && mov.tipo === 'pago') {
+      mov.metodo_pago = normalizarMetodoPago(metodo_pago);
+    }
     await mov.save();
 
     if (diferencia > 0.005) {
@@ -517,3 +596,4 @@ const db = {
 };
 
 module.exports = db;
+module.exports.calcularProximoVencimiento = calcularProximoVencimiento;

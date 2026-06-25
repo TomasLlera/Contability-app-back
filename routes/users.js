@@ -19,11 +19,12 @@ router.post('/', requireAdmin, audit('user'), async (req, res, next) => {
     const { usuario, password, role = 'viewer' } = req.body;
     if (!usuario || !password) return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
     if (!['admin', 'viewer'].includes(role)) return res.status(400).json({ error: 'Rol inválido' });
-    const exists = await User.findOne({ usuario: usuario.trim() });
+    const usuarioNormalizado = usuario.trim().toLowerCase();
+    const exists = await User.findOne({ usuario: usuarioNormalizado });
     if (exists) return res.status(400).json({ error: 'El usuario ya existe' });
     const hash = await bcrypt.hash(password, 10);
     const id = await Counter.next('users');
-    const user = await User.create({ _id: id, usuario: usuario.trim(), password_hash: hash, role, activo: true, created_at: new Date().toISOString() });
+    const user = await User.create({ _id: id, usuario: usuarioNormalizado, password_hash: hash, role, activo: true, created_at: new Date().toISOString() });
     res.json({ id: user._id, usuario: user.usuario, role: user.role, activo: user.activo });
   } catch (err) { next(err); }
 });
