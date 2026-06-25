@@ -254,7 +254,7 @@ const db = {
     }));
   },
 
-  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null }) {
+  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
     validarFecha(fecha);
@@ -268,6 +268,8 @@ const db = {
     // Validación de método_pago
     const metodo = normalizarMetodoPago(metodo_pago);
     const id = await Counter.next('movimientos');
+    // documento (factura/remito) solo tiene sentido para tipo='factura'.
+    const docFinal = tipoFinal === 'factura' ? (documento || 'factura') : null;
     await Movimiento.create({
       _id: id, subrubro_id: Number(subrubroId), fecha,
       monto: Number(monto) || 0, pago: Number(pago) || 0,
@@ -275,6 +277,7 @@ const db = {
       fecha_vencimiento: venc,
       campos_extra: campos_extra || {}, concepto: concepto || '',
       metodo_pago: metodo,
+      documento: docFinal,
       caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
       _ajuste_pago_id: null, created_at: now()
     });
@@ -282,7 +285,7 @@ const db = {
     return withId(await Movimiento.findById(id).lean());
   },
 
-  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago }) {
+  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, documento }) {
     const mov = await Movimiento.findById(Number(id));
     if (!mov) throw new Error('Movimiento no encontrado');
     validarFecha(fecha);
@@ -294,6 +297,9 @@ const db = {
     if (tipo) mov.tipo = tipo;
     if (concepto !== undefined) mov.concepto = concepto;
     if (metodo_pago !== undefined) mov.metodo_pago = normalizarMetodoPago(metodo_pago);
+    if (documento !== undefined) {
+      mov.documento = mov.tipo === 'factura' ? (documento || 'factura') : null;
+    }
     await mov.save();
     await recalcularPagos(mov.subrubro_id);
     return withId(mov.toObject());

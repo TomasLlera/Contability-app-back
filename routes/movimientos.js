@@ -147,6 +147,7 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
     const skipRows = Number(req.body.skipRows) || 0;
     const fechaDesde = req.body.fechaDesde || null;
     const fechaHasta = req.body.fechaHasta || null;
+    const documento = req.body.documento === 'remito' ? 'remito' : 'factura';
 
     const roleCols = {};
     const montoCols = [];
@@ -250,7 +251,7 @@ router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
                 : (fecha ? fechaMontoExistentes.has(`${fecha}|${monto}`) : false);
               if (isDup) { duplicates++; continue; }
             }
-            allMovsToInsert.push({ subrubro_id: subrubro._id, monto, pago: 0, fecha, fecha_vencimiento: fecha_vencimiento || null, campos_extra, tipo: 'factura', facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
+            allMovsToInsert.push({ subrubro_id: subrubro._id, monto, pago: 0, fecha, fecha_vencimiento: fecha_vencimiento || null, campos_extra, tipo: 'factura', documento, facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
             if (campos_extra.nro_factura) nrosExistentes.add(campos_extra.nro_factura);
             else if (fecha) fechaMontoExistentes.add(`${fecha}|${monto}`);
             created++;

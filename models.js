@@ -56,6 +56,8 @@ const movimientoSchema = new mongoose.Schema({
   concepto: { type: String, default: '' },
   // Método de pago: efectivo, transferencia o null (sin definir)
   metodo_pago: { type: String, enum: ['efectivo', 'transferencia', null], default: null },
+  // Tipo de documento de respaldo (solo aplica si tipo='factura'): factura o remito.
+  documento: { type: String, enum: ['factura', 'remito', null], default: null },
   // Link inverso a la entrada de caja que originó este pago (si vino de caja)
   caja_mov_id: { type: Number, default: null },
   _ajuste_pago_id: { type: Number, default: null },
