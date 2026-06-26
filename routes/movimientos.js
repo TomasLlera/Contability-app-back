@@ -138,7 +138,7 @@ router.get('/export/:subrubroId', async (req, res) => {
 });
 
 // Import Excel
-router.post('/import/:rubroId', upload.single('file'), async (req, res) => {
+router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movimientos_import'), async (req, res) => {
   try {
     const rubroId = Number(req.params.rubroId);
     const mapping = JSON.parse(req.body.mapping || '{}');
