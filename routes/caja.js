@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { CajaMovimiento, CajaConfig, Counter, Subrubro, Movimiento } = require('../models');
+const { computeSaldosFacturas } = require('../db');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const { asyncHandler } = require('../middleware/errorHandler');
@@ -166,15 +167,19 @@ router.get('/facturas-pendientes', asyncHandler(async (req, res) => {
   const { subrubro_id } = req.query;
   if (!subrubro_id) return res.status(400).json({ error: 'subrubro_id requerido' });
 
-  const movimientos = await Movimiento.find({
-    subrubro_id: Number(subrubro_id),
-    tipo: 'factura',
-    pagado: false,
-  }).sort({ fecha: 1 }).lean();
+  // Saldo por factura: requiere TODOS los movimientos del subrubro (NC/pagos
+  // pueden estar en otro mes). Así una 2da NC ve el saldo restante, no el original.
+  const sid = Number(subrubro_id);
+  const todos = await Movimiento.find({ subrubro_id: sid }).lean();
+  const saldos = computeSaldosFacturas(todos);
+  const movimientos = todos
+    .filter(m => m.tipo === 'factura' && !m.pagado)
+    .sort((a, b) => (a.fecha || '').localeCompare(b.fecha || ''));
 
   res.json(movimientos.map(m => ({
     id: m._id,
     monto: m.monto,
+    saldo: saldos.get(m._id) ?? m.monto,
     fecha: m.fecha,
     fecha_vencimiento: m.fecha_vencimiento,
     concepto: m.concepto || '',

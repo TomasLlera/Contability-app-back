@@ -35,8 +35,14 @@ const subrubroSchema = new mongoose.Schema({
   alias: { type: String, default: '' },
   razon_social: { type: String, default: '' },
   notas: { type: String, default: '' },
+  // Modo de cálculo del vencimiento de cada factura:
+  //   'dias'      → vence `dia_vencimiento` días después de la fecha de emisión (modo por defecto / legacy).
+  //   'dia_semana'→ vence el próximo `dia_semana_vencimiento` (0=domingo … 6=sábado) posterior a la emisión.
+  modo_vencimiento: { type: String, enum: ['dias', 'dia_semana'], default: 'dias' },
   // Días de plazo desde la fecha de cada factura hasta su vencimiento (1-365). null = sin plazo definido.
   dia_vencimiento: { type: Number, default: null, min: 1, max: 365 },
+  // Día fijo de la semana de vencimiento (0=domingo … 6=sábado). null = no configurado.
+  dia_semana_vencimiento: { type: Number, default: null, min: 0, max: 6 },
 });
 subrubroSchema.index({ rubro_id: 1 });
 const Subrubro = mongoose.model('Subrubro', subrubroSchema);

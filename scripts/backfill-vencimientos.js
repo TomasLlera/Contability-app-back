@@ -8,7 +8,7 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
 const { Subrubro, Movimiento } = require('../models');
-const { calcularProximoVencimiento } = require('../db');
+const { calcularVencimientoSub } = require('../db');
 
 async function main() {
   const dry = process.argv.includes('--dry');
@@ -20,11 +20,11 @@ async function main() {
   console.log(`Conectado a Mongo${dry ? ' (DRY RUN)' : ''}${recompute ? ' (RECOMPUTE)' : ''}`);
 
   const subs = await Subrubro.find(
-    { dia_vencimiento: { $ne: null } },
-    { _id: 1, nombre: 1, dia_vencimiento: 1 }
+    { $or: [{ dia_vencimiento: { $ne: null } }, { dia_semana_vencimiento: { $ne: null } }] },
+    { _id: 1, nombre: 1, modo_vencimiento: 1, dia_vencimiento: 1, dia_semana_vencimiento: 1 }
   ).lean();
   const subMap = new Map(subs.map(s => [s._id, s]));
-  console.log(`Subrubros con dia_vencimiento: ${subs.length}`);
+  console.log(`Subrubros con vencimiento configurado: ${subs.length}`);
 
   if (subs.length === 0) {
     await mongoose.disconnect();
@@ -49,7 +49,7 @@ async function main() {
   for (const m of movs) {
     const sub = subMap.get(m.subrubro_id);
     if (!sub) continue;
-    const venc = calcularProximoVencimiento(m.fecha, sub.dia_vencimiento);
+    const venc = calcularVencimientoSub(m.fecha, sub);
     if (!venc) continue;
     ops.push({
       updateOne: {
@@ -58,14 +58,15 @@ async function main() {
       },
     });
     if (ejemplos.length < 10) {
-      ejemplos.push({ id: m._id, sub: sub.nombre, fecha: m.fecha, dia: sub.dia_vencimiento, venc, monto: m.monto });
+      const regla = sub.modo_vencimiento === 'dia_semana' ? `diaSem=${sub.dia_semana_vencimiento}` : `dia=${sub.dia_vencimiento}`;
+      ejemplos.push({ id: m._id, sub: sub.nombre, fecha: m.fecha, regla, venc, monto: m.monto });
     }
   }
 
   console.log(`Updates a aplicar: ${ops.length}`);
   if (ejemplos.length) {
     console.log('Ejemplos:');
-    for (const e of ejemplos) console.log(`  #${e.id} [${e.sub}] fecha=${e.fecha} dia=${e.dia} → venc=${e.venc} ($${e.monto})`);
+    for (const e of ejemplos) console.log(`  #${e.id} [${e.sub}] fecha=${e.fecha} ${e.regla} → venc=${e.venc} ($${e.monto})`);
   }
 
   if (!dry && ops.length) {

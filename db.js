@@ -8,6 +8,18 @@ function hoy() {
   return new Date().toISOString().split('T')[0];
 }
 
+// Extrae un número de factura/comprobante de los campos_extra, sin importar cómo
+// se haya llamado la columna mapeada ("Facturas", "Comprobante", "Nº", etc.).
+function extraerNroFactura(campos_extra) {
+  if (!campos_extra) return null;
+  for (const [k, v] of Object.entries(campos_extra)) {
+    if (/factura|comprobante|nro|n°|numero|número/i.test(k) && v != null && String(v).trim() !== '') {
+      return String(v).trim();
+    }
+  }
+  return null;
+}
+
 function validarFecha(fecha) {
   if (fecha && fecha > hoy()) throw new Error(`La fecha ${fecha} no puede ser posterior a hoy`);
 }
@@ -31,54 +43,125 @@ function calcularProximoVencimiento(fechaStr, dias) {
   return date.toISOString().split('T')[0];
 }
 
+// Dada una fecha 'YYYY-MM-DD' y un día de la semana objetivo (0=domingo … 6=sábado),
+// devuelve la fecha del PRÓXIMO día de la semana indicado. Si la emisión cae justo en
+// ese día, salta a la semana siguiente (nunca el mismo día de emisión).
+function calcularProximoDiaSemana(fechaStr, diaSemana) {
+  const target = Number(diaSemana);
+  if (!Number.isInteger(target) || target < 0 || target > 6) return null;
+  const date = new Date(fechaStr + 'T00:00:00');
+  const actual = date.getDay();
+  const diff = ((target - actual + 6) % 7) + 1; // siempre 1..7 → nunca el mismo día
+  date.setDate(date.getDate() + diff);
+  return date.toISOString().split('T')[0];
+}
+
+// Calcula el vencimiento de una factura según el modo configurado en el subrubro.
+// 'dia_semana' usa `dia_semana_vencimiento`; cualquier otro valor (incluyendo el
+// default/legacy 'dias' o ausente) usa `dia_vencimiento` (N días desde la emisión).
+function calcularVencimientoSub(fechaStr, sub) {
+  if (!fechaStr || !sub) return null;
+  if (sub.modo_vencimiento === 'dia_semana') {
+    if (sub.dia_semana_vencimiento == null) return null;
+    return calcularProximoDiaSemana(fechaStr, sub.dia_semana_vencimiento);
+  }
+  if (!sub.dia_vencimiento) return null;
+  return calcularProximoVencimiento(fechaStr, sub.dia_vencimiento);
+}
+
+// Recalcula fecha_vencimiento de TODAS las facturas pendientes (impagas, con fecha)
+// de un subrubro según su config de vencimiento actual. Se usa al cambiar la config
+// del subrubro para que las facturas ya cargadas reflejen la regla nueva.
+// Devuelve la cantidad de facturas modificadas.
+async function recomputarVencimientosSubrubro(subId) {
+  const iid = Number(subId);
+  const sub = await Subrubro.findById(iid).lean();
+  if (!sub) return 0;
+  const facturas = await Movimiento.find(
+    { subrubro_id: iid, tipo: 'factura', pagado: { $ne: true }, fecha: { $exists: true, $ne: null, $ne: '' } },
+    { _id: 1, fecha: 1, fecha_vencimiento: 1 }
+  ).lean();
+
+  const ops = [];
+  for (const m of facturas) {
+    const venc = calcularVencimientoSub(m.fecha, sub) || null;
+    if ((m.fecha_vencimiento || null) === venc) continue; // sin cambios
+    ops.push({ updateOne: { filter: { _id: m._id }, update: { $set: { fecha_vencimiento: venc } } } });
+  }
+  if (ops.length) await Movimiento.bulkWrite(ops, { ordered: false });
+  return ops.length;
+}
+
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;
 const withIds = arr => arr.map(withId);
 
-async function recalcularPagos(subrubroId) {
-  const iid = Number(subrubroId);
-  const movs = await Movimiento.find({ subrubro_id: iid }).lean();
+const r2 = (n) => Math.round((n || 0) * 100) / 100;
 
-  movs.sort((a, b) => {
+// Calcula el SALDO pendiente de cada factura del subrubro a partir de la lista
+// completa de movimientos. Al monto original le resta, en este orden:
+//   1) pagos / notas de crédito VINCULADOS explícitamente a esa factura, y
+//   2) pagos "libres" (sin vinculación) aplicados FIFO por antigüedad.
+// Una NC o un pago parcial dejan la factura con saldo > 0 (sigue pendiente por el
+// resto); si lo aplicado cubre el total, el saldo queda en 0 (factura saldada).
+// Devuelve un Map fid -> saldo (>= 0). No modifica el monto original.
+function computeSaldosFacturas(movs) {
+  const ordenadas = [...movs].sort((a, b) => {
     if (!a.fecha && !b.fecha) return a._id - b._id;
     if (!a.fecha) return 1;
     if (!b.fecha) return -1;
     return a.fecha.localeCompare(b.fecha) || a._id - b._id;
   });
 
-  const pagadoNuevo = {};
-  for (const m of movs) {
-    if (m.tipo === 'factura') pagadoNuevo[m._id] = false;
+  const saldo = new Map();
+  for (const m of ordenadas) {
+    if (m.tipo === 'factura') saldo.set(m._id, r2(m.monto));
   }
 
-  const idsManual = new Set();
-  for (const m of movs) {
-    if ((m.tipo === 'pago' || m.tipo === 'nota_credito') && m.facturas_vinculadas_ids?.length > 0) {
-      for (const fid of m.facturas_vinculadas_ids) idsManual.add(Number(fid));
-    }
-  }
-  for (const m of movs) {
-    if (m.tipo === 'factura' && idsManual.has(m._id)) pagadoNuevo[m._id] = true;
-  }
-
-  const pagosLibres = movs.filter(m =>
-    (m.tipo === 'pago' || m.tipo === 'nota_credito') &&
-    (!m.facturas_vinculadas_ids || m.facturas_vinculadas_ids.length === 0)
-  );
-  let libre = pagosLibres.reduce((s, m) => s + (m.pago || 0), 0);
-
-  for (const m of movs) {
-    if (m.tipo !== 'factura' || pagadoNuevo[m._id]) continue;
-    if (Math.round(libre * 100) >= Math.round(m.monto * 100)) {
-      pagadoNuevo[m._id] = true;
-      libre -= m.monto;
-    } else {
-      break;
+  // 1) Pagos / NC vinculados a facturas puntuales (respeta la elección manual).
+  for (const m of ordenadas) {
+    if ((m.tipo !== 'pago' && m.tipo !== 'nota_credito') || !m.facturas_vinculadas_ids?.length) continue;
+    let restante = r2(m.pago);
+    const vinc = new Set(m.facturas_vinculadas_ids.map(Number));
+    for (const f of ordenadas) {
+      if (restante <= 0) break;
+      if (f.tipo !== 'factura' || !vinc.has(f._id)) continue;
+      const s = saldo.get(f._id) || 0;
+      const aplicar = Math.min(restante, s);
+      saldo.set(f._id, r2(s - aplicar));
+      restante = r2(restante - aplicar);
     }
   }
 
-  const bulkOps = Object.entries(pagadoNuevo).map(([id, pagado]) => ({
-    updateOne: { filter: { _id: Number(id) }, update: { $set: { pagado } } }
-  }));
+  // 2) Pagos libres (sin vinculación) → FIFO sobre las facturas con saldo.
+  let libre = ordenadas
+    .filter(m => (m.tipo === 'pago' || m.tipo === 'nota_credito') && !(m.facturas_vinculadas_ids?.length))
+    .reduce((s, m) => s + (m.pago || 0), 0);
+  libre = r2(libre);
+  for (const m of ordenadas) {
+    if (m.tipo !== 'factura' || libre <= 0) continue;
+    const s = saldo.get(m._id) || 0;
+    if (s <= 0) continue;
+    const aplicar = Math.min(libre, s);
+    saldo.set(m._id, r2(s - aplicar));
+    libre = r2(libre - aplicar);
+  }
+
+  return saldo;
+}
+
+async function recalcularPagos(subrubroId) {
+  const iid = Number(subrubroId);
+  const movs = await Movimiento.find({ subrubro_id: iid }).lean();
+  const saldo = computeSaldosFacturas(movs);
+
+  // Una factura está saldada cuando su saldo llegó a 0 (con tolerancia de centavos).
+  const bulkOps = [];
+  for (const m of movs) {
+    if (m.tipo !== 'factura') continue;
+    bulkOps.push({
+      updateOne: { filter: { _id: m._id }, update: { $set: { pagado: (saldo.get(m._id) || 0) <= 0.005 } } }
+    });
+  }
   if (bulkOps.length > 0) await Movimiento.bulkWrite(bulkOps);
 }
 
@@ -206,6 +289,15 @@ const db = {
       if (!Number.isInteger(d) || d < 1 || d > 365) throw new Error('dia_vencimiento debe ser un entero entre 1 y 365');
       doc.dia_vencimiento = d;
     }
+    if (extra.modo_vencimiento !== undefined && extra.modo_vencimiento !== null && extra.modo_vencimiento !== '') {
+      if (!['dias', 'dia_semana'].includes(extra.modo_vencimiento)) throw new Error("modo_vencimiento debe ser 'dias' o 'dia_semana'");
+      doc.modo_vencimiento = extra.modo_vencimiento;
+    }
+    if (extra.dia_semana_vencimiento !== undefined && extra.dia_semana_vencimiento !== null && extra.dia_semana_vencimiento !== '') {
+      const w = Number(extra.dia_semana_vencimiento);
+      if (!Number.isInteger(w) || w < 0 || w > 6) throw new Error('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
+      doc.dia_semana_vencimiento = w;
+    }
     return withId((await Subrubro.create(doc)).toObject());
   },
   async updateSubrubro(id, fields = {}) {
@@ -227,7 +319,26 @@ const db = {
         upd.dia_vencimiento = d;
       }
     }
+    if (fields.modo_vencimiento !== undefined) {
+      const m = fields.modo_vencimiento || 'dias';
+      if (!['dias', 'dia_semana'].includes(m)) throw new Error("modo_vencimiento debe ser 'dias' o 'dia_semana'");
+      upd.modo_vencimiento = m;
+    }
+    if (fields.dia_semana_vencimiento !== undefined) {
+      if (fields.dia_semana_vencimiento === null || fields.dia_semana_vencimiento === '') {
+        upd.dia_semana_vencimiento = null;
+      } else {
+        const w = Number(fields.dia_semana_vencimiento);
+        if (!Number.isInteger(w) || w < 0 || w > 6) throw new Error('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
+        upd.dia_semana_vencimiento = w;
+      }
+    }
     await Subrubro.findByIdAndUpdate(Number(id), upd);
+    // Si cambió algún campo de vencimiento, regenerar el vencimiento de las facturas
+    // pendientes del subrubro para que reflejen la regla nueva (la regla del subrubro manda).
+    const cambioVenc = ['modo_vencimiento', 'dia_vencimiento', 'dia_semana_vencimiento']
+      .some(k => fields[k] !== undefined);
+    if (cambioVenc) await recomputarVencimientosSubrubro(Number(id));
   },
   async deleteSubrubro(id) {
     const iid = Number(id);
@@ -240,13 +351,21 @@ const db = {
 
   // --- MOVIMIENTOS ---
   async getMovimientos(subrubroId, anio, mes) {
-    const filter = { subrubro_id: Number(subrubroId) };
+    const iid = Number(subrubroId);
+    const filter = { subrubro_id: iid };
     if (anio && mes) {
       const prefix = `${anio}-${String(mes).padStart(2, '0')}`;
       filter.fecha = { $regex: `^${prefix}` };
     }
     const movs = await Movimiento.find(filter).lean();
-    return withIds(movs.sort((a, b) => {
+    // El saldo por factura necesita TODOS los movimientos del subrubro: una NC o
+    // un pago vinculado puede estar en un mes distinto al de la factura.
+    const todos = (anio && mes) ? await Movimiento.find({ subrubro_id: iid }).lean() : movs;
+    const saldo = computeSaldosFacturas(todos);
+    const conSaldo = movs.map(m =>
+      m.tipo === 'factura' ? { ...m, saldo: saldo.get(m._id) ?? (m.monto || 0) } : m
+    );
+    return withIds(conSaldo.sort((a, b) => {
       if (!a.fecha && !b.fecha) return a._id - b._id;
       if (!a.fecha) return 1;
       if (!b.fecha) return -1;
@@ -254,26 +373,35 @@ const db = {
     }));
   },
 
-  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null }) {
+  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [] }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
-    validarFecha(fecha);
+    // Los pagos programados desde Caja se fechan en el vencimiento de la factura,
+    // que puede ser futuro; en ese caso no aplicamos la validación de "no posterior
+    // a hoy". El resto de los movimientos sí la conservan.
+    if (caja_mov_id == null) validarFecha(fecha);
     const tipoFinal = tipo || (Number(monto) > 0 ? 'factura' : 'pago');
-    // Auto-vencimiento: si es una factura sin fecha_vencimiento y el subrubro tiene dia_vencimiento configurado,
-    // calcular el próximo día N del mes (en el mes corriente si todavía no pasó, sino el mes siguiente).
+    // Auto-vencimiento: si es una factura sin fecha_vencimiento y el subrubro tiene
+    // configurado un criterio de vencimiento, calcularlo según el modo activo
+    // ('dias' = N días desde la emisión / 'dia_semana' = próximo día fijo de la semana).
     let venc = fecha_vencimiento || null;
-    if (!venc && tipoFinal === 'factura' && sub.dia_vencimiento && fecha) {
-      venc = calcularProximoVencimiento(fecha, sub.dia_vencimiento);
+    if (!venc && tipoFinal === 'factura' && fecha) {
+      venc = calcularVencimientoSub(fecha, sub);
     }
     // Validación de método_pago
     const metodo = normalizarMetodoPago(metodo_pago);
     const id = await Counter.next('movimientos');
     // documento (factura/remito) solo tiene sentido para tipo='factura'.
     const docFinal = tipoFinal === 'factura' ? (documento || 'factura') : null;
+    // Vinculación explícita de facturas: solo aplica a pagos / notas de crédito.
+    // Si el pago se vincula a una factura puntual, `recalcularPagos` marca esa
+    // factura como pagada respetando la elección del usuario (sin tocar las
+    // facturas anteriores pendientes).
+    const vinculadas = tipoFinal === 'factura' ? [] : (facturas_vinculadas_ids || []).map(Number);
     await Movimiento.create({
       _id: id, subrubro_id: Number(subrubroId), fecha,
       monto: Number(monto) || 0, pago: Number(pago) || 0,
-      tipo: tipoFinal, facturas_vinculadas_ids: [], pagado: false,
+      tipo: tipoFinal, facturas_vinculadas_ids: vinculadas, pagado: false,
       fecha_vencimiento: venc,
       campos_extra: campos_extra || {}, concepto: concepto || '',
       metodo_pago: metodo,
@@ -344,18 +472,22 @@ const db = {
     const subs = await Subrubro.find({ rubro_id: rid }, { _id: 1 }).lean();
     const subIds = subs.map(s => s._id);
     const { deletedCount } = await Movimiento.deleteMany({ subrubro_id: { $in: subIds } });
-    return { deleted: deletedCount };
+    // Barrido de huérfanos: movimientos cuyo subrubro fue borrado y quedaron sueltos
+    // (importaciones viejas que no cascadeaban). Evita que "Vaciar todo" deje datos.
+    const allSubIds = (await Subrubro.find({}, { _id: 1 }).lean()).map(s => s._id);
+    const { deletedCount: huerfanos } = await Movimiento.deleteMany({ subrubro_id: { $nin: allSubIds } });
+    return { deleted: deletedCount + huerfanos };
   },
 
   async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
     const idsNum = facturas_vinculadas_ids.map(Number);
-    const facturas = await Movimiento.find({ _id: { $in: idsNum }, tipo: 'factura' }).lean();
-    const totalFacturas = facturas.reduce((s, f) => s + (f.monto || 0), 0);
-    const diferencia = Math.round((totalFacturas - Number(monto_pago)) * 100) / 100;
     const metodo = tipo === 'pago' ? normalizarMetodoPago(metodo_pago) : null;
 
+    // Con el modelo de saldo por factura, un pago/NC parcial deja la factura con
+    // saldo pendiente; NO se genera un "ajuste" por la diferencia (eso saldaría la
+    // factura por error y descuadraría el total del subrubro).
     const id = await Counter.next('movimientos');
     await Movimiento.create({
       _id: id, subrubro_id: Number(subrubroId), fecha,
@@ -367,17 +499,6 @@ const db = {
       _ajuste_pago_id: null, created_at: now()
     });
 
-    if (diferencia > 0.005) {
-      const ajusteId = await Counter.next('movimientos');
-      await Movimiento.create({
-        _id: ajusteId, subrubro_id: Number(subrubroId), fecha,
-        monto: 0, pago: diferencia, tipo: 'ajuste',
-        facturas_vinculadas_ids: [], _ajuste_pago_id: id,
-        pagado: false, fecha_vencimiento: null, campos_extra: {},
-        concepto: concepto_diferencia || 'Diferencia', created_at: now()
-      });
-    }
-
     await recalcularPagos(subrubroId);
     return withId(await Movimiento.findById(id).lean());
   },
@@ -388,9 +509,6 @@ const db = {
     await Movimiento.deleteMany({ _ajuste_pago_id: Number(movId) });
 
     const idsNum = facturas_vinculadas_ids.map(Number);
-    const facturas = await Movimiento.find({ _id: { $in: idsNum }, tipo: 'factura' }).lean();
-    const totalFacturas = facturas.reduce((s, f) => s + (f.monto || 0), 0);
-    const diferencia = Math.round((totalFacturas - Number(monto_pago)) * 100) / 100;
 
     mov.fecha = fecha;
     mov.pago = Number(monto_pago);
@@ -401,17 +519,8 @@ const db = {
     }
     await mov.save();
 
-    if (diferencia > 0.005) {
-      const ajusteId = await Counter.next('movimientos');
-      await Movimiento.create({
-        _id: ajusteId, subrubro_id: mov.subrubro_id, fecha,
-        monto: 0, pago: diferencia, tipo: 'ajuste',
-        facturas_vinculadas_ids: [], _ajuste_pago_id: Number(movId),
-        pagado: false, fecha_vencimiento: null, campos_extra: {},
-        concepto: concepto_diferencia || 'Diferencia', created_at: now()
-      });
-    }
-
+    // Sin ajuste por diferencia: el saldo pendiente vive en la factura (modelo de
+    // saldo). El deleteMany de arriba limpia ajustes viejos de pagos previos.
     await recalcularPagos(mov.subrubro_id);
     return withId(mov.toObject());
   },
@@ -501,10 +610,11 @@ const db = {
   },
 
   async getMovsForDedup(subrubroId) {
-    const movs = await Movimiento.find({ subrubro_id: Number(subrubroId) }, { fecha: 1, monto: 1, campos_extra: 1 }).lean();
-    const nros = new Set(movs.map(m => m.campos_extra?.nro_factura).filter(Boolean));
-    const fechaMontos = new Set(movs.filter(m => m.fecha).map(m => `${m.fecha}|${m.monto}`));
-    return { nros, fechaMontos };
+    const movs = await Movimiento.find({ subrubro_id: Number(subrubroId) }, { fecha: 1, monto: 1, pago: 1, tipo: 1, campos_extra: 1 }).lean();
+    const nros = new Set(movs.map(m => extraerNroFactura(m.campos_extra)).filter(Boolean));
+    const fechaMontos = new Set(movs.filter(m => m.fecha && m.tipo !== 'pago').map(m => `${m.fecha}|${m.monto}`));
+    const pagosFechaMonto = new Set(movs.filter(m => m.fecha && (m.pago || 0) > 0).map(m => `${m.fecha}|${m.pago}`));
+    return { nros, fechaMontos, pagosFechaMonto };
   },
 
   async bulkInsertMovimientos(movsList) {
@@ -560,22 +670,44 @@ const db = {
     const subs = await Subrubro.find({ rubro_id: Number(rubroId) }).lean();
     if (subs.length === 0) return [];
     const subIds = subs.map(s => s._id);
-    const agg = await Movimiento.aggregate([
-      { $match: { subrubro_id: { $in: subIds } } },
-      {
-        $group: {
-          _id: '$subrubro_id',
-          facturado: { $sum: { $cond: [{ $eq: ['$tipo', 'factura'] }, '$monto', 0] } },
-          pagado: { $sum: '$pago' },
-        }
-      }
-    ]);
-    const aggMap = Object.fromEntries(agg.map(d => [d._id, d]));
+    // Cargamos todos los movimientos del rubro una vez para poder calcular, además
+    // de los totales, el próximo vencimiento (con su saldo real) y el método de pago
+    // habitual por subrubro.
+    const movs = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+    const porSub = new Map(subIds.map(id => [id, []]));
+    for (const m of movs) porSub.get(m.subrubro_id)?.push(m);
+
+    const hoyStr = hoy();
+
     return subs.map(s => {
-      const facturado = aggMap[s._id]?.facturado ?? 0;
-      const pagado = aggMap[s._id]?.pagado ?? 0;
+      const lista = porSub.get(s._id) || [];
+      const facturado = lista.reduce((a, m) => a + (m.tipo === 'factura' ? (m.monto || 0) : 0), 0);
+      const pagado = lista.reduce((a, m) => a + (m.pago || 0), 0);
       const pendiente = facturado - pagado;
       const saldo = (s.monto_base || 0) + pendiente;
+
+      // Saldo pendiente real por factura (descuenta pagos y NC vinculados/FIFO).
+      const saldos = computeSaldosFacturas(lista);
+
+      // Próxima factura a vencer: impaga, con fecha_vencimiento definida y saldo > 0,
+      // la de vencimiento más cercano (incluye vencidas: lo más urgente primero).
+      let prox = null;
+      for (const m of lista) {
+        if (m.tipo !== 'factura' || m.pagado === true) continue;
+        if (!m.fecha_vencimiento) continue;
+        const sal = saldos.get(m._id) ?? (m.monto || 0);
+        if (sal <= 0.005) continue;
+        if (!prox || m.fecha_vencimiento < prox.fecha) prox = { fecha: m.fecha_vencimiento, importe: r2(sal) };
+      }
+
+      // Forma de pago habitual: método más frecuente entre los pagos que lo registran.
+      const cont = {};
+      for (const m of lista) {
+        if ((m.pago || 0) > 0 && m.metodo_pago) cont[m.metodo_pago] = (cont[m.metodo_pago] || 0) + 1;
+      }
+      let metodo_habitual = null, max = 0;
+      for (const [k, v] of Object.entries(cont)) if (v > max) { max = v; metodo_habitual = k; }
+
       return {
         id: s._id,
         nombre: s.nombre,
@@ -585,6 +717,10 @@ const db = {
         pendiente,
         saldo,
         diferencia: pendiente,
+        proximo_vencimiento: prox?.fecha ?? null,
+        importe_proximo_vencimiento: prox?.importe ?? null,
+        vencido: prox ? prox.fecha < hoyStr : false,
+        metodo_habitual,
       };
     }).sort((a, b) => b.saldo - a.saldo);
   },
@@ -603,3 +739,7 @@ const db = {
 
 module.exports = db;
 module.exports.calcularProximoVencimiento = calcularProximoVencimiento;
+module.exports.calcularProximoDiaSemana = calcularProximoDiaSemana;
+module.exports.calcularVencimientoSub = calcularVencimientoSub;
+module.exports.recomputarVencimientosSubrubro = recomputarVencimientosSubrubro;
+module.exports.computeSaldosFacturas = computeSaldosFacturas;

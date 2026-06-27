@@ -164,12 +164,12 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
       }
     }
 
-    function getCol(row, role) {
-      for (const c of (roleCols[role] || [])) {
+    const pickCol = (row, cols) => {
+      for (const c of (cols || [])) {
         if (row[c] !== undefined && row[c] !== null) return row[c];
       }
       return null;
-    }
+    };
 
     const fechaHoy = new Date().toISOString().split('T')[0];
     const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
@@ -179,9 +179,19 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
 
     for (const sheetName of workbook.SheetNames.filter(n => !sheetsFilter || sheetsFilter.has(n))) {
       const sheet = expandirCeldasFusionadas(workbook.Sheets[sheetName]);
-      const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: null, range: skipRows })
+      const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, raw: true });
+      const headerIdx = detectarFilaEncabezado(matrix, skipRows);
+      const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: null, range: headerIdx })
         .map(row => Object.fromEntries(Object.entries(row).map(([k, v]) => [k.toLowerCase().trim(), v])));
-      const rows = inferirAniosSheet(rawRows, roleCols.fecha || []);
+      // Columnas efectivas POR HOJA: usa el mapeo global y, si la hoja no tiene esas
+      // columnas, autodetecta fecha/monto/pago/vto desde sus propios encabezados.
+      // Evita que hojas con otra estructura entren con 0 filas.
+      const sheetCols = rawRows.length ? Object.keys(rawRows[0]) : [];
+      const effFecha = colsParaRol(roleCols.fecha, sheetCols, 'fecha');
+      const effVenc = colsParaRol(roleCols.fecha_vencimiento, sheetCols, 'fecha_vencimiento');
+      const effPago = colsParaRol(roleCols.pago, sheetCols, 'pago');
+      const effMonto = colsParaRol(montoCols, sheetCols, 'monto');
+      const rows = inferirAniosSheet(rawRows, effFecha);
 
       if (rows.length === 0) {
         results.sheets.push({ name: sheetName, created: 0, skipped: 0, duplicates: 0 });
@@ -194,10 +204,10 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
         await db.clearMovimientos(subrubro._id);
       }
 
-      const { nros: nrosExistentes, fechaMontos: fechaMontoExistentes } = await db.getMovsForDedup(subrubro._id);
+      const { nros: nrosExistentes, fechaMontos: fechaMontoExistentes, pagosFechaMonto: pagosExistentes } = await db.getMovsForDedup(subrubro._id);
 
       // Resolver fechas: fill-forward + corrección de picos atípicos
-      const fechasBase = rows.map(r => parseDate(getCol(r, 'fecha')) ?? null);
+      const fechasBase = rows.map(r => parseDate(pickCol(r, effFecha)) ?? null);
       let last = null;
       for (let i = 0; i < fechasBase.length; i++) {
         if (fechasBase[i]) last = fechasBase[i];
@@ -210,10 +220,10 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
       for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
         const row = rows[rowIdx];
         let fecha = fechasResueltas[rowIdx];
-        const fecha_vencimiento = parseDate(getCol(row, 'fecha_vencimiento'));
-        const pago = parseMonto(getCol(row, 'pago')) || 0;
+        const fecha_vencimiento = parseDate(pickCol(row, effVenc));
+        const pago = parseMonto(pickCol(row, effPago)) || 0;
 
-        const montos = montoCols
+        const montos = effMonto
           .map(col => ({ col, monto: parseMonto(row[col]) }))
           .filter(({ monto }) => monto !== null && monto > 0);
 
@@ -242,25 +252,30 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
           skipped++; continue;
         }
 
+        const nroFactura = extraerNroFactura(campos_extra);
         if (montos.length > 0) {
           for (const { monto } of montos) {
             if (mode === 'skip_duplicates') {
-              const nro = campos_extra.nro_factura;
-              const isDup = nro
-                ? nrosExistentes.has(nro)
+              const isDup = nroFactura
+                ? nrosExistentes.has(nroFactura)
                 : (fecha ? fechaMontoExistentes.has(`${fecha}|${monto}`) : false);
               if (isDup) { duplicates++; continue; }
             }
             allMovsToInsert.push({ subrubro_id: subrubro._id, monto, pago: 0, fecha, fecha_vencimiento: fecha_vencimiento || null, campos_extra, tipo: 'factura', documento, facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
-            if (campos_extra.nro_factura) nrosExistentes.add(campos_extra.nro_factura);
+            if (nroFactura) nrosExistentes.add(nroFactura);
             else if (fecha) fechaMontoExistentes.add(`${fecha}|${monto}`);
             created++;
           }
         }
 
         if (pago > 0) {
-          allMovsToInsert.push({ subrubro_id: subrubro._id, monto: 0, pago, fecha, fecha_vencimiento: fecha_vencimiento || null, campos_extra: {}, tipo: 'pago', facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
-          created++;
+          const dupPago = mode === 'skip_duplicates' && fecha && pagosExistentes.has(`${fecha}|${pago}`);
+          if (dupPago) { duplicates++; }
+          else {
+            allMovsToInsert.push({ subrubro_id: subrubro._id, monto: 0, pago, fecha, fecha_vencimiento: fecha_vencimiento || null, campos_extra: {}, tipo: 'pago', facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
+            if (fecha) pagosExistentes.add(`${fecha}|${pago}`);
+            created++;
+          }
         }
       }
 
@@ -301,6 +316,71 @@ function toStr(val) {
   if (val === null || val === undefined) return null;
   const s = String(val).trim();
   return s || null;
+}
+
+// Palabras que delatan la fila de encabezado real (en hojas con fila de título arriba)
+const HEADER_TOKENS = ['fecha', 'importe', 'monto', 'debe', 'haber', 'pago', 'abono', 'cobrado', 'pagado', 'factura', 'comprobante', 'saldo', 'total', 'vencimiento', 'venc', 'vto', 'concepto', 'descripcion', 'detalle'];
+
+function puntuarFilaEncabezado(fila) {
+  let score = 0;
+  for (const v of (fila || [])) {
+    if (v == null) continue;
+    const s = String(v).toLowerCase().trim();
+    if (!s) continue;
+    if (HEADER_TOKENS.some(t => s === t || s.includes(t))) score++;
+  }
+  return score;
+}
+
+// Detecta la fila de encabezado de una hoja escaneando desde `desde`.
+// `matrix` = sheet_to_json con header:1. Devuelve el índice (0-based) con más
+// coincidencias de columnas conocidas; si ninguna supera el umbral, usa `desde`.
+function detectarFilaEncabezado(matrix, desde = 0, maxScan = 15) {
+  let mejorIdx = desde, mejorScore = -1;
+  const fin = Math.min(matrix.length, desde + maxScan);
+  for (let i = desde; i < fin; i++) {
+    const score = puntuarFilaEncabezado(matrix[i]);
+    if (score > mejorScore) { mejorScore = score; mejorIdx = i; }
+  }
+  return mejorScore >= 2 ? mejorIdx : desde;
+}
+
+// Alias de columnas por rol (espejo del frontend) para autodetección por hoja.
+const ROLE_ALIASES = {
+  fecha:             ['fecha', 'date', 'fecha pago', 'fecha factura'],
+  monto:             ['monto', 'importe', 'debe', 'amount', 'valor', 'precio'],
+  pago:              ['pago', 'abono', 'pagado', 'payment', 'haber', 'cobrado'],
+  fecha_vencimiento: ['vencimiento', 'venc', 'vto', 'expira', 'fecha venc'],
+};
+
+function detectRoleCol(sheetCols, role) {
+  const aliases = ROLE_ALIASES[role] || [];
+  for (const col of sheetCols) {
+    if (aliases.some(a => col.includes(a))) return col;
+  }
+  return null;
+}
+
+// Columnas del mapeo global presentes en esta hoja; si no hay ninguna, autodetecta
+// una desde los encabezados propios de la hoja. Así cada hoja se importa aunque
+// use nombres de columna distintos al resto del archivo.
+function colsParaRol(mappedCols, sheetCols, role) {
+  const present = (mappedCols || []).filter(c => sheetCols.includes(c));
+  if (present.length) return present;
+  const det = detectRoleCol(sheetCols, role);
+  return det ? [det] : [];
+}
+
+// Extrae un N° de factura/comprobante de campos_extra sin importar el nombre real
+// de la columna mapeada ("Facturas", "Comprobante", "Nº", etc.).
+function extraerNroFactura(campos_extra) {
+  if (!campos_extra) return null;
+  for (const [k, v] of Object.entries(campos_extra)) {
+    if (/factura|comprobante|nro|n°|numero|número/i.test(k) && v != null && String(v).trim() !== '') {
+      return String(v).trim();
+    }
+  }
+  return null;
 }
 
 function parseDate(val) {
