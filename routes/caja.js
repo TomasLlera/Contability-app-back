@@ -127,39 +127,55 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   const pendientes = vencimientos.filter(v => !yaSet.has(v._id));
   if (pendientes.length === 0) return res.json({ creados: 0 });
 
-  // Reservar IDs en bloque
-  const startId = await Counter.nextBatch
+  // Reservar IDs en bloque (solo se consumen si el upsert inserta).
+  const startId = Counter.nextBatch
     ? await Counter.nextBatch('caja', pendientes.length)
     : null;
 
-  const docs = pendientes.map((v, i) => {
+  // Upsert por movimiento_id: si dos llamadas al auto-sync corren en paralelo
+  // (p. ej. el doble disparo de efectos de React en dev), ambas convergen al
+  // mismo documento en vez de crear duplicados. El _id solo se fija al insertar.
+  const ops = await Promise.all(pendientes.map(async (v, i) => {
     const sub = subMap[v.subrubro_id];
     const baseConcepto = sub?.nombre || 'Vencimiento';
     const concepto = v.concepto ? `${baseConcepto} — ${v.concepto}` : baseConcepto;
+    const _id = startId != null ? startId + i : await Counter.next('caja');
     return {
-      _id: startId != null ? startId + i : undefined,
-      // El caja item vive en la fecha de vencimiento. Si no se paga, el GET
-      // lo arrastra hacia adelante mediante el lookback de fechas anteriores.
-      fecha: v.fecha_vencimiento,
-      tipo: 'gasto',
-      concepto,
-      monto: Number(v.monto) || 0,
-      metodo: null,
-      subrubro_id: v.subrubro_id,
-      movimiento_id: v._id,
-      confirmado: false,
-      es_especial: false,
-      created_at: now(),
+      updateOne: {
+        filter: { movimiento_id: v._id },
+        update: {
+          $setOnInsert: {
+            _id,
+            // El caja item vive en la fecha de vencimiento. Si no se paga, el GET
+            // lo arrastra hacia adelante mediante el lookback de fechas anteriores.
+            fecha: v.fecha_vencimiento,
+            tipo: 'gasto',
+            concepto,
+            monto: Number(v.monto) || 0,
+            metodo: null,
+            subrubro_id: v.subrubro_id,
+            movimiento_id: v._id,
+            confirmado: false,
+            es_especial: false,
+            created_at: now(),
+          },
+        },
+        upsert: true,
+      },
     };
-  });
+  }));
 
-  // Fallback: si nextBatch no estuviera disponible, generar IDs uno por uno.
-  if (startId == null) {
-    for (const d of docs) d._id = await Counter.next('caja');
+  // ordered:false + tolerancia a E11000: el índice único sobre movimiento_id es la
+  // garantía final ante una carrera exacta; el duplicado perdedor se ignora.
+  let creados = 0;
+  try {
+    const r = await CajaMovimiento.bulkWrite(ops, { ordered: false });
+    creados = r.upsertedCount || 0;
+  } catch (err) {
+    if (err.code !== 11000 && !(err.writeErrors || []).every(e => e.code === 11000)) throw err;
+    creados = err.result?.nUpserted ?? err.result?.result?.nUpserted ?? 0;
   }
-
-  await CajaMovimiento.insertMany(docs);
-  res.json({ creados: docs.length });
+  res.json({ creados });
 }));
 
 // GET /api/caja/facturas-pendientes?subrubro_id=X

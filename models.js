@@ -110,7 +110,14 @@ const cajaSchema = new mongoose.Schema({
   created_at: String,
 });
 cajaSchema.index({ fecha: 1 });
-cajaSchema.index({ movimiento_id: 1 });
+// Único parcial: cada factura (movimiento_id) puede generar como mucho UN ítem de
+// caja. Garantiza idempotencia del auto-sync ante llamadas concurrentes (p. ej. el
+// doble disparo de efectos en React dev). Los ítems manuales tienen movimiento_id
+// null y quedan fuera del índice gracias al partialFilterExpression.
+cajaSchema.index(
+  { movimiento_id: 1 },
+  { unique: true, partialFilterExpression: { movimiento_id: { $type: 'number' } } }
+);
 const CajaMovimiento = mongoose.model('CajaMovimiento', cajaSchema);
 
 // --- Caja Config ---
