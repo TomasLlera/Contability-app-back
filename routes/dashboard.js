@@ -14,7 +14,7 @@ function mesActual() {
 router.get('/resumen', asyncHandler(async (req, res) => {
   const mes = mesActual();
 
-  const [mesData, totalData] = await Promise.all([
+  const [mesData, deudaTotal] = await Promise.all([
     // Facturado y pagado del mes actual (todos los rubros)
     Movimiento.aggregate([
       { $match: { fecha: { $regex: `^${mes}` } } },
@@ -26,27 +26,18 @@ router.get('/resumen', asyncHandler(async (req, res) => {
         }
       }
     ]),
-    // Deuda total acumulada (toda la historia)
-    Movimiento.aggregate([
-      {
-        $group: {
-          _id: null,
-          totalFacturado: { $sum: { $cond: [{ $eq: ['$tipo', 'factura'] }, '$monto', 0] } },
-          totalPagado: { $sum: '$pago' },
-        }
-      }
-    ]),
+    // Deuda = suma de saldos pendientes de todas las facturas (toda la historia)
+    db.getDeudaTotal(),
   ]);
 
   const { facturadoMes = 0, pagadoMes = 0 } = mesData[0] || {};
-  const { totalFacturado = 0, totalPagado = 0 } = totalData[0] || {};
 
   res.json({
     mes,
     facturadoMes,
     pagadoMes,
     diferenciaMes: facturadoMes - pagadoMes,
-    deudaTotal: totalFacturado - totalPagado,
+    deudaTotal,
   });
 }));
 
@@ -60,33 +51,7 @@ router.get('/tendencia/:rubroId', asyncHandler(async (req, res) => {
 
   if (subIds.length === 0) return res.json({ tendencia: [] });
 
-  const tendencia = await Movimiento.aggregate([
-    {
-      $match: {
-        subrubro_id: { $in: subIds },
-        fecha: { $exists: true, $type: 'string', $ne: '' },
-      }
-    },
-    {
-      $group: {
-        _id: { $substr: ['$fecha', 0, 7] },
-        facturado: { $sum: { $cond: [{ $eq: ['$tipo', 'factura'] }, '$monto', 0] } },
-        pagado: { $sum: '$pago' },
-      }
-    },
-    { $sort: { _id: 1 } },
-    {
-      $project: {
-        _id: 0,
-        mes: '$_id',
-        facturado: 1,
-        pagado: 1,
-        diferencia: { $subtract: ['$facturado', '$pagado'] },
-      }
-    }
-  ]).then(data => data.slice(-meses));
-
-  res.json({ tendencia });
+  res.json({ tendencia: await db.getTendenciaDeuda(subIds, meses) });
 }));
 
 // Tendencia mensual de un subrubro específico (últimos N meses)
@@ -94,33 +59,7 @@ router.get('/tendencia-subrubro/:subrubroId', asyncHandler(async (req, res) => {
   const subrubroId = Number(req.params.subrubroId);
   const meses = Math.min(Number(req.query.meses) || 6, 24);
 
-  const tendencia = await Movimiento.aggregate([
-    {
-      $match: {
-        subrubro_id: subrubroId,
-        fecha: { $exists: true, $type: 'string', $ne: '' },
-      }
-    },
-    {
-      $group: {
-        _id: { $substr: ['$fecha', 0, 7] },
-        facturado: { $sum: { $cond: [{ $eq: ['$tipo', 'factura'] }, '$monto', 0] } },
-        pagado: { $sum: '$pago' },
-      }
-    },
-    { $sort: { _id: 1 } },
-    {
-      $project: {
-        _id: 0,
-        mes: '$_id',
-        facturado: 1,
-        pagado: 1,
-        diferencia: { $subtract: ['$facturado', '$pagado'] },
-      }
-    }
-  ]).then(data => data.slice(-meses));
-
-  res.json({ tendencia });
+  res.json({ tendencia: await db.getTendenciaDeuda([subrubroId], meses) });
 }));
 
 // Comparación acumulada de todos los subrubros de un rubro

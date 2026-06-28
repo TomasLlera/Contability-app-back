@@ -168,11 +168,16 @@ const productoSchema = new mongoose.Schema({
   precio_venta: { type: Number, default: 0 },
   stock_actual: { type: Number, default: 0 },
   stock_minimo: { type: Number, default: 0 },
+  // Vínculo opcional a un subrubro (proveedor). Sin este campo en el schema,
+  // Mongoose (strict por defecto) descartaba el valor al guardar y el vínculo
+  // nunca persistía.
+  subrubro_id: { type: Number, default: null },
   activo: { type: Boolean, default: true },
   created_at: String,
 });
 productoSchema.index({ activo: 1 });
 productoSchema.index({ codigo_barra: 1 });
+productoSchema.index({ subrubro_id: 1 });
 const Producto = mongoose.model('Producto', productoSchema);
 
 const movStockSchema = new mongoose.Schema({

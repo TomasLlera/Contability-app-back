@@ -666,6 +666,52 @@ const db = {
     }));
   },
 
+  // Deuda total acumulada de toda la app = suma de los saldos pendientes de todas
+  // las facturas. computeSaldosFacturas se aplica por subrubro (la imputación FIFO
+  // y las vinculaciones son por subrubro), y se suman los saldos de cada uno.
+  async getDeudaTotal() {
+    const movs = await Movimiento.find({}, { subrubro_id: 1, fecha: 1, monto: 1, pago: 1, tipo: 1, facturas_vinculadas_ids: 1 }).lean();
+    const porSub = new Map();
+    for (const m of movs) {
+      if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
+      porSub.get(m.subrubro_id).push(m);
+    }
+    let deuda = 0;
+    for (const lista of porSub.values()) {
+      for (const s of computeSaldosFacturas(lista).values()) deuda += s;
+    }
+    return r2(deuda);
+  },
+
+  // Tendencia mensual para los subrubros indicados. Por cada mes con actividad
+  // devuelve: facturado del mes, pagado del mes y la DEUDA = suma de los saldos
+  // pendientes de todas las facturas al cierre de ese mes (incluye el arrastre de
+  // meses anteriores). La deuda se calcula con computeSaldosFacturas, así que un
+  // sobrepago o una NC nunca deja una factura en negativo ni netea contra otras.
+  async getTendenciaDeuda(subIds, meses) {
+    const ids = subIds.map(Number);
+    const movs = await Movimiento.find({ subrubro_id: { $in: ids } }).lean();
+
+    // Meses con al menos un movimiento fechado, ordenados ascendentemente.
+    const conFecha = movs.filter(m => typeof m.fecha === 'string' && m.fecha);
+    const mesesOrden = [...new Set(conFecha.map(m => m.fecha.slice(0, 7)))].sort();
+    const mesesMostrar = mesesOrden.slice(-Math.max(1, meses));
+
+    return mesesMostrar.map(mes => {
+      let facturado = 0, pagado = 0;
+      for (const m of conFecha) {
+        if (m.fecha.slice(0, 7) !== mes) continue;
+        if (m.tipo === 'factura') facturado += m.monto || 0;
+        pagado += m.pago || 0;
+      }
+      // Saldos pendientes considerando toda la historia hasta el cierre del mes.
+      const hasta = conFecha.filter(m => m.fecha.slice(0, 7) <= mes);
+      let deuda = 0;
+      for (const s of computeSaldosFacturas(hasta).values()) deuda += s;
+      return { mes, facturado: r2(facturado), pagado: r2(pagado), diferencia: r2(deuda) };
+    });
+  },
+
   async getComparacionSubrubros(rubroId) {
     const subs = await Subrubro.find({ rubro_id: Number(rubroId) }).lean();
     if (subs.length === 0) return [];
@@ -683,11 +729,14 @@ const db = {
       const lista = porSub.get(s._id) || [];
       const facturado = lista.reduce((a, m) => a + (m.tipo === 'factura' ? (m.monto || 0) : 0), 0);
       const pagado = lista.reduce((a, m) => a + (m.pago || 0), 0);
-      const pendiente = facturado - pagado;
-      const saldo = (s.monto_base || 0) + pendiente;
 
       // Saldo pendiente real por factura (descuenta pagos y NC vinculados/FIFO).
       const saldos = computeSaldosFacturas(lista);
+
+      // Deuda = suma de saldos pendientes (no facturado − pagado: así un sobrepago
+      // o una NC no deja una factura en negativo ni netea contra otras).
+      const pendiente = r2([...saldos.values()].reduce((a, v) => a + v, 0));
+      const saldo = (s.monto_base || 0) + pendiente;
 
       // Próxima factura a vencer: impaga, con fecha_vencimiento definida y saldo > 0,
       // la de vencimiento más cercano (incluye vencidas: lo más urgente primero).
