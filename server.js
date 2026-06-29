@@ -82,6 +82,7 @@ app.use('/api/caja', require('./routes/caja'));
 app.use('/api/config', require('./routes/config'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/stock', require('./routes/stock'));
+app.use('/api/iva', require('./routes/iva'));
 app.use('/api/audit', require('./routes/audit'));
 
 const PORT = process.env.PORT || 3001;

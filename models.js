@@ -194,6 +194,53 @@ const movStockSchema = new mongoose.Schema({
 movStockSchema.index({ producto_id: 1, fecha: -1 });
 const MovimientoStock = mongoose.model('MovimientoStock', movStockSchema);
 
+// --- IVA: Compras (importadas desde Excel — columnas tipo AFIP) ---
+const ivaCompraSchema = new mongoose.Schema({
+  _id: Number,
+  fecha: String,                                 // YYYY-MM-DD (col "Fecha")
+  mes: String,                                   // YYYY-MM (denormalizado para agrupar)
+  tipo: { type: String, default: '' },           // "Tipo" (ej: Factura A, NC)
+  documento: { type: String, default: '' },      // "Documento" (tipo doc del emisor)
+  nro_doc: { type: String, default: '' },        // "Nro Doc Emisor"
+  razon_social: { type: String, default: '' },   // "Razón Social" (proveedor)
+  iva_21: { type: Number, default: 0 },          // "IVA 21%"
+  neto_grav_21: { type: Number, default: 0 },    // "Neto Grav. 21%"
+  neto_gravado: { type: Number, default: 0 },    // "Neto Gravado"
+  otros_atributos: { type: String, default: '' },// "Otros Atributos"
+  total_iva: { type: Number, default: 0 },       // "Total IVA"
+  imp_total: { type: Number, default: 0 },       // "Imp. Total"
+  // clave de deduplicación: fecha|razon_social_normalizada|imp_total redondeado
+  dedup_key: { type: String, default: '' },
+  archivo: { type: String, default: '' },        // nombre del Excel de origen
+  lote: String,                                  // id del lote de importación
+  created_at: String,                            // fecha/hora de carga (ISO)
+});
+ivaCompraSchema.index({ mes: 1 });
+ivaCompraSchema.index({ lote: 1 });
+ivaCompraSchema.index({ dedup_key: 1 });
+const IvaCompra = mongoose.model('IvaCompra', ivaCompraSchema);
+
+// --- IVA: Config de mapeo de columnas (singleton) ---
+const IvaConfig = mongoose.model('IvaConfig', new mongoose.Schema({
+  _id: { type: String, default: 'main' },
+  // overrides { campoInterno: 'Nombre exacto de la columna en el Excel' }
+  mapping: { type: mongoose.Schema.Types.Mixed, default: {} },
+  updated_at: String,
+}));
+
+// --- IVA: Ventas (carga manual diaria) ---
+const ivaVentaSchema = new mongoose.Schema({
+  _id: Number,
+  fecha: String,                              // YYYY-MM-DD
+  mes: String,                                // YYYY-MM (denormalizado)
+  total: { type: Number, default: 0 },
+  concepto: { type: String, default: '' },
+  created_at: String,
+});
+ivaVentaSchema.index({ mes: 1 });
+ivaVentaSchema.index({ fecha: 1 });
+const IvaVenta = mongoose.model('IvaVenta', ivaVentaSchema);
+
 // --- Audit Log ---
 const auditSchema = new mongoose.Schema({
   _id: Number,
@@ -211,4 +258,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig, User, Producto, MovimientoStock, Audit };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, Audit };
