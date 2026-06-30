@@ -10,9 +10,9 @@ router.get('/:rubroId', asyncHandler(async (req, res) => {
 }));
 
 router.post('/:rubroId', requireAdmin, audit('subrubro'), asyncHandler(async (req, res) => {
-  const { nombre, monto_base = 0, cuit, cbu, alias, razon_social, notas, dia_vencimiento, modo_vencimiento, dia_semana_vencimiento } = req.body;
+  const { nombre, monto_base = 0, cuit, cbu, alias, razon_social, notas, dia_vencimiento, modo_vencimiento, dia_semana_vencimiento, metodo_pago_default } = req.body;
   res.json(await db.createSubrubro(req.params.rubroId, nombre, monto_base, {
-    cuit, cbu, alias, razon_social, notas, dia_vencimiento, modo_vencimiento, dia_semana_vencimiento,
+    cuit, cbu, alias, razon_social, notas, dia_vencimiento, modo_vencimiento, dia_semana_vencimiento, metodo_pago_default,
   }));
 }));
 

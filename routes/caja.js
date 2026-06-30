@@ -5,6 +5,7 @@ const { computeSaldosFacturas } = require('../db');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const { asyncHandler } = require('../middleware/errorHandler');
+const logger = require('../logger');
 
 const now = () => new Date().toISOString();
 
@@ -55,12 +56,25 @@ router.get('/vencimientos-sync', asyncHandler(async (req, res) => {
   const subrubroIds = subrubros.map(s => s._id);
   const subrubroMap = Object.fromEntries(subrubros.map(s => [s._id, s]));
 
-  const movimientos = await Movimiento.find({
-    subrubro_id: { $in: subrubroIds },
-    tipo: 'factura',
-    pagado: false,
-    fecha_vencimiento: { $gte: fecha, $lte: hasta },
-  }).sort({ fecha_vencimiento: 1 }).lean();
+  // Saldo por factura = monto − pagos − NC (FIFO). Requiere TODOS los movimientos del
+  // subrubro (NC/pagos pueden estar en otro mes), no solo las facturas de la ventana.
+  const todos = await Movimiento.find({ subrubro_id: { $in: subrubroIds } }).lean();
+  const porSub = new Map();
+  for (const m of todos) {
+    if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
+    porSub.get(m.subrubro_id).push(m);
+  }
+  const saldosPorSub = new Map();
+  for (const [sid, lista] of porSub) saldosPorSub.set(sid, computeSaldosFacturas(lista));
+  const saldoDe = (m) => saldosPorSub.get(m.subrubro_id)?.get(m._id) ?? m.monto;
+
+  const movimientos = todos
+    .filter(m =>
+      m.tipo === 'factura' && !m.pagado &&
+      m.fecha_vencimiento && m.fecha_vencimiento >= fecha && m.fecha_vencimiento <= hasta &&
+      saldoDe(m) > 0.005   // descarta facturas ya saldadas por pagos/NC aunque pagado === false
+    )
+    .sort((a, b) => a.fecha_vencimiento.localeCompare(b.fecha_vencimiento));
 
   if (movimientos.length === 0) return res.json([]);
 
@@ -77,24 +91,101 @@ router.get('/vencimientos-sync', asyncHandler(async (req, res) => {
         movimiento_id: m._id,
         subrubro_id: m.subrubro_id,
         subrubro_nombre: subrubroMap[m.subrubro_id]?.nombre || '',
-        monto: m.monto,
+        monto: saldoDe(m),   // saldo actual, no monto original
         fecha_vencimiento: m.fecha_vencimiento,
         concepto: m.concepto || '',
       }))
   );
 }));
 
+// Reconciliación: trae al día los ítems de caja auto-sincronizados (no confirmados)
+// con el estado actual de su factura de origen. Corre SIEMPRE (incluso sin rubros
+// sincronizados) para limpiar restos cuando se desactiva el sync.
+//   • factura borrada / pagada / saldada → elimina el ítem de caja pendiente.
+//   • cambió el saldo, el vencimiento o el concepto → actualiza el ítem.
+// Sólo toca ítems auto-sync (auto_sync:true) o legacy con la firma del auto-sync
+// (metodo null + movimiento_id), nunca gastos cargados a mano por el usuario.
+async function reconciliarAutoSync() {
+  const autoItems = await CajaMovimiento.find({
+    confirmado: false,
+    movimiento_id: { $ne: null },
+    $or: [{ auto_sync: true }, { metodo: null }],
+  }).lean();
+  if (autoItems.length === 0) return { actualizados: 0, eliminados: 0 };
+
+  const facturas = await Movimiento.find({
+    _id: { $in: autoItems.map(c => c.movimiento_id) },
+  }).lean();
+  const facturaMap = new Map(facturas.map(f => [f._id, f]));
+
+  // Saldo actual por factura: requiere todos los movimientos de los subrubros
+  // referenciados (pagos/NC pueden estar en otro mes).
+  const subIds = [...new Set(facturas.map(f => f.subrubro_id))];
+  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+  const porSub = new Map();
+  for (const m of todos) {
+    if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
+    porSub.get(m.subrubro_id).push(m);
+  }
+  const saldosPorSub = new Map();
+  for (const [sid, lista] of porSub) saldosPorSub.set(sid, computeSaldosFacturas(lista));
+  const saldoDe = (f) => saldosPorSub.get(f.subrubro_id)?.get(f._id) ?? f.monto;
+
+  const subs = await Subrubro.find({ _id: { $in: subIds } }).lean();
+  const subMap = Object.fromEntries(subs.map(s => [s._id, s]));
+
+  const toDelete = [];
+  const updateOps = [];
+  for (const item of autoItems) {
+    const f = facturaMap.get(item.movimiento_id);
+    // Factura inexistente, ya no es factura, pagada o saldada → el pendiente sobra.
+    if (!f || f.tipo !== 'factura' || f.pagado || saldoDe(f) <= 0.005) {
+      toDelete.push(item._id);
+      continue;
+    }
+    const sub = subMap[f.subrubro_id];
+    const baseConcepto = sub?.nombre || 'Vencimiento';
+    const concepto = f.concepto ? `${baseConcepto} — ${f.concepto}` : baseConcepto;
+    const nuevoMonto = Number(saldoDe(f)) || 0;
+    const nuevaFecha = f.fecha_vencimiento || item.fecha;
+    const set = {};
+    if (Math.abs((item.monto || 0) - nuevoMonto) > 0.005) set.monto = nuevoMonto;
+    if (item.fecha !== nuevaFecha) set.fecha = nuevaFecha;
+    if (item.concepto !== concepto) set.concepto = concepto;
+    if (item.subrubro_id !== f.subrubro_id) set.subrubro_id = f.subrubro_id;
+    if (!item.auto_sync) set.auto_sync = true; // backfill de la firma legacy
+    if (Object.keys(set).length) {
+      updateOps.push({ updateOne: { filter: { _id: item._id }, update: { $set: set } } });
+    }
+  }
+
+  let eliminados = 0, actualizados = 0;
+  if (toDelete.length) {
+    const r = await CajaMovimiento.deleteMany({ _id: { $in: toDelete } });
+    eliminados = r.deletedCount || 0;
+  }
+  if (updateOps.length) {
+    const r = await CajaMovimiento.bulkWrite(updateOps, { ordered: false });
+    actualizados = r.modifiedCount || 0;
+  }
+  return { actualizados, eliminados };
+}
+
 // POST /api/caja/auto-sync?fecha=YYYY-MM-DD
+// Reconcilia los ítems existentes con su factura y crea los faltantes.
 // Idempotente: crea CajaMovimiento (tipo='gasto', confirmado=false, metodo=null)
-// por cada factura que vence el día indicado en alguno de los rubros sincronizados,
-// siempre que no exista ya un caja item para ese movimiento_id en esa fecha.
+// por cada factura que vence dentro de la ventana en algún rubro sincronizado,
+// siempre que no exista ya un caja item para ese movimiento_id.
 router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   const { fecha } = req.query;
   if (!fecha) return res.status(400).json({ error: 'fecha requerida' });
 
+  // Reconciliar primero: refleja borrados/pagos/cambios de monto y vencimiento.
+  const { actualizados, eliminados } = await reconciliarAutoSync();
+
   const cfg = await CajaConfig.findById('main').lean();
   const rubros_sync = cfg?.rubros_sync || [];
-  if (rubros_sync.length === 0) return res.json({ creados: 0 });
+  if (rubros_sync.length === 0) return res.json({ creados: 0, actualizados, eliminados });
 
   const dias = cfg?.dias_anticipacion_caja ?? 3;
   const hasta = addDaysToStr(fecha, dias);
@@ -105,14 +196,28 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   const subIds = subrubros.map(s => s._id);
   const subMap = Object.fromEntries(subrubros.map(s => [s._id, s]));
 
+  // Saldo por factura = monto − pagos − NC (FIFO). Requiere TODOS los movimientos del
+  // subrubro (NC/pagos pueden estar en otro mes), no solo las facturas vencidas.
+  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+  const porSub = new Map();
+  for (const m of todos) {
+    if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
+    porSub.get(m.subrubro_id).push(m);
+  }
+  const saldosPorSub = new Map();
+  for (const [sid, lista] of porSub) saldosPorSub.set(sid, computeSaldosFacturas(lista));
+  const saldoDe = (m) => saldosPorSub.get(m.subrubro_id)?.get(m._id) ?? m.monto;
+
   // Incluye también vencidas (fecha_vencimiento <= hasta): si una factura venció
-  // hace 5 días y no se pagó, queremos verla hoy en caja, no perderla.
-  const vencimientos = await Movimiento.find({
-    subrubro_id: { $in: subIds },
-    tipo: 'factura',
-    pagado: false,
-    fecha_vencimiento: { $ne: null, $lte: hasta },
-  }).sort({ fecha_vencimiento: 1 }).lean();
+  // hace 5 días y no se pagó, queremos verla hoy en caja, no perderla. Se descartan
+  // las que ya están saldadas por pagos/NC aunque conserven pagado === false.
+  const vencimientos = todos
+    .filter(m =>
+      m.tipo === 'factura' && !m.pagado &&
+      m.fecha_vencimiento != null && m.fecha_vencimiento <= hasta &&
+      saldoDe(m) > 0.005
+    )
+    .sort((a, b) => (a.fecha_vencimiento || '').localeCompare(b.fecha_vencimiento || ''));
 
   if (vencimientos.length === 0) return res.json({ creados: 0 });
 
@@ -151,11 +256,12 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
             fecha: v.fecha_vencimiento,
             tipo: 'gasto',
             concepto,
-            monto: Number(v.monto) || 0,
+            monto: Number(saldoDe(v)) || 0,   // saldo actual, no monto original
             metodo: null,
             subrubro_id: v.subrubro_id,
             movimiento_id: v._id,
             confirmado: false,
+            auto_sync: true,
             es_especial: false,
             created_at: now(),
           },
@@ -175,7 +281,7 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
     if (err.code !== 11000 && !(err.writeErrors || []).every(e => e.code === 11000)) throw err;
     creados = err.result?.nUpserted ?? err.result?.result?.nUpserted ?? 0;
   }
-  res.json({ creados });
+  res.json({ creados, actualizados, eliminados });
 }));
 
 // GET /api/caja/facturas-pendientes?subrubro_id=X
@@ -245,24 +351,46 @@ router.get('/rango', asyncHandler(async (req, res) => {
 
 // POST /api/caja
 router.post('/', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
-  const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial, movimiento_id, confirmado } = req.body;
+  const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial, movimiento_id, confirmado, idempotency_key } = req.body;
   if (!fecha || !tipo || !concepto || !monto) return res.status(400).json({ error: 'Faltan campos' });
+  // Guarda de idempotencia: una misma alta reintentada (doble clic / reenvío)
+  // devuelve la entrada ya creada en lugar de duplicarla.
+  if (idempotency_key) {
+    const existente = await CajaMovimiento.findOne({ idempotency_key: String(idempotency_key) }).lean();
+    if (existente) {
+      logger.warn({ idempotency_key, caja_id: existente._id }, 'Alta de caja duplicada evitada (idempotency_key)');
+      return res.json(withId(existente));
+    }
+  }
   const id = await Counter.next('caja');
   const confirmar = tipo === 'gasto'
     ? (confirmado !== undefined ? confirmado : false)
     : null;
-  const mov = await CajaMovimiento.create({
-    _id: id, fecha, tipo, concepto,
-    monto: Number(monto),
-    // Sólo aplica default si el cliente no mandó el campo; null explícito significa "sin definir".
-    metodo: metodo === undefined ? 'efectivo' : metodo,
-    subrubro_id: subrubro_id || null,
-    movimiento_id: movimiento_id || null,
-    confirmado: confirmar,
-    es_especial: !!es_especial,
-    created_at: now(),
-  });
-  res.json(withId(mov.toObject()));
+  try {
+    const mov = await CajaMovimiento.create({
+      _id: id, fecha, tipo, concepto,
+      monto: Number(monto),
+      // Sólo aplica default si el cliente no mandó el campo; null explícito significa "sin definir".
+      metodo: metodo === undefined ? 'efectivo' : metodo,
+      subrubro_id: subrubro_id || null,
+      movimiento_id: movimiento_id || null,
+      confirmado: confirmar,
+      es_especial: !!es_especial,
+      idempotency_key: idempotency_key ? String(idempotency_key) : null,
+      created_at: now(),
+    });
+    res.json(withId(mov.toObject()));
+  } catch (err) {
+    // Backstop de carrera ante el índice único.
+    if (err.code === 11000 && idempotency_key) {
+      const existente = await CajaMovimiento.findOne({ idempotency_key: String(idempotency_key) }).lean();
+      if (existente) {
+        logger.warn({ idempotency_key, caja_id: existente._id }, 'Alta de caja duplicada evitada por índice único (carrera)');
+        return res.json(withId(existente));
+      }
+    }
+    throw err;
+  }
 }));
 
 // PUT /api/caja/:id

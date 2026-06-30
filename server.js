@@ -94,6 +94,15 @@ async function start() {
   try {
     await mongoose.connect(MONGODB_URI);
     logger.info('MongoDB conectado');
+    // Asegura que los índices estén creados antes de servir. Incluye los únicos
+    // parciales de idempotencia (Movimiento / CajaMovimiento), que son el backstop
+    // ante altas concurrentes con la misma idempotency_key.
+    try {
+      const { Movimiento, CajaMovimiento } = require('./models');
+      await Promise.all([Movimiento.createIndexes(), CajaMovimiento.createIndexes()]);
+    } catch (err) {
+      logger.warn({ err: err.message }, 'No se pudieron crear todos los índices');
+    }
     const server = app.listen(PORT, () => logger.info(`Backend corriendo en http://localhost:${PORT}`));
 
     const shutdown = async (signal) => {

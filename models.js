@@ -43,6 +43,10 @@ const subrubroSchema = new mongoose.Schema({
   dia_vencimiento: { type: Number, default: null, min: 1, max: 365 },
   // Día fijo de la semana de vencimiento (0=domingo … 6=sábado). null = no configurado.
   dia_semana_vencimiento: { type: Number, default: null, min: 0, max: 6 },
+  // Método de pago predeterminado para los pagos de este subrubro:
+  //   'efectivo' / 'transferencia' → se asigna automáticamente y bloquea el selector al crear un pago.
+  //   'ambas' → el usuario elige el método manualmente (comportamiento por defecto).
+  metodo_pago_default: { type: String, enum: ['efectivo', 'transferencia', 'ambas'], default: 'ambas' },
 });
 subrubroSchema.index({ rubro_id: 1 });
 const Subrubro = mongoose.model('Subrubro', subrubroSchema);
@@ -67,6 +71,11 @@ const movimientoSchema = new mongoose.Schema({
   // Link inverso a la entrada de caja que originó este pago (si vino de caja)
   caja_mov_id: { type: Number, default: null },
   _ajuste_pago_id: { type: Number, default: null },
+  // Clave de idempotencia: identifica de forma única una operación de alta. Si una
+  // misma alta se reintenta (doble clic, reenvío de red, doble disparo de efectos),
+  // el backend devuelve el movimiento ya creado en lugar de duplicarlo. null en
+  // altas legacy / importaciones masivas (quedan fuera del índice único parcial).
+  idempotency_key: { type: String, default: null },
   created_at: String
 });
 movimientoSchema.index({ subrubro_id: 1, fecha: 1 });
@@ -74,6 +83,12 @@ movimientoSchema.index({ subrubro_id: 1, tipo: 1, pagado: 1 });
 movimientoSchema.index({ fecha_vencimiento: 1, pagado: 1 });
 movimientoSchema.index({ _ajuste_pago_id: 1 });
 movimientoSchema.index({ caja_mov_id: 1 });
+// Único parcial: dos altas con la misma idempotency_key convergen al mismo doc.
+// Solo aplica a strings, así los null (la inmensa mayoría) quedan fuera del índice.
+movimientoSchema.index(
+  { idempotency_key: 1 },
+  { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }
+);
 const Movimiento = mongoose.model('Movimiento', movimientoSchema);
 
 // --- Campo de Rubro ---
@@ -106,10 +121,22 @@ const cajaSchema = new mongoose.Schema({
   movimiento_id: { type: Number, default: null },
   confirmado: { type: Boolean, default: null }, // null = registro viejo (se trata como confirmado); false = pendiente; true = confirmado
   pago_mov_id: { type: Number, default: null }, // ID del movimiento de pago creado en el subrubro al confirmar
+  // true = generado automáticamente por el auto-sync de vencimientos. Marca qué ítems
+  // puede reconciliar (actualizar monto/fecha o eliminar) el auto-sync sin pisar gastos
+  // cargados a mano por el usuario.
+  auto_sync: { type: Boolean, default: false },
   es_especial: { type: Boolean, default: false },
+  // Clave de idempotencia para las altas manuales (evita duplicados por doble clic /
+  // reenvío). El auto-sync ya se deduplica por movimiento_id; esto cubre los gastos,
+  // empleados, ingresos y saldos cargados a mano. null = sin clave (queda fuera del índice).
+  idempotency_key: { type: String, default: null },
   created_at: String,
 });
 cajaSchema.index({ fecha: 1 });
+cajaSchema.index(
+  { idempotency_key: 1 },
+  { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }
+);
 // Único parcial: cada factura (movimiento_id) puede generar como mucho UN ítem de
 // caja. Garantiza idempotencia del auto-sync ante llamadas concurrentes (p. ej. el
 // doble disparo de efectos en React dev). Los ítems manuales tienen movimiento_id
@@ -209,6 +236,10 @@ const ivaCompraSchema = new mongoose.Schema({
   otros_atributos: { type: String, default: '' },// "Otros Atributos"
   total_iva: { type: Number, default: 0 },       // "Total IVA"
   imp_total: { type: Number, default: 0 },       // "Imp. Total"
+  // Retenciones/percepciones: se guardan por separado y NO entran en ningún total
+  // del comprobante (imp_total, total_iva, neto). Se acumulan por mes para pagos a cuenta.
+  percepcion_iva: { type: Number, default: 0 },  // "Percepción IVA"
+  ingresos_brutos: { type: Number, default: 0 }, // "Ingresos Brutos" (percepción IIBB)
   // clave de deduplicación: fecha|razon_social_normalizada|imp_total redondeado
   dedup_key: { type: String, default: '' },
   archivo: { type: String, default: '' },        // nombre del Excel de origen

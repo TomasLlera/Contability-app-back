@@ -113,13 +113,68 @@ describe('IVA — Compras (import Excel)', () => {
   });
 });
 
+describe('IVA — Percepción IVA e Ingresos Brutos', () => {
+  const crearCompra = (body) => request(app).post('/api/iva/compras')
+    .set('Authorization', `Bearer ${adminToken}`).send(body);
+
+  it('carga manual guarda las percepciones sin tocar los totales del comprobante', async () => {
+    const res = await crearCompra({
+      fecha: '15/06/2026', tipo: 'Factura A', razon_social: 'PROV S.A.',
+      neto_gravado: 100000, iva_21: 21000, total_iva: 21000, imp_total: 121000,
+      percepcion_iva: 5000, ingresos_brutos: 3000,
+    });
+    expect(res.status).toBe(200);
+    const f = await IvaCompra.findById(res.body.id).lean();
+    expect(f.percepcion_iva).toBe(5000);
+    expect(f.ingresos_brutos).toBe(3000);
+    // Los totales del comprobante NO incluyen las percepciones
+    expect(f.imp_total).toBe(121000);
+    expect(f.total_iva).toBe(21000);
+    expect(f.neto_gravado).toBe(100000);
+  });
+
+  it('el resumen acumula percepciones por mes sin alterar la diferencia', async () => {
+    await crearCompra({ fecha: '05/06/2026', razon_social: 'A', total_iva: 21000, imp_total: 121000, percepcion_iva: 5000, ingresos_brutos: 3000 });
+    await crearCompra({ fecha: '20/06/2026', razon_social: 'B', total_iva: 10000, imp_total: 60000, percepcion_iva: 2000, ingresos_brutos: 1000 });
+
+    const res = await request(app).get('/api/iva/resumen').set('Authorization', `Bearer ${adminToken}`);
+    const junio = res.body.meses.find(m => m.mes === '2026-06');
+    expect(junio.compras.percepcion_iva).toBe(7000);
+    expect(junio.compras.ingresos_brutos).toBe(4000);
+    // Imp. Total y la diferencia (ventas - IVA compras) ignoran las percepciones
+    expect(junio.compras.imp_total).toBe(181000);
+    expect(junio.diferencia).toBe(0 - 31000); // sin ventas: -IVA compras
+    expect(res.body.totales.compras_percepcion_iva).toBe(7000);
+    expect(res.body.totales.compras_ingresos_brutos).toBe(4000);
+  });
+
+  it('importa percepciones desde Excel cuando se mapea la columna', async () => {
+    const headers = [...HEADERS, 'Percepción IVA', 'Ingresos Brutos'];
+    const aoa = [headers, ['12/06/2026', 'Factura A', 'CUIT', '30-1', 'PROV', '21000', '100000', '100000', '', '21000', '121000', '5000', '3000']];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Compras');
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    const res = await importExcel(adminToken, buffer, 'perc.xlsx');
+    expect(res.body.importadas).toBe(1);
+    const f = await IvaCompra.findOne({}).lean();
+    expect(f.percepcion_iva).toBe(5000);
+    expect(f.ingresos_brutos).toBe(3000);
+    expect(f.imp_total).toBe(121000); // sin alterar
+  });
+});
+
 describe('IVA — Config de columnas', () => {
 
-  it('devuelve las 11 columnas con sus defaults', async () => {
+  it('devuelve las 13 columnas con sus defaults', async () => {
     const res = await request(app).get('/api/iva/config').set('Authorization', `Bearer ${adminToken}`);
     expect(res.status).toBe(200);
-    expect(res.body.columns).toHaveLength(11);
+    expect(res.body.columns).toHaveLength(13);
     expect(res.body.columns.find(c => c.key === 'imp_total').default).toBe('Imp. Total');
+    // Las percepciones existen como columnas mapeables pero no se suman a los totales.
+    expect(res.body.columns.find(c => c.key === 'percepcion_iva').sum).toBe(false);
+    expect(res.body.columns.find(c => c.key === 'ingresos_brutos').sum).toBe(false);
   });
 
   it('guarda overrides solo cuando difieren del default', async () => {

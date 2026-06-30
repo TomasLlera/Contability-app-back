@@ -1,4 +1,13 @@
 const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento } = require('./models');
+const logger = require('./logger');
+
+// Busca un movimiento ya creado con esta idempotency_key. Se usa como guarda de
+// duplicados: si la misma alta se reintenta (doble clic, reenvío de red, doble
+// disparo de efectos en React), devolvemos el existente en lugar de crear otro.
+async function findMovByIdemKey(key) {
+  if (!key) return null;
+  return Movimiento.findOne({ idempotency_key: String(key) }).lean();
+}
 
 function now() {
   return new Date().toLocaleString('sv').replace('T', ' ');
@@ -298,6 +307,10 @@ const db = {
       if (!Number.isInteger(w) || w < 0 || w > 6) throw new Error('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
       doc.dia_semana_vencimiento = w;
     }
+    if (extra.metodo_pago_default !== undefined && extra.metodo_pago_default !== null && extra.metodo_pago_default !== '') {
+      if (!['efectivo', 'transferencia', 'ambas'].includes(extra.metodo_pago_default)) throw new Error("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
+      doc.metodo_pago_default = extra.metodo_pago_default;
+    }
     return withId((await Subrubro.create(doc)).toObject());
   },
   async updateSubrubro(id, fields = {}) {
@@ -333,7 +346,20 @@ const db = {
         upd.dia_semana_vencimiento = w;
       }
     }
+    if (fields.metodo_pago_default !== undefined) {
+      const mp = fields.metodo_pago_default || 'ambas';
+      if (!['efectivo', 'transferencia', 'ambas'].includes(mp)) throw new Error("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
+      upd.metodo_pago_default = mp;
+    }
     await Subrubro.findByIdAndUpdate(Number(id), upd);
+    // Si se fijó un método de pago ('efectivo'/'transferencia'), aplicarlo a TODOS los
+    // pagos existentes del subrubro (el método del subrubro manda). Con 'ambas' no se toca nada.
+    if (upd.metodo_pago_default === 'efectivo' || upd.metodo_pago_default === 'transferencia') {
+      await Movimiento.updateMany(
+        { subrubro_id: Number(id), tipo: 'pago', metodo_pago: { $ne: upd.metodo_pago_default } },
+        { $set: { metodo_pago: upd.metodo_pago_default } }
+      );
+    }
     // Si cambió algún campo de vencimiento, regenerar el vencimiento de las facturas
     // pendientes del subrubro para que reflejen la regla nueva (la regla del subrubro manda).
     const cambioVenc = ['modo_vencimiento', 'dia_vencimiento', 'dia_semana_vencimiento']
@@ -373,9 +399,18 @@ const db = {
     }));
   },
 
-  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [] }) {
+  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [], idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
+    // Guarda de idempotencia: si ya existe un movimiento con esta clave, es un
+    // reintento de la misma alta → devolver el existente sin crear un duplicado.
+    if (idempotency_key) {
+      const existente = await findMovByIdemKey(idempotency_key);
+      if (existente) {
+        logger.warn({ idempotency_key, movimiento_id: existente._id, subrubro_id: existente.subrubro_id }, 'Alta de movimiento duplicada evitada (idempotency_key)');
+        return withId(existente);
+      }
+    }
     // Los pagos programados desde Caja se fechan en el vencimiento de la factura,
     // que puede ser futuro; en ese caso no aplicamos la validación de "no posterior
     // a hoy". El resto de los movimientos sí la conservan.
@@ -398,17 +433,31 @@ const db = {
     // factura como pagada respetando la elección del usuario (sin tocar las
     // facturas anteriores pendientes).
     const vinculadas = tipoFinal === 'factura' ? [] : (facturas_vinculadas_ids || []).map(Number);
-    await Movimiento.create({
-      _id: id, subrubro_id: Number(subrubroId), fecha,
-      monto: Number(monto) || 0, pago: Number(pago) || 0,
-      tipo: tipoFinal, facturas_vinculadas_ids: vinculadas, pagado: false,
-      fecha_vencimiento: venc,
-      campos_extra: campos_extra || {}, concepto: concepto || '',
-      metodo_pago: metodo,
-      documento: docFinal,
-      caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
-      _ajuste_pago_id: null, created_at: now()
-    });
+    try {
+      await Movimiento.create({
+        _id: id, subrubro_id: Number(subrubroId), fecha,
+        monto: Number(monto) || 0, pago: Number(pago) || 0,
+        tipo: tipoFinal, facturas_vinculadas_ids: vinculadas, pagado: false,
+        fecha_vencimiento: venc,
+        campos_extra: campos_extra || {}, concepto: concepto || '',
+        metodo_pago: metodo,
+        documento: docFinal,
+        caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
+        idempotency_key: idempotency_key ? String(idempotency_key) : null,
+        _ajuste_pago_id: null, created_at: now()
+      });
+    } catch (err) {
+      // Backstop de carrera: dos altas con la misma clave en paralelo. El índice
+      // único garantiza que solo una gane; la perdedora recupera la ganadora.
+      if (err.code === 11000 && idempotency_key) {
+        const existente = await findMovByIdemKey(idempotency_key);
+        if (existente) {
+          logger.warn({ idempotency_key, movimiento_id: existente._id }, 'Alta de movimiento duplicada evitada por índice único (carrera)');
+          return withId(existente);
+        }
+      }
+      throw err;
+    }
     await recalcularPagos(subrubroId);
     return withId(await Movimiento.findById(id).lean());
   },
@@ -455,6 +504,15 @@ const db = {
       { pago_mov_id: Number(id) },
       { $set: { confirmado: false, pago_mov_id: null } }
     );
+    // Si era una factura, eliminar el ítem de caja auto-sincronizado pendiente que
+    // la representaba (apunta a ella por movimiento_id). Sin esto, el vencimiento
+    // borrado seguiría arrastrándose en la Caja del Día día a día.
+    if (mov.tipo === 'factura') {
+      await CajaMovimiento.deleteMany({
+        movimiento_id: Number(id),
+        confirmado: false,
+      });
+    }
     await Movimiento.findByIdAndDelete(Number(id));
     await recalcularPagos(subrubroId);
   },
@@ -479,9 +537,17 @@ const db = {
     return { deleted: deletedCount + huerfanos };
   },
 
-  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null }) {
+  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
+    // Guarda de idempotencia (mismo criterio que createMovimiento).
+    if (idempotency_key) {
+      const existente = await findMovByIdemKey(idempotency_key);
+      if (existente) {
+        logger.warn({ idempotency_key, movimiento_id: existente._id, subrubro_id: existente.subrubro_id }, 'Alta de pago vinculado duplicada evitada (idempotency_key)');
+        return withId(existente);
+      }
+    }
     const idsNum = facturas_vinculadas_ids.map(Number);
     const metodo = tipo === 'pago' ? normalizarMetodoPago(metodo_pago) : null;
 
@@ -489,15 +555,27 @@ const db = {
     // saldo pendiente; NO se genera un "ajuste" por la diferencia (eso saldaría la
     // factura por error y descuadraría el total del subrubro).
     const id = await Counter.next('movimientos');
-    await Movimiento.create({
-      _id: id, subrubro_id: Number(subrubroId), fecha,
-      monto: 0, pago: Number(monto_pago), tipo,
-      facturas_vinculadas_ids: idsNum, pagado: false,
-      fecha_vencimiento: null, campos_extra: campos_extra || {},
-      concepto: '', metodo_pago: metodo,
-      caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
-      _ajuste_pago_id: null, created_at: now()
-    });
+    try {
+      await Movimiento.create({
+        _id: id, subrubro_id: Number(subrubroId), fecha,
+        monto: 0, pago: Number(monto_pago), tipo,
+        facturas_vinculadas_ids: idsNum, pagado: false,
+        fecha_vencimiento: null, campos_extra: campos_extra || {},
+        concepto: '', metodo_pago: metodo,
+        caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
+        idempotency_key: idempotency_key ? String(idempotency_key) : null,
+        _ajuste_pago_id: null, created_at: now()
+      });
+    } catch (err) {
+      if (err.code === 11000 && idempotency_key) {
+        const existente = await findMovByIdemKey(idempotency_key);
+        if (existente) {
+          logger.warn({ idempotency_key, movimiento_id: existente._id }, 'Alta de pago vinculado duplicada evitada por índice único (carrera)');
+          return withId(existente);
+        }
+      }
+      throw err;
+    }
 
     await recalcularPagos(subrubroId);
     return withId(await Movimiento.findById(id).lean());

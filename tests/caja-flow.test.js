@@ -108,3 +108,77 @@ describe('Flujo caja: crear factura → autoSync → confirmar pago', () => {
     expect(todosMovs.find(m => m.tipo === 'pago').metodo_pago).toBe('efectivo');
   });
 });
+
+describe('Reconciliación auto-sync: cambios en la factura se reflejan en caja', () => {
+  beforeEach(bootstrap);
+
+  async function syncEl(fecha) {
+    return request(app).post('/api/caja/auto-sync')
+      .set('Authorization', `Bearer ${adminToken}`).query({ fecha });
+  }
+  async function cajaDe(fecha) {
+    const r = await request(app).get('/api/caja')
+      .set('Authorization', `Bearer ${adminToken}`).query({ fecha });
+    return r.body;
+  }
+  async function crearFactura(monto, fecha, venc) {
+    const r = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto, fecha, tipo: 'factura', fecha_vencimiento: venc });
+    return r.body.id;
+  }
+
+  it('editar el monto de la factura actualiza el ítem de caja pendiente', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 5);
+    const facturaId = await crearFactura(1000, hoy, venc);
+
+    await syncEl(venc);
+    let gasto = (await cajaDe(venc)).find(c => c.movimiento_id === facturaId);
+    expect(gasto.monto).toBe(1000);
+
+    // Editar el monto de la factura
+    await request(app).put(`/api/movimientos/${facturaId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1500, fecha: hoy, tipo: 'factura', fecha_vencimiento: venc });
+
+    // Re-sync (lo que hace la Caja al recargar) → el ítem refleja el nuevo monto
+    await syncEl(venc);
+    gasto = (await cajaDe(venc)).find(c => c.movimiento_id === facturaId);
+    expect(gasto.monto).toBe(1500);
+  });
+
+  it('borrar la factura elimina el ítem de caja pendiente (no se arrastra)', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 5);
+    const facturaId = await crearFactura(800, hoy, venc);
+
+    await syncEl(venc);
+    expect((await cajaDe(venc)).some(c => c.movimiento_id === facturaId)).toBe(true);
+
+    // Borrar la factura → cleanup inmediato en deleteMovimiento
+    await request(app).delete(`/api/movimientos/${facturaId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect((await cajaDe(venc)).some(c => c.movimiento_id === facturaId)).toBe(false);
+    expect(await CajaMovimiento.countDocuments({ movimiento_id: facturaId })).toBe(0);
+  });
+
+  it('pagar la factura por fuera de caja elimina el pendiente al reconciliar', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 5);
+    const facturaId = await crearFactura(500, hoy, venc);
+
+    await syncEl(venc);
+    expect((await cajaDe(venc)).some(c => c.movimiento_id === facturaId)).toBe(true);
+
+    // Pago directo en el subrubro (no desde caja) que salda la factura
+    await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', pago: 500, fecha: hoy, metodo_pago: 'efectivo' });
+
+    // Al reconciliar, el pendiente sobra y se elimina
+    await syncEl(venc);
+    expect((await cajaDe(venc)).some(c => c.movimiento_id === facturaId)).toBe(false);
+  });
+});

@@ -25,6 +25,10 @@ const COLUMNS = [
   { key: 'otros_atributos', label: 'Otros Atributos', tipo: 'texto', sum: false, syn: ['Otros Atributos', 'Otros', 'Otros Tributos'] },
   { key: 'total_iva',       label: 'Total IVA',       tipo: 'monto', sum: true,  syn: ['Total IVA', 'Total I.V.A.', 'IVA Total'] },
   { key: 'imp_total',       label: 'Imp. Total',      tipo: 'monto', sum: true,  syn: ['Imp. Total', 'Imp Total', 'Importe Total', 'Total Comprobante', 'Total'] },
+  // Retenciones/percepciones: sum:false → NUNCA se suman al Imp. Total / Total IVA / Neto.
+  // Se guardan aparte y se acumulan por mes en el resumen como pagos a cuenta.
+  { key: 'percepcion_iva',  label: 'Percepción IVA',  tipo: 'monto', sum: false, syn: ['Percepción IVA', 'Percepcion IVA', 'Perc. IVA', 'Percepción de IVA', 'Percep. IVA', 'Percep IVA'] },
+  { key: 'ingresos_brutos', label: 'Ingresos Brutos', tipo: 'monto', sum: false, syn: ['Ingresos Brutos', 'IIBB', 'Ing. Brutos', 'Percepción IIBB', 'Percepcion IIBB', 'Perc. IIBB', 'Ingresos Brutos Percepción'] },
 ];
 const SUM_FIELDS = COLUMNS.filter(c => c.sum).map(c => c.key); // iva_21, neto_gravado, total_iva, imp_total
 
@@ -235,6 +239,9 @@ router.post('/compras/import', requireAdmin, audit('iva_compra_import'), upload.
         neto_gravado:    parseMonto(pickCol(row, headerMap, COLUMNS[7], mapping)),
         otros_atributos: (pickCol(row, headerMap, COLUMNS[8], mapping) || '').toString().trim(),
         total_iva:       parseMonto(pickCol(row, headerMap, COLUMNS[9], mapping)),
+        // Retenciones/percepciones (no afectan ningún total del comprobante)
+        percepcion_iva:  parseMonto(pickCol(row, headerMap, COLUMNS[11], mapping)),
+        ingresos_brutos: parseMonto(pickCol(row, headerMap, COLUMNS[12], mapping)),
       });
     }
 
@@ -258,6 +265,34 @@ router.post('/compras/import', requireAdmin, audit('iva_compra_import'), upload.
     await IvaCompra.insertMany(docs);
 
     res.json({ importadas: docs.length, duplicadas, vacias, archivo, lote, created_at, filas: docs.map(withId) });
+  } catch (err) { next(err); }
+});
+
+// POST /api/iva/compras — carga manual de un comprobante de compra
+router.post('/compras', requireAdmin, audit('iva_compra'), async (req, res, next) => {
+  try {
+    const fecha = parseFecha(req.body.fecha);
+    if (!fecha) return res.status(400).json({ error: 'Fecha inválida' });
+    const razon_social = (req.body.razon_social || '').toString().trim();
+    const imp_total = parseMonto(req.body.imp_total);
+    const id = await Counter.next('iva_compras');
+    const compra = await IvaCompra.create({
+      _id: id, fecha, mes: fecha.slice(0, 7), razon_social, imp_total,
+      dedup_key: dedupKey(fecha, razon_social, imp_total),
+      tipo:            (req.body.tipo || '').toString().trim(),
+      documento:       (req.body.documento || '').toString().trim(),
+      nro_doc:         (req.body.nro_doc || '').toString().trim(),
+      iva_21:          parseMonto(req.body.iva_21),
+      neto_grav_21:    parseMonto(req.body.neto_grav_21),
+      neto_gravado:    parseMonto(req.body.neto_gravado),
+      otros_atributos: (req.body.otros_atributos || '').toString().trim(),
+      total_iva:       parseMonto(req.body.total_iva),
+      // Retenciones/percepciones: aparte, no entran en ningún total del comprobante.
+      percepcion_iva:  parseMonto(req.body.percepcion_iva),
+      ingresos_brutos: parseMonto(req.body.ingresos_brutos),
+      archivo: 'Carga manual', lote: 'manual', created_at: nowTs(),
+    });
+    res.json(withId(compra.toObject()));
   } catch (err) { next(err); }
 });
 
@@ -349,6 +384,8 @@ async function buildResumen() {
           total_iva:    { $sum: '$total_iva' },
           iva_21:       { $sum: '$iva_21' },
           neto_gravado: { $sum: '$neto_gravado' },
+          percepcion_iva:  { $sum: '$percepcion_iva' },
+          ingresos_brutos: { $sum: '$ingresos_brutos' },
           items:        { $sum: 1 },
       } },
     ]),
@@ -357,7 +394,7 @@ async function buildResumen() {
     ]),
   ]);
 
-  const emptyCompras = () => ({ imp_total: 0, total_iva: 0, iva_21: 0, neto_gravado: 0, items: 0, facturas: 0, notas_credito: 0, por_tipo: {} });
+  const emptyCompras = () => ({ imp_total: 0, total_iva: 0, iva_21: 0, neto_gravado: 0, percepcion_iva: 0, ingresos_brutos: 0, items: 0, facturas: 0, notas_credito: 0, por_tipo: {} });
   const map = {};
   const tiposSet = new Map(); // tipo -> es_nc (lista global de tipos para el filtro)
 
@@ -375,6 +412,10 @@ async function buildResumen() {
     cp.total_iva    += signo * c.total_iva;
     cp.iva_21       += signo * c.iva_21;
     cp.neto_gravado += signo * c.neto_gravado;
+    // Retenciones/percepciones: se acumulan por mes (NC las revierte, igual que el resto)
+    // pero NO entran en la diferencia del cruce (que usa solo total_iva).
+    cp.percepcion_iva  += signo * c.percepcion_iva;
+    cp.ingresos_brutos += signo * c.ingresos_brutos;
     cp.items        += c.items;
     cp.facturas      += es_nc ? 0 : c.imp_total;
     cp.notas_credito += es_nc ? c.imp_total : 0;
@@ -397,11 +438,13 @@ async function buildResumen() {
     compras_total_iva:     acc.compras_total_iva + m.compras.total_iva,
     compras_iva_21:        acc.compras_iva_21 + m.compras.iva_21,
     compras_neto_gravado:  acc.compras_neto_gravado + m.compras.neto_gravado,
+    compras_percepcion_iva:  acc.compras_percepcion_iva + m.compras.percepcion_iva,
+    compras_ingresos_brutos: acc.compras_ingresos_brutos + m.compras.ingresos_brutos,
     compras_facturas:      acc.compras_facturas + m.compras.facturas,
     compras_notas_credito: acc.compras_notas_credito + m.compras.notas_credito,
     ventas: acc.ventas + m.ventas,
     diferencia: acc.diferencia + m.diferencia,
-  }), { compras_imp_total: 0, compras_total_iva: 0, compras_iva_21: 0, compras_neto_gravado: 0, compras_facturas: 0, compras_notas_credito: 0, ventas: 0, diferencia: 0 });
+  }), { compras_imp_total: 0, compras_total_iva: 0, compras_iva_21: 0, compras_neto_gravado: 0, compras_percepcion_iva: 0, compras_ingresos_brutos: 0, compras_facturas: 0, compras_notas_credito: 0, ventas: 0, diferencia: 0 });
 
   const tipos = [...tiposSet.entries()]
     .map(([tipo, es_nc]) => ({ tipo, es_nc }))
@@ -436,6 +479,8 @@ router.get('/export-resumen', async (req, res, next) => {
       'Compras (Imp. Total)': m.compras.imp_total,
       'IVA Compras': m.compras.total_iva,
       'Neto Gravado': m.compras.neto_gravado,
+      'Percepción IVA': m.compras.percepcion_iva,
+      'Ingresos Brutos': m.compras.ingresos_brutos,
       'Ventas': m.ventas,
       'Diferencia': m.diferencia,
       'Saldo': saldoLabel(m.diferencia),
@@ -445,18 +490,20 @@ router.get('/export-resumen', async (req, res, next) => {
       'Compras (Imp. Total)': totales.compras_imp_total,
       'IVA Compras': totales.compras_total_iva,
       'Neto Gravado': totales.compras_neto_gravado,
+      'Percepción IVA': totales.compras_percepcion_iva,
+      'Ingresos Brutos': totales.compras_ingresos_brutos,
       'Ventas': totales.ventas,
       'Diferencia': totales.diferencia,
       'Saldo': saldoLabel(totales.diferencia),
     });
 
     const ws = XLSX.utils.json_to_sheet(rows, {
-      header: ['Mes', 'Compras (Imp. Total)', 'IVA Compras', 'Neto Gravado', 'Ventas', 'Diferencia', 'Saldo'],
+      header: ['Mes', 'Compras (Imp. Total)', 'IVA Compras', 'Neto Gravado', 'Percepción IVA', 'Ingresos Brutos', 'Ventas', 'Diferencia', 'Saldo'],
     });
-    ws['!cols'] = [16, 20, 16, 16, 16, 16, 12].map(w => ({ wch: w }));
-    // Formato con 2 decimales en las columnas de montos (B..F), filas de datos + totales.
+    ws['!cols'] = [16, 20, 16, 16, 16, 16, 16, 16, 12].map(w => ({ wch: w }));
+    // Formato con 2 decimales en las columnas de montos (B..H), filas de datos + totales.
     for (let r = 1; r <= rows.length; r++) {
-      for (const c of [1, 2, 3, 4, 5]) {
+      for (const c of [1, 2, 3, 4, 5, 6, 7]) {
         const cell = ws[XLSX.utils.encode_cell({ r, c })];
         if (cell && cell.t === 'n') cell.z = '#,##0.00';
       }
