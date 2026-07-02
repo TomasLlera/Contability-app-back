@@ -3,7 +3,7 @@ const router = express.Router();
 const multer = require('multer');
 const XLSX = require('xlsx');
 const PDFDocument = require('pdfkit');
-const { IvaCompra, IvaVenta, IvaConfig, Counter } = require('../models');
+const { IvaCompra, IvaVenta, IvaConfig, Counter, Movimiento } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const upload = multer({ storage: multer.memoryStorage() });
@@ -376,7 +376,7 @@ const esNotaCredito = (tipo) => norm(tipo).includes('credito');
 // el desglose `por_tipo` (montos crudos por tipo + flag es_nc) para que el front
 // pueda filtrar/sumar por tipo de comprobante.
 async function buildResumen() {
-  const [comprasAgg, ventasAgg] = await Promise.all([
+  const [comprasAgg, ventasAgg, movPercepAgg] = await Promise.all([
     IvaCompra.aggregate([
       { $group: {
           _id: { mes: '$mes', tipo: '$tipo' },
@@ -391,6 +391,22 @@ async function buildResumen() {
     ]),
     IvaVenta.aggregate([
       { $group: { _id: '$mes', total: { $sum: '$total' }, items: { $sum: 1 } } },
+    ]),
+    // Percepciones/IIBB cargadas en los comprobantes de Subrubros/Caja Rápida.
+    // Fuente distinta a IvaCompra: si el usuario carga lo mismo en ambos lados,
+    // se cuenta doble (es esperado, no un bug). La NC resta (signo -1) igual que
+    // en IvaCompra. Se agrupa por mes = 'YYYY-MM' (substr de la fecha 'YYYY-MM-DD'),
+    // mismo formato que IvaCompra.mes, para que caigan en el mismo mes.
+    Movimiento.aggregate([
+      { $match: {
+          tipo: { $in: ['factura', 'nota_credito'] },
+          $or: [{ percepcion_iva: { $gt: 0 } }, { ingresos_brutos: { $gt: 0 } }],
+      } },
+      { $group: {
+          _id: { mes: { $substr: ['$fecha', 0, 7] }, tipo: '$tipo' },
+          percepcion_iva:  { $sum: '$percepcion_iva' },
+          ingresos_brutos: { $sum: '$ingresos_brutos' },
+      } },
     ]),
   ]);
 
@@ -420,6 +436,19 @@ async function buildResumen() {
     cp.facturas      += es_nc ? 0 : c.imp_total;
     cp.notas_credito += es_nc ? c.imp_total : 0;
     cp.por_tipo[tipo] = { tipo, es_nc, imp_total: c.imp_total, total_iva: c.total_iva, iva_21: c.iva_21, neto_gravado: c.neto_gravado, items: c.items };
+  }
+  // Sumar las percepciones/IIBB derivadas de los movimientos (Subrubros/Caja Rápida)
+  // al acumulado mensual. 'nota_credito' resta, 'factura' suma. Si el mes no existía
+  // en el map (no había IvaCompra ese mes), se crea. Estos montos entran solo en
+  // percepcion_iva/ingresos_brutos: no tocan imp_total/total_iva ni la diferencia.
+  for (const m of movPercepAgg) {
+    const mes = m._id?.mes;
+    if (!mes) continue;
+    const signo = m._id.tipo === 'nota_credito' ? -1 : 1;
+    if (!map[mes]) map[mes] = { mes, compras: emptyCompras(), ventas: 0, ventas_items: 0 };
+    const cp = map[mes].compras;
+    cp.percepcion_iva  += signo * (m.percepcion_iva || 0);
+    cp.ingresos_brutos += signo * (m.ingresos_brutos || 0);
   }
   for (const v of ventasAgg) {
     if (!v._id) continue;

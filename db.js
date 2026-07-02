@@ -399,7 +399,7 @@ const db = {
     }));
   },
 
-  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [], idempotency_key = null }) {
+  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [], percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
     // Guarda de idempotencia: si ya existe un movimiento con esta clave, es un
@@ -440,6 +440,10 @@ const db = {
         tipo: tipoFinal, facturas_vinculadas_ids: vinculadas, pagado: false,
         fecha_vencimiento: venc,
         campos_extra: campos_extra || {}, concepto: concepto || '',
+        // Percepciones/retenciones: solo tienen sentido en facturas/NC, pero se
+        // guardan siempre (0 por defecto). No afectan el `monto`.
+        percepcion_iva: Number(percepcion_iva) || 0,
+        ingresos_brutos: Number(ingresos_brutos) || 0,
         metodo_pago: metodo,
         documento: docFinal,
         caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
@@ -462,7 +466,7 @@ const db = {
     return withId(await Movimiento.findById(id).lean());
   },
 
-  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, documento }) {
+  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, documento, percepcion_iva, ingresos_brutos }) {
     const mov = await Movimiento.findById(Number(id));
     if (!mov) throw new Error('Movimiento no encontrado');
     validarFecha(fecha);
@@ -471,6 +475,9 @@ const db = {
     mov.fecha = fecha;
     mov.fecha_vencimiento = fecha_vencimiento || null;
     mov.campos_extra = campos_extra || {};
+    // Percepciones/retenciones: solo se actualizan si vienen en el payload (no pisar con 0).
+    if (percepcion_iva !== undefined) mov.percepcion_iva = Number(percepcion_iva) || 0;
+    if (ingresos_brutos !== undefined) mov.ingresos_brutos = Number(ingresos_brutos) || 0;
     if (tipo) mov.tipo = tipo;
     if (concepto !== undefined) mov.concepto = concepto;
     if (metodo_pago !== undefined) mov.metodo_pago = normalizarMetodoPago(metodo_pago);
@@ -537,7 +544,7 @@ const db = {
     return { deleted: deletedCount + huerfanos };
   },
 
-  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null, idempotency_key = null }) {
+  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null, percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw new Error('Subrubro no encontrado');
     // Guarda de idempotencia (mismo criterio que createMovimiento).
@@ -562,6 +569,9 @@ const db = {
         facturas_vinculadas_ids: idsNum, pagado: false,
         fecha_vencimiento: null, campos_extra: campos_extra || {},
         concepto: '', metodo_pago: metodo,
+        // Percepciones: solo la NC las lleva (el pago no). No suman al monto.
+        percepcion_iva: tipo === 'nota_credito' ? (Number(percepcion_iva) || 0) : 0,
+        ingresos_brutos: tipo === 'nota_credito' ? (Number(ingresos_brutos) || 0) : 0,
         caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
         idempotency_key: idempotency_key ? String(idempotency_key) : null,
         _ajuste_pago_id: null, created_at: now()
@@ -581,7 +591,7 @@ const db = {
     return withId(await Movimiento.findById(id).lean());
   },
 
-  async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago }) {
+  async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago, percepcion_iva, ingresos_brutos }) {
     const mov = await Movimiento.findById(Number(movId));
     if (!mov) throw new Error('Movimiento no encontrado');
     await Movimiento.deleteMany({ _ajuste_pago_id: Number(movId) });
@@ -595,6 +605,9 @@ const db = {
     if (metodo_pago !== undefined && mov.tipo === 'pago') {
       mov.metodo_pago = normalizarMetodoPago(metodo_pago);
     }
+    // Percepciones: solo se tocan si vienen en el payload (y solo tienen sentido en NC).
+    if (percepcion_iva !== undefined) mov.percepcion_iva = mov.tipo === 'nota_credito' ? (Number(percepcion_iva) || 0) : 0;
+    if (ingresos_brutos !== undefined) mov.ingresos_brutos = mov.tipo === 'nota_credito' ? (Number(ingresos_brutos) || 0) : 0;
     await mov.save();
 
     // Sin ajuste por diferencia: el saldo pendiente vive en la factura (modelo de

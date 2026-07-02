@@ -63,6 +63,11 @@ const movimientoSchema = new mongoose.Schema({
   pagado: { type: Boolean, default: false },
   fecha_vencimiento: String,
   campos_extra: { type: mongoose.Schema.Types.Mixed, default: {} },
+  // Retenciones/percepciones del comprobante (solo aplican a tipo 'factura'/'nota_credito').
+  // NO suman al `monto` de la factura; se acumulan aparte por mes en la sección IVA
+  // (routes/iva.js buildResumen). Una NC las revierte (signo negativo).
+  percepcion_iva: { type: Number, default: 0 },
+  ingresos_brutos: { type: Number, default: 0 },
   concepto: { type: String, default: '' },
   // Método de pago: efectivo, transferencia o null (sin definir)
   metodo_pago: { type: String, enum: ['efectivo', 'transferencia', null], default: null },
