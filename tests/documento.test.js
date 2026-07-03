@@ -149,4 +149,25 @@ describe('remito → efectivo automático + Caja del Día', () => {
     expect(caja).not.toBeNull();
     expect(caja.metodo).toBe('efectivo');
   });
+
+  it('el gasto de caja se agenda en la fecha de vencimiento del remito, no la de emisión', async () => {
+    const res = await crearRemito({ fecha_vencimiento: '2025-01-15' });
+    const caja = await CajaMovimiento.findOne({ movimiento_id: res.body.id }).lean();
+    expect(caja.fecha).toBe('2025-01-15');   // vencimiento, no emisión (2025-01-01)
+  });
+
+  it('editar el vencimiento del remito reagenda el gasto de caja', async () => {
+    const res = await crearRemito({ fecha_vencimiento: '2025-01-15' });
+    await request(app).put(`/api/movimientos/${res.body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 100, fecha: '2025-01-01', fecha_vencimiento: '2025-01-20', tipo: 'factura', documento: 'remito' });
+    const caja = await CajaMovimiento.findOne({ movimiento_id: res.body.id }).lean();
+    expect(caja.fecha).toBe('2025-01-20');
+  });
+
+  it('un remito sin vencimiento cae a la fecha de emisión', async () => {
+    const res = await crearRemito();   // sin fecha_vencimiento y subrubro sin criterio
+    const caja = await CajaMovimiento.findOne({ movimiento_id: res.body.id }).lean();
+    expect(caja.fecha).toBe('2025-01-01');
+  });
 });

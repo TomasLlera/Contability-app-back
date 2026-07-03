@@ -189,10 +189,11 @@ async function borrarCajaRemito(movId) {
 // Sincroniza el ítem de Caja del Día que representa un remito. Un remito se paga en
 // efectivo, así que su factura genera automáticamente un gasto en la Caja (efectivo)
 // enlazado por movimiento_id, para que aparezca solo bajo la sección de Efectivo.
+// El gasto se agenda en la FECHA DE VENCIMIENTO del remito (cuándo hay que pagarlo);
+// si el remito no tiene vencimiento se cae a la fecha de emisión.
 // El gasto queda SIN CONFIRMAR: aparece en la Caja pero no descuenta hasta que el
 // usuario lo confirme con el ✓. Se marca auto_sync:false a propósito para quedar
-// fuera del reconciliador de vencimientos (que si no le movería la fecha al
-// vencimiento y le reescribiría el concepto).
+// fuera del reconciliador de vencimientos (que si no le reescribiría el concepto).
 //   • esRemito=true  → crea/actualiza el gasto (fecha, monto, concepto, efectivo).
 //   • esRemito=false → borra el gasto auto-generado del remito (si lo había).
 // El llamador solo invoca la rama de borrado cuando el movimiento ES o FUE un remito,
@@ -204,7 +205,8 @@ async function syncCajaRemito(mov, sub, esRemito) {
     return;
   }
   const set = {
-    fecha: mov.fecha,
+    // El gasto va en la caja del día en que vence el remito, no en el de emisión.
+    fecha: mov.fecha_vencimiento || mov.fecha,
     tipo: 'gasto',
     concepto: `Remito — ${sub?.nombre || 'Proveedor'}`,
     monto: Number(mov.monto) || 0,
@@ -526,7 +528,7 @@ const db = {
     await recalcularPagos(subrubroId);
     // Remito → gasto automático (sin confirmar) en la Caja del Día, en efectivo.
     if (docFinal === 'remito' && caja_mov_id == null) {
-      await syncCajaRemito({ _id: id, fecha, monto, subrubro_id: subrubroId }, sub, true);
+      await syncCajaRemito({ _id: id, fecha, fecha_vencimiento: venc, monto, subrubro_id: subrubroId }, sub, true);
     }
     return withId(await Movimiento.findById(id).lean());
   },
@@ -753,22 +755,44 @@ const db = {
   async getVencimientos(diasAdelante = 30) {
     const hoy = new Date();
     hoy.setHours(0, 0, 0, 0);
-    const movs = await Movimiento.find({ fecha_vencimiento: { $exists: true, $ne: null }, tipo: 'factura', pagado: { $ne: true } }).lean();
-    const subIds = [...new Set(movs.map(m => m.subrubro_id))];
+    const candidatas = await Movimiento.find({ fecha_vencimiento: { $exists: true, $ne: null }, tipo: 'factura', pagado: { $ne: true } }).lean();
+    if (candidatas.length === 0) return [];
+
+    const subIds = [...new Set(candidatas.map(m => m.subrubro_id))];
+    // Para cada subrubro necesitamos TODOS sus movimientos (facturas + pagos + NC),
+    // no solo las facturas por vencer, porque el saldo real de una factura sale de
+    // descontarle los pagos y notas de crédito (vinculados o aplicados FIFO).
+    const movsSub = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+    const porSub = new Map();
+    for (const m of movsSub) {
+      if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
+      porSub.get(m.subrubro_id).push(m);
+    }
+    const saldosPorSub = new Map(); // subId -> Map(facturaId -> saldo)
+    for (const [sid, lista] of porSub) saldosPorSub.set(sid, computeSaldosFacturas(lista));
+
     const subs = await Subrubro.find({ _id: { $in: subIds } }).lean();
     const rubroIds = [...new Set(subs.map(s => s.rubro_id))];
     const rubros = await Rubro.find({ _id: { $in: rubroIds } }).lean();
     const subMap = Object.fromEntries(subs.map(s => [s._id, { ...s, id: s._id }]));
     const rubroMap = Object.fromEntries(rubros.map(r => [r._id, { ...r, id: r._id }]));
-    return movs
+    return candidatas
       .map(m => {
         const venc = new Date(m.fecha_vencimiento + 'T00:00:00');
         const diasRestantes = Math.ceil((venc - hoy) / (1000 * 60 * 60 * 24));
         const sub = subMap[m.subrubro_id];
         const rubro = sub ? rubroMap[sub.rubro_id] : null;
-        return { ...m, id: m._id, subrubro: sub, rubro, dias_restantes: diasRestantes };
+        const saldoCalc = saldosPorSub.get(m.subrubro_id)?.get(m._id);
+        // Saldo pendiente real. Si por algún motivo no se pudo calcular, cae al monto.
+        const saldo = saldoCalc == null ? r2(m.monto) : saldoCalc;
+        // `monto` se expone como el saldo pendiente porque es lo que todos los
+        // consumidores (dashboard, panel, email) muestran como "lo que se debe".
+        // El monto original de la factura queda en `monto_original`.
+        return { ...m, id: m._id, subrubro: sub, rubro, dias_restantes: diasRestantes, saldo, monto: saldo, monto_original: m.monto };
       })
       .filter(m => m.dias_restantes <= diasAdelante)
+      // Una NC o pagos que cubren todo dejan saldo 0: ya no es un vencimiento pendiente.
+      .filter(m => (m.saldo || 0) > 0.005)
       .sort((a, b) => a.fecha_vencimiento.localeCompare(b.fecha_vencimiento));
   },
 
