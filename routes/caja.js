@@ -153,6 +153,11 @@ async function reconciliarAutoSync() {
     if (item.fecha !== nuevaFecha) set.fecha = nuevaFecha;
     if (item.concepto !== concepto) set.concepto = concepto;
     if (item.subrubro_id !== f.subrubro_id) set.subrubro_id = f.subrubro_id;
+    // Método de pago: el subrubro manda. Si la factura tiene un método cargado y difiere
+    // del ítem de Caja, se actualiza. Si la factura no tiene método (null), se respeta el
+    // que el usuario haya puesto en la Caja (no se pisa).
+    const metFactura = f.metodo_pago || null;
+    if (metFactura && (item.metodo || null) !== metFactura) set.metodo = metFactura;
     if (!item.auto_sync) set.auto_sync = true; // backfill de la firma legacy
     if (Object.keys(set).length) {
       updateOps.push({ updateOne: { filter: { _id: item._id }, update: { $set: set } } });
@@ -257,7 +262,9 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
             tipo: 'gasto',
             concepto,
             monto: Number(saldoDe(v)) || 0,   // saldo actual, no monto original
-            metodo: null,
+            // Método heredado de la factura: si se cargó con efectivo/transferencia en
+            // el subrubro, el ítem de Caja aparece ya con ese método (si no, sin definir).
+            metodo: v.metodo_pago || null,
             subrubro_id: v.subrubro_id,
             movimiento_id: v._id,
             confirmado: false,
@@ -407,6 +414,20 @@ router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) =>
   if (confirmado !== undefined) upd.confirmado = confirmado;
   if (pago_mov_id !== undefined) upd.pago_mov_id = pago_mov_id !== null ? Number(pago_mov_id) : null;
   await CajaMovimiento.findByIdAndUpdate(Number(req.params.id), upd);
+  // Sync inverso del método (Caja → subrubro): si se cambió el método de un ítem
+  // pendiente que representa una factura por vencer, se escribe también en la factura
+  // para que ambos lados queden consistentes. No toca remitos (siempre efectivo) ni
+  // ítems ya confirmados.
+  if (metodo !== undefined) {
+    const item = await CajaMovimiento.findById(Number(req.params.id)).lean();
+    if (item?.movimiento_id && item.confirmado === false) {
+      const fac = await Movimiento.findById(Number(item.movimiento_id));
+      if (fac && fac.tipo === 'factura' && fac.documento !== 'remito' && (fac.metodo_pago || null) !== (metodo || null)) {
+        fac.metodo_pago = metodo || null;
+        await fac.save();
+      }
+    }
+  }
   res.json({ ok: true });
 }));
 

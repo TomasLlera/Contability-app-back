@@ -182,3 +182,78 @@ describe('Reconciliación auto-sync: cambios en la factura se reflejan en caja',
     expect((await cajaDe(venc)).some(c => c.movimiento_id === facturaId)).toBe(false);
   });
 });
+
+describe('Método de pago: sincronización subrubro ↔ Caja del Día', () => {
+  beforeEach(bootstrap);
+
+  async function syncEl(fecha) {
+    return request(app).post('/api/caja/auto-sync')
+      .set('Authorization', `Bearer ${adminToken}`).query({ fecha });
+  }
+  async function cajaDe(fecha) {
+    const r = await request(app).get('/api/caja')
+      .set('Authorization', `Bearer ${adminToken}`).query({ fecha });
+    return r.body;
+  }
+
+  it('el método cargado en la factura viaja al ítem de Caja al vencer', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 5);
+    const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: hoy, tipo: 'factura', fecha_vencimiento: venc, metodo_pago: 'transferencia' });
+    const facturaId = fact.body.id;
+
+    await syncEl(venc);
+    const gasto = (await cajaDe(venc)).find(c => c.movimiento_id === facturaId);
+    expect(gasto.metodo).toBe('transferencia');
+  });
+
+  it('factura sin método → ítem de Caja sin definir (null)', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 5);
+    const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: hoy, tipo: 'factura', fecha_vencimiento: venc });
+    const facturaId = fact.body.id;
+
+    await syncEl(venc);
+    const gasto = (await cajaDe(venc)).find(c => c.movimiento_id === facturaId);
+    expect(gasto.metodo == null).toBe(true);
+  });
+
+  it('cambiar el método en la factura se refleja en el ítem de Caja al reconciliar', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 5);
+    const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: hoy, tipo: 'factura', fecha_vencimiento: venc, metodo_pago: 'efectivo' });
+    const facturaId = fact.body.id;
+    await syncEl(venc);
+
+    await request(app).put(`/api/movimientos/${facturaId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: hoy, tipo: 'factura', fecha_vencimiento: venc, metodo_pago: 'transferencia' });
+    await syncEl(venc);
+    const gasto = (await cajaDe(venc)).find(c => c.movimiento_id === facturaId);
+    expect(gasto.metodo).toBe('transferencia');
+  });
+
+  it('poner el método en la Caja lo escribe de vuelta en la factura (Caja → subrubro)', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 5);
+    const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: hoy, tipo: 'factura', fecha_vencimiento: venc });
+    const facturaId = fact.body.id;
+    await syncEl(venc);
+    const gasto = (await cajaDe(venc)).find(c => c.movimiento_id === facturaId);
+
+    await request(app).put(`/api/caja/${gasto.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ metodo: 'transferencia' });
+
+    const fresh = await Movimiento.findById(facturaId).lean();
+    expect(fresh.metodo_pago).toBe('transferencia');
+  });
+});

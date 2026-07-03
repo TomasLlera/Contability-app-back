@@ -174,6 +174,64 @@ async function recalcularPagos(subrubroId) {
   if (bulkOps.length > 0) await Movimiento.bulkWrite(bulkOps);
 }
 
+// Borra el gasto de Caja del Día de un remito (enlazado por movimiento_id) y, si
+// llegó a confirmarse en Caja, también el pago que esa confirmación generó en el
+// subrubro. El índice único sobre movimiento_id garantiza que hay a lo sumo un ítem,
+// así que basta filtrar por movimiento_id.
+async function borrarCajaRemito(movId) {
+  const items = await CajaMovimiento.find({ movimiento_id: Number(movId) }).lean();
+  for (const it of items) {
+    if (it.pago_mov_id) await Movimiento.deleteOne({ _id: Number(it.pago_mov_id) });
+  }
+  await CajaMovimiento.deleteMany({ movimiento_id: Number(movId) });
+}
+
+// Sincroniza el ítem de Caja del Día que representa un remito. Un remito se paga en
+// efectivo, así que su factura genera automáticamente un gasto en la Caja (efectivo)
+// enlazado por movimiento_id, para que aparezca solo bajo la sección de Efectivo.
+// El gasto queda SIN CONFIRMAR: aparece en la Caja pero no descuenta hasta que el
+// usuario lo confirme con el ✓. Se marca auto_sync:false a propósito para quedar
+// fuera del reconciliador de vencimientos (que si no le movería la fecha al
+// vencimiento y le reescribiría el concepto).
+//   • esRemito=true  → crea/actualiza el gasto (fecha, monto, concepto, efectivo).
+//   • esRemito=false → borra el gasto auto-generado del remito (si lo había).
+// El llamador solo invoca la rama de borrado cuando el movimiento ES o FUE un remito,
+// para no tocar vencimientos auto-sync ni gastos manuales de una factura normal.
+async function syncCajaRemito(mov, sub, esRemito) {
+  const movId = Number(mov._id);
+  if (!esRemito) {
+    await borrarCajaRemito(movId);
+    return;
+  }
+  const set = {
+    fecha: mov.fecha,
+    tipo: 'gasto',
+    concepto: `Remito — ${sub?.nombre || 'Proveedor'}`,
+    monto: Number(mov.monto) || 0,
+    metodo: 'efectivo',
+    subrubro_id: Number(mov.subrubro_id),
+    confirmado: false,
+    auto_sync: false,
+    es_especial: false,
+  };
+  // Upsert por movimiento_id (índice único parcial): si el remito ya tenía su gasto
+  // lo actualiza; si no, lo crea reservando un _id nuevo. No se pisa `confirmado` si
+  // el usuario ya lo confirmó a mano (solo se refresca fecha/monto/concepto).
+  const existente = await CajaMovimiento.findOne({ movimiento_id: movId });
+  if (existente) {
+    const { confirmado, ...refresh } = set;
+    await CajaMovimiento.updateOne({ _id: existente._id }, { $set: refresh });
+  } else {
+    const cajaId = await Counter.next('caja');
+    try {
+      await CajaMovimiento.create({ _id: cajaId, movimiento_id: movId, created_at: now(), ...set });
+    } catch (err) {
+      // Carrera contra el índice único (dos altas simultáneas): el ítem ya existe.
+      if (err.code !== 11000) throw err;
+    }
+  }
+}
+
 const db = {
   // --- LOCALES ---
   async getLocales() {
@@ -424,10 +482,12 @@ const db = {
       venc = calcularVencimientoSub(fecha, sub);
     }
     // Validación de método_pago
-    const metodo = normalizarMetodoPago(metodo_pago);
+    let metodo = normalizarMetodoPago(metodo_pago);
     const id = await Counter.next('movimientos');
     // documento (factura/remito) solo tiene sentido para tipo='factura'.
     const docFinal = tipoFinal === 'factura' ? (documento || 'factura') : null;
+    // Remito: se paga en efectivo en el acto y el método no es editable.
+    if (docFinal === 'remito') metodo = 'efectivo';
     // Vinculación explícita de facturas: solo aplica a pagos / notas de crédito.
     // Si el pago se vincula a una factura puntual, `recalcularPagos` marca esa
     // factura como pagada respetando la elección del usuario (sin tocar las
@@ -441,9 +501,10 @@ const db = {
         fecha_vencimiento: venc,
         campos_extra: campos_extra || {}, concepto: concepto || '',
         // Percepciones/retenciones: solo tienen sentido en facturas/NC, pero se
-        // guardan siempre (0 por defecto). No afectan el `monto`.
-        percepcion_iva: Number(percepcion_iva) || 0,
-        ingresos_brutos: Number(ingresos_brutos) || 0,
+        // guardan siempre (0 por defecto). No afectan el `monto`. Un remito nunca
+        // lleva percepciones.
+        percepcion_iva: docFinal === 'remito' ? 0 : (Number(percepcion_iva) || 0),
+        ingresos_brutos: docFinal === 'remito' ? 0 : (Number(ingresos_brutos) || 0),
         metodo_pago: metodo,
         documento: docFinal,
         caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
@@ -463,12 +524,19 @@ const db = {
       throw err;
     }
     await recalcularPagos(subrubroId);
+    // Remito → gasto automático (sin confirmar) en la Caja del Día, en efectivo.
+    if (docFinal === 'remito' && caja_mov_id == null) {
+      await syncCajaRemito({ _id: id, fecha, monto, subrubro_id: subrubroId }, sub, true);
+    }
     return withId(await Movimiento.findById(id).lean());
   },
 
   async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, documento, percepcion_iva, ingresos_brutos }) {
     const mov = await Movimiento.findById(Number(id));
     if (!mov) throw new Error('Movimiento no encontrado');
+    // Estado previo: para saber si hay que limpiar el gasto de caja de un remito
+    // que dejó de serlo (o quedó como pago/NC).
+    const eraRemito = mov.tipo === 'factura' && mov.documento === 'remito';
     validarFecha(fecha);
     mov.monto = Number(monto) || 0;
     mov.pago = Number(pago) || 0;
@@ -484,8 +552,23 @@ const db = {
     if (documento !== undefined) {
       mov.documento = mov.tipo === 'factura' ? (documento || 'factura') : null;
     }
+    const esRemito = mov.tipo === 'factura' && mov.documento === 'remito';
+    // Remito: sin percepciones y siempre en efectivo (no editable).
+    if (esRemito) {
+      mov.percepcion_iva = 0;
+      mov.ingresos_brutos = 0;
+      mov.metodo_pago = 'efectivo';
+    }
     await mov.save();
     await recalcularPagos(mov.subrubro_id);
+    // Mantener en sync el gasto de Caja del Día solo si el movimiento es o fue un
+    // remito: crear/actualizar si lo es, o eliminar el gasto auto-generado si dejó
+    // de serlo. Para una factura normal no se toca nada (ni vencimientos ni gastos
+    // manuales enlazados).
+    if (esRemito || eraRemito) {
+      const sub = await Subrubro.findById(mov.subrubro_id).lean();
+      await syncCajaRemito(mov, sub, esRemito);
+    }
     return withId(mov.toObject());
   },
 
@@ -515,10 +598,11 @@ const db = {
     // la representaba (apunta a ella por movimiento_id). Sin esto, el vencimiento
     // borrado seguiría arrastrándose en la Caja del Día día a día.
     if (mov.tipo === 'factura') {
-      await CajaMovimiento.deleteMany({
-        movimiento_id: Number(id),
-        confirmado: false,
-      });
+      if (mov.documento === 'remito') {
+        await borrarCajaRemito(Number(id));
+      } else {
+        await CajaMovimiento.deleteMany({ movimiento_id: Number(id), confirmado: false });
+      }
     }
     await Movimiento.findByIdAndDelete(Number(id));
     await recalcularPagos(subrubroId);
