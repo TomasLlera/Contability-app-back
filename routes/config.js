@@ -68,7 +68,7 @@ router.get('/', async (req, res, next) => {
 // PUT /api/config
 router.put('/', requireAdmin, audit('app_config'), async (req, res, next) => {
   try {
-    const allowed = ['email_alertas', 'alertas_activas', 'dias_anticipacion'];
+    const allowed = ['email_alertas', 'alertas_activas', 'dias_anticipacion', 'dashboard_tablas'];
     const data = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
     const cfg = await db.updateConfig(data);
     res.json(cfg);

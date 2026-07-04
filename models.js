@@ -185,6 +185,9 @@ const AppConfig = mongoose.model('AppConfig', new mongoose.Schema({
   email_alertas: { type: String, default: '' },
   alertas_activas: { type: Boolean, default: false },
   dias_anticipacion: { type: Number, default: 7 },
+  // Rubros a mostrar como tablas de "Saldos mensuales" en el dashboard.
+  // Cada rubro trae asociado su gráfico (tendencia). Vacío = auto (Proveedores).
+  dashboard_tablas: { type: [Number], default: [] },
 }));
 
 // --- Stock ---
