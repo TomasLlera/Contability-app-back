@@ -65,14 +65,44 @@ function calcularProximoDiaSemana(fechaStr, diaSemana) {
   return date.toISOString().split('T')[0];
 }
 
+// Dada una fecha 'YYYY-MM-DD' y un día del mes objetivo (1..31), devuelve la fecha
+// de vencimiento en ese día fijo del mes:
+//   • si el día todavía no pasó en el mes de emisión (día objetivo >= día de emisión)
+//     → vence ese día del mes de emisión (incluye el mismo día de emisión);
+//   • si ya pasó (día objetivo < día de emisión) → vence ese día del mes siguiente.
+// Si el mes destino no tiene ese día (p. ej. 31 en un mes de 30, o 30/31 en febrero),
+// se ajusta al ÚLTIMO día de ese mes (28/29-feb, 30-abr, etc.).
+function calcularProximoDiaMes(fechaStr, diaMes) {
+  const target = Number(diaMes);
+  if (!Number.isInteger(target) || target < 1 || target > 31) return null;
+  const date = new Date(fechaStr + 'T00:00:00');
+  const emisionDia = date.getDate();
+  let anio = date.getFullYear();
+  let mes = date.getMonth(); // 0-based
+  // Si el día objetivo ya pasó este mes, saltar al mes siguiente.
+  if (target < emisionDia) {
+    mes += 1;
+    if (mes > 11) { mes = 0; anio += 1; }
+  }
+  // Último día del mes destino: día 0 del mes siguiente.
+  const ultimoDia = new Date(anio, mes + 1, 0).getDate();
+  const dia = Math.min(target, ultimoDia);
+  return `${anio}-${String(mes + 1).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+}
+
 // Calcula el vencimiento de una factura según el modo configurado en el subrubro.
-// 'dia_semana' usa `dia_semana_vencimiento`; cualquier otro valor (incluyendo el
-// default/legacy 'dias' o ausente) usa `dia_vencimiento` (N días desde la emisión).
+// 'dia_semana' usa `dia_semana_vencimiento`; 'dia_mes' usa `dia_mes_vencimiento`;
+// cualquier otro valor (incluyendo el default/legacy 'dias' o ausente) usa
+// `dia_vencimiento` (N días desde la emisión).
 function calcularVencimientoSub(fechaStr, sub) {
   if (!fechaStr || !sub) return null;
   if (sub.modo_vencimiento === 'dia_semana') {
     if (sub.dia_semana_vencimiento == null) return null;
     return calcularProximoDiaSemana(fechaStr, sub.dia_semana_vencimiento);
+  }
+  if (sub.modo_vencimiento === 'dia_mes') {
+    if (sub.dia_mes_vencimiento == null) return null;
+    return calcularProximoDiaMes(fechaStr, sub.dia_mes_vencimiento);
   }
   if (!sub.dia_vencimiento) return null;
   return calcularProximoVencimiento(fechaStr, sub.dia_vencimiento);
@@ -234,6 +264,54 @@ async function syncCajaRemito(mov, sub, esRemito) {
   }
 }
 
+// Espeja en la Caja del Día un pago registrado desde un Subrubro (sincronización
+// Subrubro → Caja). Un pago del subrubro es una salida de caja real, así que se
+// refleja como un gasto CONFIRMADO en la Caja, en la FECHA REAL del pago y con su
+// método. Se enlaza por pago_mov_id + origen:'subrubro' para poder mantenerlo en
+// sync (editar) o eliminarlo en espejo cuando el pago cambia o se borra.
+//   • activo=true  → crea/actualiza el gasto espejo.
+//   • activo=false → borra el gasto espejo (si lo había: p. ej. el pago dejó de serlo).
+// NO se invoca para pagos que vinieron de la Caja (traen caja_mov_id): esos ya tienen
+// su propio ítem en la Caja y crear otro los duplicaría.
+async function syncCajaPago(pago, sub, activo) {
+  const pagoId = Number(pago._id);
+  if (!activo) {
+    await CajaMovimiento.deleteMany({ pago_mov_id: pagoId, origen: 'subrubro' });
+    return;
+  }
+  const set = {
+    // La fecha del gasto en Caja es la fecha real del pago (no un vencimiento).
+    fecha: pago.fecha,
+    tipo: 'gasto',
+    concepto: `Pago — ${sub?.nombre || 'Subrubro'}`,
+    monto: Number(pago.pago) || 0,
+    // Un pago sin método definido cae a 'efectivo' (misma convención que la Caja).
+    metodo: pago.metodo_pago || 'efectivo',
+    subrubro_id: Number(pago.subrubro_id),
+    // Ya es un pago concretado → entra confirmado y descuenta de la Caja.
+    confirmado: true,
+    origen: 'subrubro',
+    auto_sync: false,
+    es_especial: false,
+  };
+  const existente = await CajaMovimiento.findOne({ pago_mov_id: pagoId, origen: 'subrubro' });
+  if (existente) {
+    await CajaMovimiento.updateOne({ _id: existente._id }, { $set: set });
+  } else {
+    const cajaId = await Counter.next('caja');
+    try {
+      await CajaMovimiento.create({
+        _id: cajaId, pago_mov_id: pagoId, created_at: now(),
+        // Clave determinística: un pago genera a lo sumo un ítem de caja espejo.
+        idempotency_key: `pago-sync-${pagoId}`, ...set,
+      });
+    } catch (err) {
+      // Carrera contra el índice único (idempotency_key): el ítem ya existe.
+      if (err.code !== 11000) throw err;
+    }
+  }
+}
+
 const db = {
   // --- LOCALES ---
   async getLocales() {
@@ -359,13 +437,18 @@ const db = {
       doc.dia_vencimiento = d;
     }
     if (extra.modo_vencimiento !== undefined && extra.modo_vencimiento !== null && extra.modo_vencimiento !== '') {
-      if (!['dias', 'dia_semana'].includes(extra.modo_vencimiento)) throw new Error("modo_vencimiento debe ser 'dias' o 'dia_semana'");
+      if (!['dias', 'dia_semana', 'dia_mes'].includes(extra.modo_vencimiento)) throw new Error("modo_vencimiento debe ser 'dias', 'dia_semana' o 'dia_mes'");
       doc.modo_vencimiento = extra.modo_vencimiento;
     }
     if (extra.dia_semana_vencimiento !== undefined && extra.dia_semana_vencimiento !== null && extra.dia_semana_vencimiento !== '') {
       const w = Number(extra.dia_semana_vencimiento);
       if (!Number.isInteger(w) || w < 0 || w > 6) throw new Error('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
       doc.dia_semana_vencimiento = w;
+    }
+    if (extra.dia_mes_vencimiento !== undefined && extra.dia_mes_vencimiento !== null && extra.dia_mes_vencimiento !== '') {
+      const dm = Number(extra.dia_mes_vencimiento);
+      if (!Number.isInteger(dm) || dm < 1 || dm > 31) throw new Error('dia_mes_vencimiento debe ser un entero entre 1 y 31');
+      doc.dia_mes_vencimiento = dm;
     }
     if (extra.metodo_pago_default !== undefined && extra.metodo_pago_default !== null && extra.metodo_pago_default !== '') {
       if (!['efectivo', 'transferencia', 'ambas'].includes(extra.metodo_pago_default)) throw new Error("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
@@ -394,7 +477,7 @@ const db = {
     }
     if (fields.modo_vencimiento !== undefined) {
       const m = fields.modo_vencimiento || 'dias';
-      if (!['dias', 'dia_semana'].includes(m)) throw new Error("modo_vencimiento debe ser 'dias' o 'dia_semana'");
+      if (!['dias', 'dia_semana', 'dia_mes'].includes(m)) throw new Error("modo_vencimiento debe ser 'dias', 'dia_semana' o 'dia_mes'");
       upd.modo_vencimiento = m;
     }
     if (fields.dia_semana_vencimiento !== undefined) {
@@ -404,6 +487,15 @@ const db = {
         const w = Number(fields.dia_semana_vencimiento);
         if (!Number.isInteger(w) || w < 0 || w > 6) throw new Error('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
         upd.dia_semana_vencimiento = w;
+      }
+    }
+    if (fields.dia_mes_vencimiento !== undefined) {
+      if (fields.dia_mes_vencimiento === null || fields.dia_mes_vencimiento === '') {
+        upd.dia_mes_vencimiento = null;
+      } else {
+        const dm = Number(fields.dia_mes_vencimiento);
+        if (!Number.isInteger(dm) || dm < 1 || dm > 31) throw new Error('dia_mes_vencimiento debe ser un entero entre 1 y 31');
+        upd.dia_mes_vencimiento = dm;
       }
     }
     if (fields.metodo_pago_default !== undefined) {
@@ -422,7 +514,7 @@ const db = {
     }
     // Si cambió algún campo de vencimiento, regenerar el vencimiento de las facturas
     // pendientes del subrubro para que reflejen la regla nueva (la regla del subrubro manda).
-    const cambioVenc = ['modo_vencimiento', 'dia_vencimiento', 'dia_semana_vencimiento']
+    const cambioVenc = ['modo_vencimiento', 'dia_vencimiento', 'dia_semana_vencimiento', 'dia_mes_vencimiento']
       .some(k => fields[k] !== undefined);
     if (cambioVenc) await recomputarVencimientosSubrubro(Number(id));
   },
@@ -530,6 +622,12 @@ const db = {
     if (docFinal === 'remito' && caja_mov_id == null) {
       await syncCajaRemito({ _id: id, fecha, fecha_vencimiento: venc, monto, subrubro_id: subrubroId }, sub, true);
     }
+    // Pago registrado desde el Subrubro → reflejarlo como gasto confirmado en la
+    // Caja del Día (sincronización Subrubro → Caja). Solo si NO vino de la Caja
+    // (caja_mov_id null): un pago originado en la Caja ya tiene allí su ítem.
+    if (tipoFinal === 'pago' && caja_mov_id == null) {
+      await syncCajaPago({ _id: id, fecha, pago: Number(pago) || 0, metodo_pago: metodo, subrubro_id: subrubroId }, sub, true);
+    }
     return withId(await Movimiento.findById(id).lean());
   },
 
@@ -537,8 +635,10 @@ const db = {
     const mov = await Movimiento.findById(Number(id));
     if (!mov) throw new Error('Movimiento no encontrado');
     // Estado previo: para saber si hay que limpiar el gasto de caja de un remito
-    // que dejó de serlo (o quedó como pago/NC).
+    // que dejó de serlo (o quedó como pago/NC), o el espejo de Caja de un pago.
     const eraRemito = mov.tipo === 'factura' && mov.documento === 'remito';
+    const eraPago = mov.tipo === 'pago';
+    const veniaDeCaja = mov.caja_mov_id != null;
     validarFecha(fecha);
     mov.monto = Number(monto) || 0;
     mov.pago = Number(pago) || 0;
@@ -571,6 +671,13 @@ const db = {
       const sub = await Subrubro.findById(mov.subrubro_id).lean();
       await syncCajaRemito(mov, sub, esRemito);
     }
+    // Mantener en sync el espejo de Caja de un pago del subrubro: actualizar si sigue
+    // siendo pago, o borrarlo si dejó de serlo. No aplica a pagos que vinieron de la
+    // Caja (esos ya tienen su propio ítem y no llevan espejo).
+    if (!veniaDeCaja && (mov.tipo === 'pago' || eraPago)) {
+      const subP = await Subrubro.findById(mov.subrubro_id).lean();
+      await syncCajaPago(mov, subP, mov.tipo === 'pago');
+    }
     return withId(mov.toObject());
   },
 
@@ -589,6 +696,12 @@ const db = {
         { _id: Number(mov.caja_mov_id), pago_mov_id: Number(id) },
         { $set: { confirmado: false, pago_mov_id: null } }
       );
+    }
+    // Espejo de Caja de un pago del subrubro (sincronización Subrubro → Caja): se
+    // borra junto con el pago. Va ANTES del updateMany de abajo para que se elimine
+    // de verdad (no que quede como gasto pendiente desligado).
+    if (mov.tipo === 'pago') {
+      await CajaMovimiento.deleteMany({ pago_mov_id: Number(id), origen: 'subrubro' });
     }
     // Defensa adicional: por si el caja_mov_id quedó suelto, buscar cualquier
     // CajaMovimiento que apunte a este pago y limpiarlo.
@@ -674,6 +787,11 @@ const db = {
     }
 
     await recalcularPagos(subrubroId);
+    // Pago vinculado registrado desde el Subrubro → espejo en la Caja del Día
+    // (Subrubro → Caja). Solo si no vino de la Caja (caja_mov_id null).
+    if (tipo === 'pago' && caja_mov_id == null) {
+      await syncCajaPago({ _id: id, fecha, pago: Number(monto_pago) || 0, metodo_pago: metodo, subrubro_id: subrubroId }, sub, true);
+    }
     return withId(await Movimiento.findById(id).lean());
   },
 
@@ -699,6 +817,12 @@ const db = {
     // Sin ajuste por diferencia: el saldo pendiente vive en la factura (modelo de
     // saldo). El deleteMany de arriba limpia ajustes viejos de pagos previos.
     await recalcularPagos(mov.subrubro_id);
+    // Mantener el espejo de Caja en sync (fecha/monto/método) si es un pago del
+    // subrubro. No aplica a pagos originados en la Caja.
+    if (mov.caja_mov_id == null && mov.tipo === 'pago') {
+      const subP = await Subrubro.findById(mov.subrubro_id).lean();
+      await syncCajaPago(mov, subP, true);
+    }
     return withId(mov.toObject());
   },
 
@@ -988,6 +1112,7 @@ const db = {
 module.exports = db;
 module.exports.calcularProximoVencimiento = calcularProximoVencimiento;
 module.exports.calcularProximoDiaSemana = calcularProximoDiaSemana;
+module.exports.calcularProximoDiaMes = calcularProximoDiaMes;
 module.exports.calcularVencimientoSub = calcularVencimientoSub;
 module.exports.recomputarVencimientosSubrubro = recomputarVencimientosSubrubro;
 module.exports.computeSaldosFacturas = computeSaldosFacturas;

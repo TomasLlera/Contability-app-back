@@ -38,11 +38,15 @@ const subrubroSchema = new mongoose.Schema({
   // Modo de cálculo del vencimiento de cada factura:
   //   'dias'      → vence `dia_vencimiento` días después de la fecha de emisión (modo por defecto / legacy).
   //   'dia_semana'→ vence el próximo `dia_semana_vencimiento` (0=domingo … 6=sábado) posterior a la emisión.
-  modo_vencimiento: { type: String, enum: ['dias', 'dia_semana'], default: 'dias' },
+  //   'dia_mes'   → vence el `dia_mes_vencimiento` (1-31) fijo de cada mes; si ya pasó, el del mes siguiente.
+  modo_vencimiento: { type: String, enum: ['dias', 'dia_semana', 'dia_mes'], default: 'dias' },
   // Días de plazo desde la fecha de cada factura hasta su vencimiento (1-365). null = sin plazo definido.
   dia_vencimiento: { type: Number, default: null, min: 1, max: 365 },
   // Día fijo de la semana de vencimiento (0=domingo … 6=sábado). null = no configurado.
   dia_semana_vencimiento: { type: Number, default: null, min: 0, max: 6 },
+  // Día fijo del mes de vencimiento (1-31). Si el mes destino no tiene ese día
+  // (p. ej. 31 en abril, o 30 en febrero) se ajusta al último día del mes. null = no configurado.
+  dia_mes_vencimiento: { type: Number, default: null, min: 1, max: 31 },
   // Método de pago predeterminado para los pagos de este subrubro:
   //   'efectivo' / 'transferencia' → se asigna automáticamente y bloquea el selector al crear un pago.
   //   'ambas' → el usuario elige el método manualmente (comportamiento por defecto).
@@ -126,6 +130,10 @@ const cajaSchema = new mongoose.Schema({
   movimiento_id: { type: Number, default: null },
   confirmado: { type: Boolean, default: null }, // null = registro viejo (se trata como confirmado); false = pendiente; true = confirmado
   pago_mov_id: { type: Number, default: null }, // ID del movimiento de pago creado en el subrubro al confirmar
+  // Origen del ítem: 'subrubro' = espejo auto-generado de un pago registrado desde un
+  // Subrubro (sincronización Subrubro → Caja). null = ítem normal de Caja (manual,
+  // vencimiento auto-sync, saldos, etc.). Distingue qué ítems borrar al borrar el pago.
+  origen: { type: String, enum: ['subrubro', null], default: null },
   // true = generado automáticamente por el auto-sync de vencimientos. Marca qué ítems
   // puede reconciliar (actualizar monto/fecha o eliminar) el auto-sync sin pisar gastos
   // cargados a mano por el usuario.

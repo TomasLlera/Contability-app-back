@@ -257,3 +257,107 @@ describe('Método de pago: sincronización subrubro ↔ Caja del Día', () => {
     expect(fresh.metodo_pago).toBe('transferencia');
   });
 });
+
+describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en la Caja del Día', () => {
+  beforeEach(bootstrap);
+
+  async function cajaDe(fecha) {
+    const r = await request(app).get('/api/caja')
+      .set('Authorization', `Bearer ${adminToken}`).query({ fecha });
+    return r.body;
+  }
+
+  it('un pago suelto registrado en el subrubro crea un gasto confirmado en la Caja del mismo día', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', pago: 700, fecha: hoy, metodo_pago: 'efectivo' });
+    expect(pago.status).toBe(200);
+
+    const caja = await cajaDe(hoy);
+    const espejo = caja.find(c => c.pago_mov_id === pago.body.id);
+    expect(espejo).toBeTruthy();
+    expect(espejo.tipo).toBe('gasto');
+    expect(espejo.monto).toBe(700);
+    expect(espejo.metodo).toBe('efectivo');
+    expect(espejo.confirmado).toBe(true);
+    expect(espejo.origen).toBe('subrubro');
+    expect(espejo.fecha).toBe(hoy);
+  });
+
+  it('un pago vinculado a una factura también aparece en la Caja', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 500, fecha: hoy, tipo: 'factura' });
+    const pago = await request(app).post(`/api/movimientos/${subrubroId}/pago-vinculado`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', fecha: hoy, monto_pago: 500, facturas_vinculadas_ids: [fact.body.id], metodo_pago: 'transferencia' });
+    expect(pago.status).toBe(200);
+
+    const espejo = (await cajaDe(hoy)).find(c => c.pago_mov_id === pago.body.id);
+    expect(espejo).toBeTruthy();
+    expect(espejo.monto).toBe(500);
+    expect(espejo.metodo).toBe('transferencia');
+  });
+
+  it('el pago se registra en la fecha real, no en el vencimiento de la factura', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const vencPasado = addDays(hoy, -2); // factura vencida hace 2 días
+    const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 900, fecha: addDays(hoy, -10), tipo: 'factura', fecha_vencimiento: vencPasado });
+
+    // Se paga HOY, vinculando a la factura vencida
+    const pago = await request(app).post(`/api/movimientos/${subrubroId}/pago-vinculado`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', fecha: hoy, monto_pago: 900, facturas_vinculadas_ids: [fact.body.id], metodo_pago: 'efectivo' });
+
+    const espejo = (await cajaDe(hoy)).find(c => c.pago_mov_id === pago.body.id);
+    expect(espejo.fecha).toBe(hoy);          // fecha real del pago, no el vencimiento
+    expect(espejo.fecha).not.toBe(vencPasado);
+  });
+
+  it('borrar el pago en el subrubro elimina el espejo de la Caja', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', pago: 300, fecha: hoy, metodo_pago: 'efectivo' });
+    expect((await cajaDe(hoy)).some(c => c.pago_mov_id === pago.body.id)).toBe(true);
+
+    await request(app).delete(`/api/movimientos/${pago.body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect((await cajaDe(hoy)).some(c => c.pago_mov_id === pago.body.id)).toBe(false);
+    expect(await CajaMovimiento.countDocuments({ pago_mov_id: pago.body.id, origen: 'subrubro' })).toBe(0);
+  });
+
+  it('editar el pago (monto/fecha) actualiza el espejo de la Caja', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', pago: 400, fecha: hoy, metodo_pago: 'efectivo' });
+
+    await request(app).put(`/api/movimientos/${pago.body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', pago: 650, fecha: hoy, metodo_pago: 'transferencia' });
+
+    const espejo = (await cajaDe(hoy)).find(c => c.pago_mov_id === pago.body.id);
+    expect(espejo.monto).toBe(650);
+    expect(espejo.metodo).toBe('transferencia');
+  });
+
+  it('un pago originado en la Caja NO genera un espejo duplicado', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    // Simula el pago que crea la Caja al confirmar: trae caja_mov_id.
+    const cajaItem = await request(app).post('/api/caja')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ fecha: hoy, tipo: 'gasto', concepto: 'Gasto manual', monto: 200, metodo: 'efectivo', subrubro_id: subrubroId });
+    const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ tipo: 'pago', pago: 200, fecha: hoy, metodo_pago: 'efectivo', caja_mov_id: cajaItem.body.id });
+
+    // No debe existir un espejo origen:'subrubro' para este pago (ya vino de Caja).
+    expect(await CajaMovimiento.countDocuments({ pago_mov_id: pago.body.id, origen: 'subrubro' })).toBe(0);
+  });
+});

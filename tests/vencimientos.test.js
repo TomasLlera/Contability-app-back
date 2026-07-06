@@ -65,3 +65,35 @@ describe('Vencimientos: saldo (NC / pagos), no monto original', () => {
     expect(item.monto).toBe(500);
   });
 });
+
+describe('Modo de vencimiento "día fijo del mes" (integración)', () => {
+  beforeEach(bootstrap);
+
+  it('un subrubro con dia_mes calcula el vencimiento de la factura al día fijo del mes', async () => {
+    // Subrubro con vencimiento el día 14 de cada mes
+    const sub = (await request(app).post(`/api/subrubros/1`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ nombre: 'Prov Día Fijo', modo_vencimiento: 'dia_mes', dia_mes_vencimiento: 14 })).body;
+    expect(sub.modo_vencimiento).toBe('dia_mes');
+    expect(sub.dia_mes_vencimiento).toBe(14);
+
+    // Factura emitida antes del 14 → vence el 14 del mismo mes (fecha pasada, válida)
+    const f1 = (await request(app).post(`/api/movimientos/${sub.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: '2026-05-10', tipo: 'factura' })).body;
+    expect(f1.fecha_vencimiento).toBe('2026-05-14');
+
+    // Factura emitida después del 14 → vence el 14 del mes siguiente
+    const f2 = (await request(app).post(`/api/movimientos/${sub.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: '2026-05-20', tipo: 'factura' })).body;
+    expect(f2.fecha_vencimiento).toBe('2026-06-14');
+  });
+
+  it('rechaza dia_mes_vencimiento fuera de rango (1-31)', async () => {
+    const res = await request(app).post(`/api/subrubros/1`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ nombre: 'Prov Inválido', modo_vencimiento: 'dia_mes', dia_mes_vencimiento: 40 });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+});
