@@ -16,8 +16,23 @@ async function seedAdminIfNeeded() {
     ? envPass
     : await bcrypt.hash(envPass, 10);
   const id = await Counter.next('users');
-  await User.create({ _id: id, usuario: envUser, password_hash: hash, role: 'admin', activo: true, created_at: new Date().toISOString() });
-  console.log(`Admin "${envUser}" migrado a la base de datos`);
+  await User.create({ _id: id, usuario: envUser, password_hash: hash, role: 'superadmin', activo: true, created_at: new Date().toISOString() });
+  console.log(`Super Admin "${envUser}" migrado a la base de datos`);
+}
+
+// Migración one-shot: antes de esta versión, 'admin' era el rol de mayor privilegio.
+// Si no existe ningún superadmin, promovemos a los admins existentes a 'superadmin'
+// para que conserven exactamente el poder que ya tenían (incluida la gestión de
+// usuarios). El nuevo rol 'admin' queda disponible como nivel intermedio.
+async function ensureSuperAdmin() {
+  try {
+    const superCount = await User.countDocuments({ role: 'superadmin' });
+    if (superCount > 0) return;
+    const res = await User.updateMany({ role: 'admin' }, { $set: { role: 'superadmin' } });
+    if (res.modifiedCount > 0) console.log(`Migrados ${res.modifiedCount} admin(s) a superadmin`);
+  } catch (err) {
+    console.warn('No se pudo ejecutar la migración de superadmin:', err.message);
+  }
 }
 
 router.post('/login', async (req, res) => {
@@ -60,3 +75,4 @@ router.post('/refresh', (req, res) => {
 });
 
 module.exports = router;
+module.exports.ensureSuperAdmin = ensureSuperAdmin;

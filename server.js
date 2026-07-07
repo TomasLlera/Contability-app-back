@@ -84,6 +84,8 @@ app.use('/api/users', require('./routes/users'));
 app.use('/api/stock', require('./routes/stock'));
 app.use('/api/iva', require('./routes/iva'));
 app.use('/api/audit', require('./routes/audit'));
+app.use('/api/reportes', require('./routes/reportes'));
+app.use('/api/backup', require('./routes/backup'));
 
 const PORT = process.env.PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -102,6 +104,12 @@ async function start() {
       await Promise.all([Movimiento.createIndexes(), CajaMovimiento.createIndexes()]);
     } catch (err) {
       logger.warn({ err: err.message }, 'No se pudieron crear todos los índices');
+    }
+    // Migración one-shot de roles: promueve admins existentes a superadmin si no hay ninguno.
+    try {
+      await require('./routes/auth').ensureSuperAdmin();
+    } catch (err) {
+      logger.warn({ err: err.message }, 'No se pudo ejecutar la migración de superadmin');
     }
     const server = app.listen(PORT, () => logger.info(`Backend corriendo en http://localhost:${PORT}`));
 

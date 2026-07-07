@@ -17,6 +17,13 @@ function hoy() {
   return new Date().toISOString().split('T')[0];
 }
 
+// Mes anterior a `mes` (YYYY-MM) → YYYY-MM.
+function prevMes(mes) {
+  const [a, m] = mes.split('-').map(Number);
+  const d = new Date(a, m - 2, 1); // m-2: mes es 1-based, JS 0-based, y -1 al anterior
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
 // Extrae un número de factura/comprobante de los campos_extra, sin importar cómo
 // se haya llamado la columna mapeada ("Facturas", "Comprobante", "Nº", etc.).
 function extraerNroFactura(campos_extra) {
@@ -1095,6 +1102,60 @@ const db = {
         metodo_habitual,
       };
     }).sort((a, b) => b.saldo - a.saldo);
+  },
+
+  // Análisis mes-a-mes de los subrubros de un rubro (S1). Para el mes objetivo
+  // `mes` (YYYY-MM) devuelve, por subrubro: saldo (deuda acumulada) al cierre del
+  // mes anterior y del mes actual, facturado/pagado del mes, diferencia, % de cambio
+  // y tendencia. `subrubroId` opcional restringe a un solo subrubro.
+  async getSubrubrosMensual(rubroId, mes, subrubroId = null) {
+    const filtro = { rubro_id: Number(rubroId) };
+    if (subrubroId) filtro._id = Number(subrubroId);
+    const subs = await Subrubro.find(filtro).lean();
+    if (subs.length === 0) return { mes, mesAnterior: prevMes(mes), subrubros: [] };
+
+    const subIds = subs.map(s => s._id);
+    const movs = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+    const porSub = new Map(subIds.map(id => [id, []]));
+    for (const m of movs) {
+      if (typeof m.fecha === 'string' && m.fecha) porSub.get(m.subrubro_id)?.push(m);
+    }
+
+    const mesAnterior = prevMes(mes);
+    const saldoHasta = (lista, mesTope) => {
+      const hasta = lista.filter(m => m.fecha.slice(0, 7) <= mesTope);
+      let d = 0;
+      for (const s of computeSaldosFacturas(hasta).values()) d += s;
+      return r2(d);
+    };
+
+    const subrubros = subs.map(s => {
+      const lista = porSub.get(s._id) || [];
+      const saldoActual = (s.monto_base || 0) + saldoHasta(lista, mes);
+      const saldoAnterior = (s.monto_base || 0) + saldoHasta(lista, mesAnterior);
+      let facturadoMes = 0, pagadoMes = 0;
+      for (const m of lista) {
+        if (m.fecha.slice(0, 7) !== mes) continue;
+        if (m.tipo === 'factura') facturadoMes += m.monto || 0;
+        pagadoMes += m.pago || 0;
+      }
+      const diferencia = r2(saldoActual - saldoAnterior);
+      const pctCambio = saldoAnterior !== 0 ? r2((diferencia / Math.abs(saldoAnterior)) * 100) : null;
+      const tendencia = Math.abs(diferencia) < 0.01 ? 'igual' : diferencia > 0 ? 'sube' : 'baja';
+      return {
+        id: s._id,
+        nombre: s.nombre,
+        saldoAnterior,
+        saldoActual,
+        facturadoMes: r2(facturadoMes),
+        pagadoMes: r2(pagadoMes),
+        diferencia,
+        pctCambio,
+        tendencia,
+      };
+    }).sort((a, b) => b.saldoActual - a.saldoActual);
+
+    return { mes, mesAnterior, subrubros };
   },
 
   async getConfig() {

@@ -27,4 +27,11 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
   res.json({ items, total, page, limit });
 }));
 
+// GET /api/audit/:id — detalle completo de un registro (incluye diff before/after)
+router.get('/:id', requireAdmin, asyncHandler(async (req, res) => {
+  const item = await Audit.findById(req.params.id).lean();
+  if (!item) return res.status(404).json({ error: 'Registro de auditoría no encontrado' });
+  res.json(item);
+}));
+
 module.exports = router;

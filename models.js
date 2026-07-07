@@ -182,7 +182,9 @@ const User = mongoose.model('User', new mongoose.Schema({
   _id: Number,
   usuario: { type: String, unique: true },
   password_hash: String,
-  role: { type: String, enum: ['admin', 'viewer'], default: 'viewer' },
+  // superadmin → control total + gestión de usuarios · admin → administra funcionalidades
+  // (no usuarios) · viewer → solo lectura.
+  role: { type: String, enum: ['superadmin', 'admin', 'viewer'], default: 'viewer' },
   activo: { type: Boolean, default: true },
   created_at: String,
 }));
