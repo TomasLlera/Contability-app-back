@@ -241,12 +241,23 @@ async function syncCajaRemito(mov, sub, esRemito) {
     await borrarCajaRemito(movId);
     return;
   }
+  // La Caja refleja el SALDO pendiente del remito (monto − pagos − NC vía FIFO),
+  // NO el monto original. Requiere todos los movimientos del subrubro (pagos/NC
+  // pueden estar en otro mes). Si el saldo quedó en 0 el remito está saldado y no
+  // debe figurar como gasto pendiente: se borra el ítem sin confirmar (nunca uno
+  // ya confirmado, que tiene su pago real enlazado).
+  const movsSub = await Movimiento.find({ subrubro_id: Number(mov.subrubro_id) }).lean();
+  const saldo = computeSaldosFacturas(movsSub).get(movId) ?? (Number(mov.monto) || 0);
+  if (saldo <= 0.005) {
+    await CajaMovimiento.deleteMany({ movimiento_id: movId, confirmado: false });
+    return;
+  }
   const set = {
     // El gasto va en la caja del día en que vence el remito, no en el de emisión.
     fecha: mov.fecha_vencimiento || mov.fecha,
     tipo: 'gasto',
     concepto: `Remito — ${sub?.nombre || 'Proveedor'}`,
-    monto: Number(mov.monto) || 0,
+    monto: saldo,
     metodo: 'efectivo',
     subrubro_id: Number(mov.subrubro_id),
     confirmado: false,
@@ -675,6 +686,9 @@ const db = {
     // de serlo. Para una factura normal no se toca nada (ni vencimientos ni gastos
     // manuales enlazados).
     if (esRemito || eraRemito) {
+      // syncCajaRemito refleja el SALDO y, si el remito quedó saldado (saldo 0, p. ej.
+      // pagado con un pago del subrubro), borra el ítem pendiente en vez de re-generarlo.
+      // Así editar un remito ya pagado no lo revive en la Caja como pendiente.
       const sub = await Subrubro.findById(mov.subrubro_id).lean();
       await syncCajaRemito(mov, sub, esRemito);
     }

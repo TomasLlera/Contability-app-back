@@ -361,3 +361,81 @@ describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en l
     expect(await CajaMovimiento.countDocuments({ pago_mov_id: pago.body.id, origen: 'subrubro' })).toBe(0);
   });
 });
+
+describe('Descarte de vencimiento: borrar hoy no reaparece hoy, sí al día siguiente', () => {
+  beforeEach(bootstrap);
+
+  async function syncEl(fecha) {
+    return request(app).post('/api/caja/auto-sync')
+      .set('Authorization', `Bearer ${adminToken}`).query({ fecha });
+  }
+  async function cajaDe(fecha) {
+    const r = await request(app).get('/api/caja')
+      .set('Authorization', `Bearer ${adminToken}`).query({ fecha });
+    return r.body;
+  }
+  async function crearFactura(monto, fecha, venc) {
+    const r = await request(app).post(`/api/movimientos/${subrubroId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto, fecha, tipo: 'factura', fecha_vencimiento: venc });
+    return r.body.id;
+  }
+
+  it('borrar el ítem auto-sync pasando la fecha vista impide que reaparezca ese mismo día', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, -1); // vencida ayer, impaga → aparece hoy
+    const facturaId = await crearFactura(1000, addDays(hoy, -5), venc);
+
+    // 1. autoSync de HOY la trae a la Caja (arrastrada desde el venc)
+    await syncEl(hoy);
+    let gasto = (await cajaDe(hoy)).find(c => c.movimiento_id === facturaId);
+    expect(gasto).toBeTruthy();
+
+    // 2. El usuario la borra desde la fecha que está viendo (hoy)
+    await request(app).delete(`/api/caja/${gasto.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .query({ fecha: hoy });
+
+    // 3. Re-sync de HOY (lo que dispara cada recarga/refresco) → NO reaparece
+    await syncEl(hoy);
+    expect((await cajaDe(hoy)).some(c => c.movimiento_id === facturaId)).toBe(false);
+  });
+
+  it('al día siguiente, si sigue impaga, el vencimiento vuelve a aparecer', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const manana = addDays(hoy, 1);
+    const venc = addDays(hoy, -1); // vencida, impaga
+    const facturaId = await crearFactura(1000, addDays(hoy, -5), venc);
+
+    await syncEl(hoy);
+    const gasto = (await cajaDe(hoy)).find(c => c.movimiento_id === facturaId);
+
+    // Descartada HOY
+    await request(app).delete(`/api/caja/${gasto.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .query({ fecha: hoy });
+    await syncEl(hoy);
+    expect((await cajaDe(hoy)).some(c => c.movimiento_id === facturaId)).toBe(false);
+
+    // Mañana (otra fecha, sin descarte registrado) → vuelve a aparecer
+    await syncEl(manana);
+    expect((await cajaDe(manana)).some(c => c.movimiento_id === facturaId)).toBe(true);
+  });
+
+  it('borrar sin fecha usa la del ítem y no rompe (fallback)', async () => {
+    const hoy = new Date().toISOString().split('T')[0];
+    const venc = addDays(hoy, 3);
+    const facturaId = await crearFactura(500, hoy, venc);
+
+    await syncEl(venc);
+    const gasto = (await cajaDe(venc)).find(c => c.movimiento_id === facturaId);
+
+    // Sin ?fecha → cae al item.fecha (= venc)
+    const del = await request(app).delete(`/api/caja/${gasto.id}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(del.status).toBe(200);
+
+    await syncEl(venc);
+    expect((await cajaDe(venc)).some(c => c.movimiento_id === facturaId)).toBe(false);
+  });
+});

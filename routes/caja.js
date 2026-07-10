@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { CajaMovimiento, CajaConfig, Counter, Subrubro, Movimiento } = require('../models');
+const { CajaMovimiento, CajaDescarte, CajaConfig, Counter, Subrubro, Movimiento } = require('../models');
 const { computeSaldosFacturas } = require('../db');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
@@ -234,7 +234,15 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   }, { movimiento_id: 1 }).lean();
   const yaSet = new Set(yaCreados.map(c => c.movimiento_id));
 
-  const pendientes = vencimientos.filter(v => !yaSet.has(v._id));
+  // Descartes del usuario para ESTA fecha: si borró el ítem hoy, no recrearlo hoy.
+  // Al otro día (otra fecha, sin descarte) el vencimiento impago vuelve a aparecer.
+  const descartados = await CajaDescarte.find({
+    fecha,
+    movimiento_id: { $in: vencimientos.map(v => v._id) },
+  }, { movimiento_id: 1 }).lean();
+  const descartadoSet = new Set(descartados.map(d => d.movimiento_id));
+
+  const pendientes = vencimientos.filter(v => !yaSet.has(v._id) && !descartadoSet.has(v._id));
   if (pendientes.length === 0) return res.json({ creados: 0 });
 
   // Reservar IDs en bloque (solo se consumen si el upsert inserta).
@@ -431,8 +439,21 @@ router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) =>
   res.json({ ok: true });
 }));
 
-// DELETE /api/caja/:id
+// DELETE /api/caja/:id?fecha=YYYY-MM-DD
 router.delete('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
+  const item = await CajaMovimiento.findById(Number(req.params.id)).lean();
+  // Sólo los pendientes auto-generados (movimiento_id + no confirmados) dejan
+  // "memoria" de descarte: si el usuario borra el vencimiento hoy, no debe volver a
+  // recrearse hoy vía auto-sync. Se registra contra la fecha VISTA en la Caja (no la
+  // del ítem, que vive en fecha_vencimiento y el GET arrastra hacia adelante).
+  if (item?.movimiento_id && item.confirmado === false) {
+    const fecha = req.query.fecha || item.fecha;
+    await CajaDescarte.updateOne(
+      { movimiento_id: item.movimiento_id, fecha },
+      { $setOnInsert: { movimiento_id: item.movimiento_id, fecha, created_at: now() } },
+      { upsert: true }
+    );
+  }
   await CajaMovimiento.findByIdAndDelete(Number(req.params.id));
   res.json({ ok: true });
 }));

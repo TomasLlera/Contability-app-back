@@ -160,6 +160,21 @@ cajaSchema.index(
 );
 const CajaMovimiento = mongoose.model('CajaMovimiento', cajaSchema);
 
+// --- Caja Descarte ---
+// Registra que un vencimiento (movimiento_id) fue descartado por el usuario para
+// una fecha puntual (la que estaba viendo en la Caja del Día). El auto-sync lo
+// consulta para NO recrear ese ítem ese mismo día — pero al otro día, sin descarte
+// registrado para esa nueva fecha, el vencimiento (si sigue impago) vuelve a
+// aparecer con normalidad. No reemplaza el borrado: el CajaMovimiento se borra
+// igual, esto es sólo la "memoria" acotada a un día.
+const cajaDescarteSchema = new mongoose.Schema({
+  movimiento_id: { type: Number, required: true },
+  fecha: { type: String, required: true },
+  created_at: String,
+});
+cajaDescarteSchema.index({ movimiento_id: 1, fecha: 1 }, { unique: true });
+const CajaDescarte = mongoose.model('CajaDescarte', cajaDescarteSchema);
+
 // --- Caja Config ---
 const CajaConfig = mongoose.model('CajaConfig', new mongoose.Schema({
   _id: { type: String, default: 'main' },
@@ -307,4 +322,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, Audit };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, Audit };

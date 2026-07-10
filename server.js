@@ -53,6 +53,8 @@ const loginLimiter = rateLimit({
   message: { error: 'Demasiados intentos. Intentá de nuevo en 15 minutos.' },
   standardHeaders: true,
   legacyHeaders: false,
+  // En tests cada caso hace login en su beforeEach; el limiter no debe cortar la suite.
+  skip: () => process.env.NODE_ENV === 'test',
 });
 
 app.use('/api/auth/login', loginLimiter);
