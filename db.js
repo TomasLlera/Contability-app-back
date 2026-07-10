@@ -561,11 +561,14 @@ const db = {
     const conSaldo = movs.map(m =>
       m.tipo === 'factura' ? { ...m, saldo: saldo.get(m._id) ?? (m.monto || 0) } : m
     );
+    // Dentro de cada día: primero facturas (ingresos, +), luego pagos/NC/ajustes
+    // (egresos, −). Misma detección de "factura" que usa el frontend.
+    const rankTipo = (m) => (m.tipo === 'factura' || (!m.tipo && (m.monto || 0) > 0)) ? 0 : 1;
     return withIds(conSaldo.sort((a, b) => {
-      if (!a.fecha && !b.fecha) return a._id - b._id;
+      if (!a.fecha && !b.fecha) return rankTipo(a) - rankTipo(b) || a._id - b._id;
       if (!a.fecha) return 1;
       if (!b.fecha) return -1;
-      return a.fecha.localeCompare(b.fecha) || a._id - b._id;
+      return a.fecha.localeCompare(b.fecha) || rankTipo(a) - rankTipo(b) || a._id - b._id;
     }));
   },
 
