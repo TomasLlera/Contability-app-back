@@ -85,6 +85,7 @@ app.use('/api/config', require('./routes/config'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/stock', require('./routes/stock'));
 app.use('/api/iva', require('./routes/iva'));
+app.use('/api/registro', require('./routes/registro'));
 app.use('/api/audit', require('./routes/audit'));
 app.use('/api/reportes', require('./routes/reportes'));
 app.use('/api/backup', require('./routes/backup'));

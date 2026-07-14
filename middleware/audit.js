@@ -19,6 +19,8 @@ const MODEL_MAP = {
   user: models.User,
   iva_compra: models.IvaCompra,
   iva_venta: models.IvaVenta,
+  venta_sistema: models.VentaSistema,
+  tarjeta: models.TarjetaTransaccion,
 };
 
 function redact(obj) {

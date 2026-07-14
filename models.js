@@ -305,6 +305,54 @@ ivaVentaSchema.index({ mes: 1 });
 ivaVentaSchema.index({ fecha: 1 });
 const IvaVenta = mongoose.model('IvaVenta', ivaVentaSchema);
 
+// --- Registro: Venta Sistema (ventas propias, carga diaria) ---
+const ventaSistemaSchema = new mongoose.Schema({
+  _id: Number,
+  fecha: String,                              // YYYY-MM-DD
+  mes: String,                                // YYYY-MM (denormalizado para agrupar)
+  monto: { type: Number, default: 0 },
+  concepto: { type: String, default: '' },
+  user_id: { type: Number, default: null },   // usuario que la cargó (del JWT)
+  created_at: String,
+  updated_at: String,
+});
+ventaSistemaSchema.index({ mes: 1 });
+ventaSistemaSchema.index({ fecha: 1 });
+const VentaSistema = mongoose.model('VentaSistema', ventaSistemaSchema);
+
+// --- Registro: Tarjetas (QR / débito / crédito / prepaga) ---
+// Cada documento es un ingreso del día por un tipo de pago, atribuido a un empleado.
+const tarjetaSchema = new mongoose.Schema({
+  _id: Number,
+  tipo: { type: String, enum: ['qr', 'debito', 'credito', 'prepaga'], required: true },
+  fecha: String,                              // YYYY-MM-DD
+  mes: String,                                // YYYY-MM (denormalizado)
+  monto: { type: Number, default: 0 },
+  // Quién registró el ingreso. Se elige de la lista de empleados de CajaConfig
+  // (la misma que usa la Caja del día), o se escribe a mano si no está en la lista.
+  empleado: { type: String, default: '' },
+  user_id: { type: Number, default: null },
+
+  // --- Infraestructura reservada (NO usar todavía) --------------------------
+  // TODO: implementar cálculo de retenciones cuando se active. La idea es que cada
+  // tipo de tarjeta tenga un % de retención bancaria configurable y que el neto sea
+  // monto - (monto * retencion_pct / 100). Hoy ambos campos quedan en null y ningún
+  // total del sistema los lee: los reportes usan `monto` (bruto).
+  retencion_pct: { type: Number, default: null },
+  monto_neto: { type: Number, default: null },
+  // TODO: impacto diferenciado en cash flow. Cada tipo acredita en una fecha distinta
+  // (QR/débito ~inmediato, crédito a 18 días, etc.). Cuando se active, esta fecha
+  // decide en qué día impacta la plata en Caja, en vez de `fecha`.
+  fecha_acreditacion: { type: String, default: null },
+
+  created_at: String,
+  updated_at: String,
+});
+tarjetaSchema.index({ mes: 1, tipo: 1 });
+tarjetaSchema.index({ fecha: 1 });
+tarjetaSchema.index({ mes: 1, empleado: 1 });
+const TarjetaTransaccion = mongoose.model('TarjetaTransaccion', tarjetaSchema);
+
 // --- Audit Log ---
 const auditSchema = new mongoose.Schema({
   _id: Number,
@@ -322,4 +370,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, Audit };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, VentaSistema, TarjetaTransaccion, Audit };
