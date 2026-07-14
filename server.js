@@ -82,6 +82,7 @@ app.use('/api/subrubros', require('./routes/subrubros'));
 app.use('/api/movimientos', require('./routes/movimientos'));
 app.use('/api/caja', require('./routes/caja'));
 app.use('/api/config', require('./routes/config'));
+app.use('/api/cotizaciones', require('./routes/cotizaciones'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/stock', require('./routes/stock'));
 app.use('/api/iva', require('./routes/iva'));
