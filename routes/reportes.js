@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { asyncHandler } = require('../middleware/errorHandler');
 const db = require('../db');
-const { CajaMovimiento } = require('../models');
+const { CajaMovimiento, VentaSistema, TarjetaTransaccion } = require('../models');
 const {
   MONEDA, nombreMes, nuevoWorkbook, escribirTitulo, escribirHeader,
   agregarDataBar, colorearSigno, zebra, flechaTendencia, COLORS,
@@ -258,6 +258,222 @@ router.get('/caja-mensual', asyncHandler(async (req, res) => {
   wsC.getColumn(1).width = 24; [2, 3, 4].forEach(x => { wsC.getColumn(x).width = 18; }); wsC.getColumn(5).width = 12;
 
   await enviarWorkbook(res, wb, `caja_${mes}.xlsx`);
+}));
+
+// ── S3 · Registro de Ventas Sistema y Tarjetas (rango de meses) ──────────────
+
+// Lista de meses 'YYYY-MM' entre desde y hasta (inclusive).
+function mesesRango(desde, hasta) {
+  const out = [];
+  let [y, m] = desde.split('-').map(Number);
+  const [hy, hm] = hasta.split('-').map(Number);
+  while (y < hy || (y === hy && m <= hm)) {
+    out.push(`${y}-${String(m).padStart(2, '0')}`);
+    if (++m > 12) { m = 1; y++; }
+  }
+  return out;
+}
+
+// Índice de columna (1-based) → letra de Excel (para armar rangos de data bars).
+const colLetter = (n) => { let s = ''; while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; };
+
+// Lee desde/hasta del querystring, con defaults sanos e inversión si vienen al revés.
+function rangoMeses(req) {
+  let desde = esMesValido(req.query.desde) ? req.query.desde : mesActualStr();
+  let hasta = esMesValido(req.query.hasta) ? req.query.hasta : desde;
+  if (hasta < desde) [desde, hasta] = [hasta, desde];
+  return { desde, hasta };
+}
+
+const tend = (dif) => (dif > 0.0001 ? 'sube' : dif < -0.0001 ? 'baja' : 'igual');
+const colorTend = (t) => (t === 'sube' ? COLORS.green : t === 'baja' ? COLORS.red : COLORS.subtle);
+
+// GET /api/reportes/ventas-sistema?desde=YYYY-MM&hasta=YYYY-MM
+// Resumen mes a mes (total, cantidad, promedio, diferencia vs mes anterior) + detalle.
+router.get('/ventas-sistema', asyncHandler(async (req, res) => {
+  const { desde, hasta } = rangoMeses(req);
+  const meses = mesesRango(desde, hasta);
+  const base = prevMesStr(desde); // mes previo para comparar el primer mes del rango
+
+  const ventas = await VentaSistema.find({ mes: { $gte: base, $lte: hasta } }).sort({ fecha: 1, _id: 1 }).lean();
+  const porMes = {};
+  for (const v of ventas) (porMes[v.mes] ||= []).push(v);
+  const totalDe = (lista) => lista.reduce((s, v) => s + (v.monto || 0), 0);
+
+  const wb = nuevoWorkbook();
+  const sub = meses.length === 1 ? nombreMes(desde) : `${nombreMes(desde)} — ${nombreMes(hasta)}`;
+
+  // ── Hoja 1: Resumen mensual ──
+  const wsR = wb.addWorksheet('Resumen mensual');
+  const HEAD = ['Mes', 'Total', 'Cantidad', 'Promedio diario', 'Dif. vs mes ant.', '% Cambio', 'Tendencia'];
+  let r = escribirTitulo(wsR, 'Ventas por sistema — Resumen mensual', sub, HEAD.length);
+  escribirHeader(wsR, r, HEAD); r++;
+  const dataStart = r;
+  let totGeneral = 0;
+  for (const mes of meses) {
+    const lista = porMes[mes] || [];
+    const total = totalDe(lista);
+    const totalPrev = totalDe(porMes[prevMesStr(mes)] || []);
+    const dif = total - totalPrev;
+    const pct = totalPrev ? dif / Math.abs(totalPrev) : null;
+    const diasConVentas = new Set(lista.filter(v => (v.monto || 0) > 0).map(v => v.fecha)).size;
+    const t = tend(dif);
+    const row = wsR.getRow(r);
+    row.getCell(1).value = nombreMes(mes);
+    row.getCell(2).value = total;
+    row.getCell(3).value = lista.length;
+    row.getCell(4).value = diasConVentas ? total / diasConVentas : 0;
+    row.getCell(5).value = dif;
+    row.getCell(6).value = pct === null ? '—' : pct;
+    row.getCell(7).value = flechaTendencia(t);
+    [2, 4, 5].forEach(c => { row.getCell(c).numFmt = MONEDA; });
+    if (pct !== null) { row.getCell(6).numFmt = '0.0%'; row.getCell(6).font = { color: { argb: dif >= 0 ? COLORS.green : COLORS.red } }; }
+    colorearSigno(row.getCell(5), dif);
+    row.getCell(7).font = { color: { argb: colorTend(t) }, bold: true };
+    row.getCell(7).alignment = { horizontal: 'center' };
+    totGeneral += total;
+    r++;
+  }
+  const dataEnd = r - 1;
+  if (meses.length > 1) {
+    const tr = wsR.getRow(r);
+    tr.getCell(1).value = 'TOTAL'; tr.getCell(2).value = totGeneral; tr.getCell(2).numFmt = MONEDA;
+    for (let c = 1; c <= HEAD.length; c++) { tr.getCell(c).font = { bold: true }; tr.getCell(c).border = { top: { style: 'thin', color: { argb: COLORS.header } } }; }
+  }
+  if (dataEnd >= dataStart) { zebra(wsR, dataStart, dataEnd, HEAD.length); agregarDataBar(wsR, `B${dataStart}:B${dataEnd}`); }
+  else wsR.getRow(r).getCell(1).value = 'Sin ventas en el período';
+  wsR.getColumn(1).width = 18; [2, 3, 4, 5].forEach(c => { wsR.getColumn(c).width = 16; }); wsR.getColumn(6).width = 12; wsR.getColumn(7).width = 16;
+
+  // ── Hoja 2: Detalle ──
+  const wsD = wb.addWorksheet('Detalle');
+  let d = escribirTitulo(wsD, 'Ventas por sistema — Detalle', sub, 4);
+  escribirHeader(wsD, d, ['Fecha', 'Mes', 'Concepto', 'Monto']); d++;
+  const detStart = d;
+  const detalle = ventas.filter(v => v.mes >= desde); // excluye el mes base (solo para comparar)
+  for (const v of detalle) {
+    const row = wsD.getRow(d);
+    row.getCell(1).value = v.fecha;
+    row.getCell(2).value = nombreMes(v.mes);
+    row.getCell(3).value = v.concepto || '—';
+    row.getCell(4).value = v.monto || 0; row.getCell(4).numFmt = MONEDA;
+    d++;
+  }
+  const detEnd = d - 1;
+  if (detEnd >= detStart) { zebra(wsD, detStart, detEnd, 4); agregarDataBar(wsD, `D${detStart}:D${detEnd}`); }
+  else wsD.getRow(d).getCell(1).value = 'Sin ventas en el período';
+  wsD.getColumn(1).width = 12; wsD.getColumn(2).width = 16; wsD.getColumn(3).width = 34; wsD.getColumn(4).width = 16;
+
+  const fname = meses.length === 1 ? `ventas_sistema_${desde}.xlsx` : `ventas_sistema_${desde}_a_${hasta}.xlsx`;
+  await enviarWorkbook(res, wb, fname);
+}));
+
+const TARJETA_TIPOS = [
+  { key: 'qr', label: 'Pagos QR' },
+  { key: 'debito', label: 'Tarjeta Débito' },
+  { key: 'credito', label: 'Tarjeta Crédito' },
+  { key: 'prepaga', label: 'Tarjeta Prepaga' },
+];
+
+// GET /api/reportes/tarjetas?desde=YYYY-MM&hasta=YYYY-MM
+// Resumen mensual por tipo (QR/débito/crédito/prepaga) + acumulado por empleado + detalle.
+router.get('/tarjetas', asyncHandler(async (req, res) => {
+  const { desde, hasta } = rangoMeses(req);
+  const meses = mesesRango(desde, hasta);
+  const base = prevMesStr(desde);
+
+  const txs = await TarjetaTransaccion.find({ mes: { $gte: base, $lte: hasta } }).sort({ fecha: 1, _id: 1 }).lean();
+  const porMes = {};
+  for (const t of txs) (porMes[t.mes] ||= []).push(t);
+  const sumaTipo = (lista, key) => lista.filter(t => t.tipo === key).reduce((s, t) => s + (t.monto || 0), 0);
+  const sumaTotal = (lista) => lista.reduce((s, t) => s + (t.monto || 0), 0);
+
+  const wb = nuevoWorkbook();
+  const sub = meses.length === 1 ? nombreMes(desde) : `${nombreMes(desde)} — ${nombreMes(hasta)}`;
+  const nTipos = TARJETA_TIPOS.length;
+  const colTotal = 2 + nTipos; // columna del Total en las hojas por tipo
+
+  // ── Hoja 1: Resumen mensual por tipo ──
+  const wsR = wb.addWorksheet('Resumen por tipo');
+  const HEAD = ['Mes', ...TARJETA_TIPOS.map(t => t.label), 'Total', 'Dif. vs mes ant.', '% Cambio'];
+  let r = escribirTitulo(wsR, 'Tarjetas — Resumen mensual por tipo', sub, HEAD.length);
+  escribirHeader(wsR, r, HEAD); r++;
+  const dataStart = r;
+  const totCols = TARJETA_TIPOS.map(() => 0); let totGen = 0;
+  for (const mes of meses) {
+    const lista = porMes[mes] || [];
+    const total = sumaTotal(lista);
+    const totalPrev = sumaTotal(porMes[prevMesStr(mes)] || []);
+    const dif = total - totalPrev;
+    const pct = totalPrev ? dif / Math.abs(totalPrev) : null;
+    const row = wsR.getRow(r);
+    row.getCell(1).value = nombreMes(mes);
+    TARJETA_TIPOS.forEach((t, i) => { const v = sumaTipo(lista, t.key); row.getCell(2 + i).value = v; row.getCell(2 + i).numFmt = MONEDA; totCols[i] += v; });
+    row.getCell(colTotal).value = total; row.getCell(colTotal).numFmt = MONEDA; row.getCell(colTotal).font = { bold: true };
+    row.getCell(colTotal + 1).value = dif; row.getCell(colTotal + 1).numFmt = MONEDA; colorearSigno(row.getCell(colTotal + 1), dif);
+    row.getCell(colTotal + 2).value = pct === null ? '—' : pct;
+    if (pct !== null) { row.getCell(colTotal + 2).numFmt = '0.0%'; row.getCell(colTotal + 2).font = { color: { argb: dif >= 0 ? COLORS.green : COLORS.red } }; }
+    totGen += total;
+    r++;
+  }
+  const dataEnd = r - 1;
+  if (meses.length > 1) {
+    const tr = wsR.getRow(r);
+    tr.getCell(1).value = 'TOTAL';
+    TARJETA_TIPOS.forEach((t, i) => { tr.getCell(2 + i).value = totCols[i]; tr.getCell(2 + i).numFmt = MONEDA; });
+    tr.getCell(colTotal).value = totGen; tr.getCell(colTotal).numFmt = MONEDA;
+    for (let c = 1; c <= HEAD.length; c++) { tr.getCell(c).font = { bold: true }; tr.getCell(c).border = { top: { style: 'thin', color: { argb: COLORS.header } } }; }
+  }
+  if (dataEnd >= dataStart) { zebra(wsR, dataStart, dataEnd, HEAD.length); agregarDataBar(wsR, `${colLetter(colTotal)}${dataStart}:${colLetter(colTotal)}${dataEnd}`); }
+  else wsR.getRow(r).getCell(1).value = 'Sin transacciones en el período';
+  wsR.getColumn(1).width = 18; for (let c = 2; c <= HEAD.length; c++) wsR.getColumn(c).width = c === HEAD.length ? 12 : 16;
+
+  // ── Hoja 2: Acumulado por empleado ──
+  const detalleTxs = txs.filter(t => t.mes >= desde); // excluye el mes base
+  const wsE = wb.addWorksheet('Por empleado');
+  let e = escribirTitulo(wsE, 'Tarjetas — Acumulado por empleado', sub, colTotal);
+  escribirHeader(wsE, e, ['Empleado', ...TARJETA_TIPOS.map(t => t.label), 'Total']); e++;
+  const empMap = {};
+  for (const t of detalleTxs) {
+    const nom = (t.empleado || '').trim() || 'Sin asignar';
+    const g = (empMap[nom] ||= { nom, total: 0, ...Object.fromEntries(TARJETA_TIPOS.map(x => [x.key, 0])) });
+    if (TARJETA_TIPOS.some(x => x.key === t.tipo)) g[t.tipo] += t.monto || 0;
+    g.total += t.monto || 0;
+  }
+  const empList = Object.values(empMap).sort((a, b) => b.total - a.total);
+  const empStart = e;
+  for (const g of empList) {
+    const row = wsE.getRow(e);
+    row.getCell(1).value = g.nom;
+    TARJETA_TIPOS.forEach((t, i) => { row.getCell(2 + i).value = g[t.key]; row.getCell(2 + i).numFmt = MONEDA; });
+    row.getCell(colTotal).value = g.total; row.getCell(colTotal).numFmt = MONEDA; row.getCell(colTotal).font = { bold: true };
+    e++;
+  }
+  const empEnd = e - 1;
+  if (empEnd >= empStart) { zebra(wsE, empStart, empEnd, colTotal); agregarDataBar(wsE, `${colLetter(colTotal)}${empStart}:${colLetter(colTotal)}${empEnd}`); }
+  else wsE.getRow(e).getCell(1).value = 'Sin transacciones en el período';
+  wsE.getColumn(1).width = 24; for (let c = 2; c <= colTotal; c++) wsE.getColumn(c).width = 16;
+
+  // ── Hoja 3: Detalle ──
+  const wsD = wb.addWorksheet('Detalle');
+  let d = escribirTitulo(wsD, 'Tarjetas — Detalle', sub, 4);
+  escribirHeader(wsD, d, ['Fecha', 'Tipo', 'Empleado', 'Monto']); d++;
+  const detStart = d;
+  const labelTipo = (k) => (TARJETA_TIPOS.find(x => x.key === k) || {}).label || k;
+  for (const t of detalleTxs) {
+    const row = wsD.getRow(d);
+    row.getCell(1).value = t.fecha;
+    row.getCell(2).value = labelTipo(t.tipo);
+    row.getCell(3).value = (t.empleado || '').trim() || 'Sin asignar';
+    row.getCell(4).value = t.monto || 0; row.getCell(4).numFmt = MONEDA;
+    d++;
+  }
+  const detEnd = d - 1;
+  if (detEnd >= detStart) { zebra(wsD, detStart, detEnd, 4); agregarDataBar(wsD, `D${detStart}:D${detEnd}`); }
+  else wsD.getRow(d).getCell(1).value = 'Sin transacciones en el período';
+  wsD.getColumn(1).width = 12; wsD.getColumn(2).width = 18; wsD.getColumn(3).width = 24; wsD.getColumn(4).width = 16;
+
+  const fname = meses.length === 1 ? `tarjetas_${desde}.xlsx` : `tarjetas_${desde}_a_${hasta}.xlsx`;
+  await enviarWorkbook(res, wb, fname);
 }));
 
 module.exports = router;
