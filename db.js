@@ -211,6 +211,39 @@ async function recalcularPagos(subrubroId) {
   if (bulkOps.length > 0) await Movimiento.bulkWrite(bulkOps);
 }
 
+// Valida que una nota de crédito vinculada no supere el saldo pendiente de las
+// facturas a las que se aplica. `saldos` es el Map fid → saldo contra el que la
+// NC va a aplicarse (un pago sí puede exceder: el excedente queda como crédito
+// libre FIFO; una NC no — el proveedor no emite crédito por más de lo adeudado).
+function validarSaldoNC(saldos, idsNum, montoNC) {
+  const saldoVinc = r2(idsNum.reduce((s, fid) => s + (saldos.get(fid) || 0), 0));
+  if (r2(Number(montoNC) || 0) > saldoVinc + 0.005) {
+    const e = new Error(`La nota de crédito supera el saldo pendiente de la factura vinculada ($${saldoVinc.toFixed(2)})`);
+    e.statusCode = 400;
+    throw e;
+  }
+}
+
+// Detalle de aplicación por factura vinculada: saldo anterior → monto aplicado →
+// saldo posterior. Viaja en la respuesta del alta/edición del pago/NC, por lo que
+// el middleware de auditoría lo persiste en `Audit.diff.response.aplicaciones`.
+function armarAplicaciones(idsNum, saldosAntes, movsPost) {
+  const saldosDespues = computeSaldosFacturas(movsPost);
+  return idsNum.map(fid => {
+    const antes = r2(saldosAntes.get(fid) || 0);
+    const despues = r2(saldosDespues.get(fid) || 0);
+    const fact = movsPost.find(m => m._id === fid);
+    return {
+      factura_id: fid,
+      monto_original: fact?.monto ?? null,
+      saldo_anterior: antes,
+      aplicado: r2(antes - despues),
+      saldo_posterior: despues,
+      saldada: despues <= 0.005,
+    };
+  });
+}
+
 // Borra el gasto de Caja del Día de un remito (enlazado por movimiento_id) y, si
 // llegó a confirmarse en Caja, también el pago que esa confirmación generó en el
 // subrubro. El índice único sobre movimiento_id garantiza que hay a lo sumo un ítem,
@@ -593,6 +626,13 @@ const db = {
     // configurado un criterio de vencimiento, calcularlo según el modo activo
     // ('dias' = N días desde la emisión / 'dia_semana' = próximo día fijo de la semana).
     let venc = fecha_vencimiento || null;
+    // Un vencimiento manual nunca puede ser anterior a la emisión (el automático
+    // ya lo garantiza por construcción).
+    if (venc && fecha && venc < fecha) {
+      const e = new Error('La fecha de vencimiento no puede ser anterior a la fecha de emisión');
+      e.statusCode = 400;
+      throw e;
+    }
     if (!venc && tipoFinal === 'factura' && fecha) {
       venc = calcularVencimientoSub(fecha, sub);
     }
@@ -608,6 +648,14 @@ const db = {
     // factura como pagada respetando la elección del usuario (sin tocar las
     // facturas anteriores pendientes).
     const vinculadas = tipoFinal === 'factura' ? [] : (facturas_vinculadas_ids || []).map(Number);
+    // Pago/NC vinculado: capturar los saldos previos (alimentan el detalle de
+    // aplicación para auditoría) y validar que una NC no supere el saldo pendiente.
+    let saldosAntes = null;
+    if (vinculadas.length && (tipoFinal === 'pago' || tipoFinal === 'nota_credito')) {
+      const movsPrev = await Movimiento.find({ subrubro_id: Number(subrubroId) }).lean();
+      saldosAntes = computeSaldosFacturas(movsPrev);
+      if (tipoFinal === 'nota_credito') validarSaldoNC(saldosAntes, vinculadas, pago);
+    }
     try {
       await Movimiento.create({
         _id: id, subrubro_id: Number(subrubroId), fecha,
@@ -649,7 +697,13 @@ const db = {
     if (tipoFinal === 'pago' && caja_mov_id == null) {
       await syncCajaPago({ _id: id, fecha, pago: Number(pago) || 0, metodo_pago: metodo, subrubro_id: subrubroId }, sub, true);
     }
-    return withId(await Movimiento.findById(id).lean());
+    const creado = withId(await Movimiento.findById(id).lean());
+    // Detalle de aplicación por factura (queda en Audit vía la respuesta).
+    if (saldosAntes) {
+      const movsPost = await Movimiento.find({ subrubro_id: Number(subrubroId) }).lean();
+      creado.aplicaciones = armarAplicaciones(vinculadas, saldosAntes, movsPost);
+    }
+    return creado;
   },
 
   async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, documento, percepcion_iva, ingresos_brutos }) {
@@ -661,6 +715,12 @@ const db = {
     const eraPago = mov.tipo === 'pago';
     const veniaDeCaja = mov.caja_mov_id != null;
     validarFecha(fecha);
+    // Misma regla que en el alta: el vencimiento nunca puede ser anterior a la emisión.
+    if (fecha_vencimiento && fecha && fecha_vencimiento < fecha) {
+      const e = new Error('La fecha de vencimiento no puede ser anterior a la fecha de emisión');
+      e.statusCode = 400;
+      throw e;
+    }
     mov.monto = Number(monto) || 0;
     mov.pago = Number(pago) || 0;
     mov.fecha = fecha;
@@ -781,6 +841,16 @@ const db = {
     const idsNum = facturas_vinculadas_ids.map(Number);
     const metodo = tipo === 'pago' ? normalizarMetodoPago(metodo_pago) : null;
 
+    // Saldos ANTES de aplicar este pago/NC: validan el monto de la NC (nunca mayor
+    // al saldo pendiente de la factura vinculada) y alimentan el detalle de
+    // aplicación saldo_anterior → saldo_posterior para la auditoría.
+    let saldosAntes = null;
+    if (idsNum.length) {
+      const movsPrev = await Movimiento.find({ subrubro_id: Number(subrubroId) }).lean();
+      saldosAntes = computeSaldosFacturas(movsPrev);
+      if (tipo === 'nota_credito') validarSaldoNC(saldosAntes, idsNum, monto_pago);
+    }
+
     // Con el modelo de saldo por factura, un pago/NC parcial deja la factura con
     // saldo pendiente; NO se genera un "ajuste" por la diferencia (eso saldaría la
     // factura por error y descuadraría el total del subrubro).
@@ -816,7 +886,13 @@ const db = {
     if (tipo === 'pago' && caja_mov_id == null) {
       await syncCajaPago({ _id: id, fecha, pago: Number(monto_pago) || 0, metodo_pago: metodo, subrubro_id: subrubroId }, sub, true);
     }
-    return withId(await Movimiento.findById(id).lean());
+    const creado = withId(await Movimiento.findById(id).lean());
+    // Detalle de aplicación por factura (queda en Audit vía la respuesta).
+    if (saldosAntes) {
+      const movsPost = await Movimiento.find({ subrubro_id: Number(subrubroId) }).lean();
+      creado.aplicaciones = armarAplicaciones(idsNum, saldosAntes, movsPost);
+    }
+    return creado;
   },
 
   async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago, percepcion_iva, ingresos_brutos }) {
@@ -825,6 +901,18 @@ const db = {
     await Movimiento.deleteMany({ _ajuste_pago_id: Number(movId) });
 
     const idsNum = facturas_vinculadas_ids.map(Number);
+
+    // Saldos previos reales (para auditoría) y saldos SIN este movimiento (para
+    // validar el nuevo monto de una NC: su aplicación anterior se reemplaza).
+    let saldosAntes = null;
+    if (idsNum.length) {
+      const movsPrev = await Movimiento.find({ subrubro_id: mov.subrubro_id }).lean();
+      saldosAntes = computeSaldosFacturas(movsPrev);
+      if (mov.tipo === 'nota_credito') {
+        const saldosSinEste = computeSaldosFacturas(movsPrev.filter(m => m._id !== Number(movId)));
+        validarSaldoNC(saldosSinEste, idsNum, monto_pago);
+      }
+    }
 
     mov.fecha = fecha;
     mov.pago = Number(monto_pago);
@@ -847,7 +935,13 @@ const db = {
       const subP = await Subrubro.findById(mov.subrubro_id).lean();
       await syncCajaPago(mov, subP, true);
     }
-    return withId(mov.toObject());
+    const actualizado = withId(mov.toObject());
+    // Detalle de aplicación por factura (queda en Audit vía la respuesta).
+    if (saldosAntes) {
+      const movsPost = await Movimiento.find({ subrubro_id: mov.subrubro_id }).lean();
+      actualizado.aplicaciones = armarAplicaciones(idsNum, saldosAntes, movsPost);
+    }
+    return actualizado;
   },
 
   async getSaldoTotal(subrubroId) {

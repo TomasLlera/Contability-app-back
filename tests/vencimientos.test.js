@@ -66,6 +66,33 @@ describe('Vencimientos: saldo (NC / pagos), no monto original', () => {
   });
 });
 
+describe('Validación: vencimiento nunca anterior a la emisión', () => {
+  beforeEach(bootstrap);
+
+  it('rechaza crear una factura con vencimiento anterior a la emisión', async () => {
+    const res = await crear({ monto: 1000, fecha: hoy(), fecha_vencimiento: enDias(-2), tipo: 'factura' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/vencimiento/i);
+  });
+
+  it('acepta vencimiento igual a la emisión (vence el mismo día)', async () => {
+    const res = await crear({ monto: 1000, fecha: hoy(), fecha_vencimiento: hoy(), tipo: 'factura' });
+    expect(res.status).toBe(200);
+    expect(res.body.fecha_vencimiento).toBe(hoy());
+  });
+
+  it('rechaza editar una factura dejando el vencimiento antes de la emisión', async () => {
+    const factura = (await crear({ monto: 1000, fecha: hoy(), fecha_vencimiento: enDias(5), tipo: 'factura' })).body;
+    const res = await request(app).put(`/api/movimientos/${factura.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ monto: 1000, fecha: hoy(), fecha_vencimiento: enDias(-1), tipo: 'factura' });
+    expect(res.status).toBe(400);
+    // La factura conserva su vencimiento original
+    const check = await getVenc(30);
+    expect(check.body.find(v => v.id === factura.id).fecha_vencimiento).toBe(enDias(5));
+  });
+});
+
 describe('Modo de vencimiento "día fijo del mes" (integración)', () => {
   beforeEach(bootstrap);
 
