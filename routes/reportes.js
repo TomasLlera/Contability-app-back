@@ -137,6 +137,8 @@ function resumenCaja(movs) {
   let ingresos = 0, egresos = 0, gastosEfvo = 0, gastosTrans = 0, especiales = 0;
   for (const m of movs) {
     const monto = m.monto || 0;
+    // Pendientes (gasto sin confirmar / deuda sin cobrar) no cuentan en los flujos.
+    if (m.confirmado === false) continue;
     if (m.tipo === 'gasto') {
       egresos += monto;
       if (m.metodo === 'efectivo') gastosEfvo += monto; else gastosTrans += monto;
@@ -209,8 +211,10 @@ router.get('/caja-mensual', asyncHandler(async (req, res) => {
   const detStart = d;
   let acum = 0;
   for (const mv of movsActual) {
-    const esIngreso = mv.tipo === 'ingreso_extra' || mv.tipo === 'empleado';
-    const esGasto = mv.tipo === 'gasto';
+    // Pendientes (sin confirmar/cobrar) se listan pero no mueven el acumulado.
+    const pendiente = mv.confirmado === false;
+    const esIngreso = !pendiente && (mv.tipo === 'ingreso_extra' || mv.tipo === 'empleado');
+    const esGasto = !pendiente && mv.tipo === 'gasto';
     if (esIngreso) acum += mv.monto || 0;
     if (esGasto) acum -= mv.monto || 0;
     const row = wsD.getRow(d);

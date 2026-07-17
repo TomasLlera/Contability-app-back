@@ -29,6 +29,13 @@ const Rubro = mongoose.model('Rubro', rubroSchema);
 const subrubroSchema = new mongoose.Schema({
   _id: Number, rubro_id: Number, nombre: String,
   monto_base: { type: Number, default: 0 }, icon: String, created_at: String,
+  // Tipo de subrubro:
+  //   'factura' → proveedor clásico: facturas a PAGAR (default / legacy).
+  //   'deuda'   → dinero a COBRAR (préstamos a otros locales/personas). Sus
+  //               movimientos reusan los tipos internos 'factura' (= deuda) y
+  //               'pago' (= abono), pero se presentan como Deuda/Abono y en la
+  //               Caja del Día los abonos entran como INGRESOS (no gastos).
+  tipo_subrubro: { type: String, enum: ['factura', 'deuda'], default: 'factura' },
   // Metadata fiscal/bancaria
   cuit: { type: String, default: '' },
   cbu: { type: String, default: '' },

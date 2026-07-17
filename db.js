@@ -330,17 +330,21 @@ async function syncCajaPago(pago, sub, activo) {
     await CajaMovimiento.deleteMany({ pago_mov_id: pagoId, origen: 'subrubro' });
     return;
   }
+  // En un subrubro de tipo DEUDA (dinero a cobrar) el "pago" es un ABONO recibido:
+  // entra a la Caja como INGRESO (suma al saldo del día bajo su método), no como
+  // gasto. Los ingresos no tienen ciclo de confirmación (confirmado null).
+  const esDeuda = sub?.tipo_subrubro === 'deuda';
   const set = {
-    // La fecha del gasto en Caja es la fecha real del pago (no un vencimiento).
+    // La fecha del gasto/ingreso en Caja es la fecha real del pago (no un vencimiento).
     fecha: pago.fecha,
-    tipo: 'gasto',
-    concepto: `Pago — ${sub?.nombre || 'Subrubro'}`,
+    tipo: esDeuda ? 'ingreso_extra' : 'gasto',
+    concepto: esDeuda ? `Abono — ${sub?.nombre || 'Deuda'}` : `Pago — ${sub?.nombre || 'Subrubro'}`,
     monto: Number(pago.pago) || 0,
     // Un pago sin método definido cae a 'efectivo' (misma convención que la Caja).
     metodo: pago.metodo_pago || 'efectivo',
     subrubro_id: Number(pago.subrubro_id),
-    // Ya es un pago concretado → entra confirmado y descuenta de la Caja.
-    confirmado: true,
+    // Un pago concretado entra confirmado y descuenta; un ingreso no lleva confirmación.
+    confirmado: esDeuda ? null : true,
     origen: 'subrubro',
     auto_sync: false,
     es_especial: false,
@@ -505,6 +509,10 @@ const db = {
       if (!['efectivo', 'transferencia', 'ambas'].includes(extra.metodo_pago_default)) throw new Error("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
       doc.metodo_pago_default = extra.metodo_pago_default;
     }
+    if (extra.tipo_subrubro !== undefined && extra.tipo_subrubro !== null && extra.tipo_subrubro !== '') {
+      if (!['factura', 'deuda'].includes(extra.tipo_subrubro)) throw new Error("tipo_subrubro debe ser 'factura' o 'deuda'");
+      doc.tipo_subrubro = extra.tipo_subrubro;
+    }
     return withId((await Subrubro.create(doc)).toObject());
   },
   async updateSubrubro(id, fields = {}) {
@@ -554,6 +562,11 @@ const db = {
       if (!['efectivo', 'transferencia', 'ambas'].includes(mp)) throw new Error("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
       upd.metodo_pago_default = mp;
     }
+    if (fields.tipo_subrubro !== undefined) {
+      const ts = fields.tipo_subrubro || 'factura';
+      if (!['factura', 'deuda'].includes(ts)) throw new Error("tipo_subrubro debe ser 'factura' o 'deuda'");
+      upd.tipo_subrubro = ts;
+    }
     await Subrubro.findByIdAndUpdate(Number(id), upd);
     // Si se fijó un método de pago ('efectivo'/'transferencia'), aplicarlo a TODOS los
     // pagos existentes del subrubro (el método del subrubro manda). Con 'ambas' no se toca nada.
@@ -568,6 +581,30 @@ const db = {
     const cambioVenc = ['modo_vencimiento', 'dia_vencimiento', 'dia_semana_vencimiento', 'dia_mes_vencimiento']
       .some(k => fields[k] !== undefined);
     if (cambioVenc) await recomputarVencimientosSubrubro(Number(id));
+    // Si cambió el tipo de subrubro, re-espejar en Caja todos los pagos existentes
+    // (no originados en la Caja): un abono de deuda es un INGRESO, un pago de
+    // proveedor es un gasto. El espejo viejo con el signo equivocado se reescribe.
+    if (upd.tipo_subrubro !== undefined) {
+      const iid = Number(id);
+      const subNuevo = await Subrubro.findById(iid).lean();
+      const pagos = await Movimiento.find({ subrubro_id: iid, tipo: 'pago', caja_mov_id: null }).lean();
+      for (const p of pagos) await syncCajaPago(p, subNuevo, true);
+      // Conversión a DEUDA: limpiar la "memoria" de proveedor que quedó en Caja.
+      //   • Los remitos dejan de serlo (una deuda a cobrar nunca es un remito) y
+      //   • los GASTOS sin confirmar que apuntaban a facturas de este subrubro
+      //     (remitos + vencimientos auto-sync) se borran: el próximo auto-sync los
+      //     recrea con el signo correcto (ingreso pendiente de cobro).
+      if (upd.tipo_subrubro === 'deuda') {
+        await Movimiento.updateMany(
+          { subrubro_id: iid, tipo: 'factura', documento: 'remito' },
+          { $set: { documento: 'factura' } }
+        );
+        const factIds = (await Movimiento.find({ subrubro_id: iid, tipo: 'factura' }, { _id: 1 }).lean()).map(m => m._id);
+        if (factIds.length) {
+          await CajaMovimiento.deleteMany({ movimiento_id: { $in: factIds }, tipo: 'gasto', confirmado: false });
+        }
+      }
+    }
   },
   async deleteSubrubro(id) {
     const iid = Number(id);
@@ -639,8 +676,12 @@ const db = {
     // Validación de método_pago
     let metodo = normalizarMetodoPago(metodo_pago);
     const id = await Counter.next('movimientos');
-    // documento (factura/remito) solo tiene sentido para tipo='factura'.
-    const docFinal = tipoFinal === 'factura' ? (documento || 'factura') : null;
+    // documento (factura/remito) solo tiene sentido para tipo='factura'. En un
+    // subrubro DEUDA no existe el remito (es dinero a cobrar, no un gasto en
+    // efectivo): se fuerza 'factura' para que nunca dispare syncCajaRemito.
+    const docFinal = tipoFinal === 'factura'
+      ? (sub.tipo_subrubro === 'deuda' ? 'factura' : (documento || 'factura'))
+      : null;
     // Remito: se paga en efectivo en el acto y el método no es editable.
     if (docFinal === 'remito') metodo = 'efectivo';
     // Vinculación explícita de facturas: solo aplica a pagos / notas de crédito.
@@ -734,6 +775,11 @@ const db = {
     if (metodo_pago !== undefined) mov.metodo_pago = normalizarMetodoPago(metodo_pago);
     if (documento !== undefined) {
       mov.documento = mov.tipo === 'factura' ? (documento || 'factura') : null;
+    }
+    // En un subrubro DEUDA no existe el remito (misma regla que en el alta).
+    if (mov.documento === 'remito') {
+      const subDoc = await Subrubro.findById(mov.subrubro_id).lean();
+      if (subDoc?.tipo_subrubro === 'deuda') mov.documento = 'factura';
     }
     const esRemito = mov.tipo === 'factura' && mov.documento === 'remito';
     // Remito: sin percepciones y siempre en efectivo (no editable).
@@ -994,10 +1040,23 @@ const db = {
     return saldo;
   },
 
-  async getVencimientos(diasAdelante = 30) {
+  // `tipoSubrubro` filtra por el tipo del subrubro dueño de la factura:
+  //   'factura' (default) → boletas a PAGAR a proveedores (excluye deudas a cobrar,
+  //               así no aparecen como "facturas vencidas" en dashboard/alertas/caja).
+  //   'deuda'   → deudas a COBRAR próximas a vencer (informativas).
+  async getVencimientos(diasAdelante = 30, tipoSubrubro = 'factura') {
     const hoy = new Date();
     hoy.setHours(0, 0, 0, 0);
-    const candidatas = await Movimiento.find({ fecha_vencimiento: { $exists: true, $ne: null }, tipo: 'factura', pagado: { $ne: true } }).lean();
+    let candidatas = await Movimiento.find({ fecha_vencimiento: { $exists: true, $ne: null }, tipo: 'factura', pagado: { $ne: true } }).lean();
+    if (candidatas.length === 0) return [];
+
+    // Filtro por tipo de subrubro (los legacy sin campo cuentan como 'factura').
+    const subsTipo = await Subrubro.find(
+      { _id: { $in: [...new Set(candidatas.map(m => m.subrubro_id))] } },
+      { tipo_subrubro: 1 }
+    ).lean();
+    const tipoDe = new Map(subsTipo.map(s => [s._id, s.tipo_subrubro || 'factura']));
+    candidatas = candidatas.filter(m => (tipoDe.get(m.subrubro_id) || 'factura') === tipoSubrubro);
     if (candidatas.length === 0) return [];
 
     const subIds = [...new Set(candidatas.map(m => m.subrubro_id))];
@@ -1110,10 +1169,14 @@ const db = {
   // Deuda total acumulada de toda la app = suma de los saldos pendientes de todas
   // las facturas. computeSaldosFacturas se aplica por subrubro (la imputación FIFO
   // y las vinculaciones son por subrubro), y se suman los saldos de cada uno.
+  // Excluye los subrubros de tipo 'deuda': eso es plata a COBRAR, no deuda propia.
   async getDeudaTotal() {
+    const subsDeuda = await Subrubro.find({ tipo_subrubro: 'deuda' }, { _id: 1 }).lean();
+    const excluidos = new Set(subsDeuda.map(s => s._id));
     const movs = await Movimiento.find({}, { subrubro_id: 1, fecha: 1, monto: 1, pago: 1, tipo: 1, facturas_vinculadas_ids: 1 }).lean();
     const porSub = new Map();
     for (const m of movs) {
+      if (excluidos.has(m.subrubro_id)) continue;
       if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
       porSub.get(m.subrubro_id).push(m);
     }
@@ -1122,6 +1185,49 @@ const db = {
       for (const s of computeSaldosFacturas(lista).values()) deuda += s;
     }
     return r2(deuda);
+  },
+
+  // Resumen de DEUDAS POR COBRAR (subrubros tipo 'deuda'): total pendiente,
+  // cantidad de deudas abiertas y detalle por subrubro con su próximo vencimiento.
+  // Alimenta la card del dashboard.
+  async getDeudasPorCobrar() {
+    const subs = await Subrubro.find({ tipo_subrubro: 'deuda' }).lean();
+    if (subs.length === 0) return { total: 0, cantidad: 0, subrubros: [] };
+    const subIds = subs.map(s => s._id);
+    const movs = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+    const porSub = new Map(subIds.map(id => [id, []]));
+    for (const m of movs) porSub.get(m.subrubro_id)?.push(m);
+
+    const rubros = await Rubro.find({ _id: { $in: [...new Set(subs.map(s => s.rubro_id))] } }).lean();
+    const rubroMap = Object.fromEntries(rubros.map(r => [r._id, { ...r, id: r._id }]));
+
+    let total = 0, cantidad = 0;
+    const detalle = subs.map(s => {
+      const lista = porSub.get(s._id) || [];
+      const saldos = computeSaldosFacturas(lista);
+      let pendiente = 0, abiertas = 0, prox = null;
+      for (const m of lista) {
+        if (m.tipo !== 'factura') continue;
+        const sal = saldos.get(m._id) ?? (m.monto || 0);
+        if (sal <= 0.005) continue;
+        pendiente += sal;
+        abiertas++;
+        if (m.fecha_vencimiento && (!prox || m.fecha_vencimiento < prox)) prox = m.fecha_vencimiento;
+      }
+      total += pendiente;
+      cantidad += abiertas;
+      return {
+        id: s._id,
+        nombre: s.nombre,
+        rubro: rubroMap[s.rubro_id] || null,
+        saldo: r2(pendiente),
+        deudas_abiertas: abiertas,
+        proximo_vencimiento: prox,
+      };
+    }).filter(d => d.saldo > 0.005)
+      .sort((a, b) => b.saldo - a.saldo);
+
+    return { total: r2(total), cantidad, subrubros: detalle };
   },
 
   // Tendencia mensual para los subrubros indicados. Por cada mes con actividad

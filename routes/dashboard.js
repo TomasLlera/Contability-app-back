@@ -41,6 +41,11 @@ router.get('/resumen', asyncHandler(async (req, res) => {
   });
 }));
 
+// Deudas por cobrar (subrubros tipo 'deuda'): total, cantidad y detalle por subrubro.
+router.get('/deudas-cobrar', asyncHandler(async (req, res) => {
+  res.json(await db.getDeudasPorCobrar());
+}));
+
 // Tendencia mensual de un rubro específico (últimos N meses)
 router.get('/tendencia/:rubroId', asyncHandler(async (req, res) => {
   const rubroId = Number(req.params.rubroId);
@@ -141,6 +146,8 @@ async function resumenCajaRango(desde, hasta) {
   let ingresos = 0, egresos = 0;
   for (const m of movs) {
     const monto = m.monto || 0;
+    // confirmado === false = pendiente (gasto sin pagar / deuda sin cobrar): no cuenta.
+    if (m.confirmado === false) continue;
     if (m.tipo === 'gasto') egresos += monto;
     else if (m.tipo === 'ingreso_extra' || m.tipo === 'empleado') ingresos += monto;
   }

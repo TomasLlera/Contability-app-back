@@ -50,7 +50,11 @@ router.get('/vencimientos-sync', asyncHandler(async (req, res) => {
   const dias = cfg?.dias_anticipacion_caja ?? 3;
   const hasta = addDaysToStr(fecha, dias);
 
-  const subrubros = await Subrubro.find({ rubro_id: { $in: rubros_sync } }).lean();
+  // Los subrubros DEUDA (dinero a cobrar) no generan gastos en la Caja: sus
+  // vencimientos se muestran aparte como informativos (GET /movimientos/vencimientos
+  // con tipo=deuda) y sus abonos entran como ingresos.
+  const subrubros = (await Subrubro.find({ rubro_id: { $in: rubros_sync } }).lean())
+    .filter(s => (s.tipo_subrubro || 'factura') !== 'deuda');
   if (subrubros.length === 0) return res.json([]);
 
   const subrubroIds = subrubros.map(s => s._id);
@@ -106,10 +110,13 @@ router.get('/vencimientos-sync', asyncHandler(async (req, res) => {
 // Sólo toca ítems auto-sync (auto_sync:true) o legacy con la firma del auto-sync
 // (metodo null + movimiento_id), nunca gastos cargados a mano por el usuario.
 async function reconciliarAutoSync() {
+  // Trae TODOS los pendientes enlazados a una factura; el loop decide cuáles tocar:
+  // los auto-sync (auto_sync:true o firma legacy metodo:null) y, además, cualquiera
+  // cuya factura viva en un subrubro DEUDA (p. ej. gastos de remito que quedaron de
+  // antes de convertir el subrubro: su signo ya no corresponde).
   const autoItems = await CajaMovimiento.find({
     confirmado: false,
     movimiento_id: { $ne: null },
-    $or: [{ auto_sync: true }, { metodo: null }],
   }).lean();
   if (autoItems.length === 0) return { actualizados: 0, eliminados: 0 };
 
@@ -138,6 +145,12 @@ async function reconciliarAutoSync() {
   const updateOps = [];
   for (const item of autoItems) {
     const f = facturaMap.get(item.movimiento_id);
+    const subDe = f ? subMap[f.subrubro_id] : null;
+    // Solo se tocan los ítems auto-generados (auto_sync / firma legacy) o los que
+    // pertenecen a un subrubro DEUDA (restos con el signo viejo). Un gasto manual
+    // vinculado a una factura de proveedor queda intacto.
+    const esAuto = item.auto_sync || item.metodo == null;
+    if (!esAuto && subDe?.tipo_subrubro !== 'deuda') continue;
     // Factura inexistente, ya no es factura, pagada o saldada → el pendiente sobra.
     if (!f || f.tipo !== 'factura' || f.pagado || saldoDe(f) <= 0.005) {
       toDelete.push(item._id);
@@ -149,6 +162,10 @@ async function reconciliarAutoSync() {
     const nuevoMonto = Number(saldoDe(f)) || 0;
     const nuevaFecha = f.fecha_vencimiento || item.fecha;
     const set = {};
+    // El tipo del subrubro manda: deuda → ingreso pendiente de cobro; proveedor →
+    // gasto. Si el subrubro cambió de tipo, el ítem pendiente corrige su signo.
+    const tipoEsperado = sub?.tipo_subrubro === 'deuda' ? 'ingreso_extra' : 'gasto';
+    if (item.tipo !== tipoEsperado) set.tipo = tipoEsperado;
     if (Math.abs((item.monto || 0) - nuevoMonto) > 0.005) set.monto = nuevoMonto;
     if (item.fecha !== nuevaFecha) set.fecha = nuevaFecha;
     if (item.concepto !== concepto) set.concepto = concepto;
@@ -195,8 +212,11 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   const dias = cfg?.dias_anticipacion_caja ?? 3;
   const hasta = addDaysToStr(fecha, dias);
 
+  // Incluye también los subrubros DEUDA: sus vencimientos entran a la Caja como
+  // INGRESOS pendientes de cobro (tipo ingreso_extra, confirmado:false) en vez de
+  // gastos. Al confirmarlos se registra el abono en el subrubro y suman al día.
   const subrubros = await Subrubro.find({ rubro_id: { $in: rubros_sync } }).lean();
-  if (subrubros.length === 0) return res.json({ creados: 0 });
+  if (subrubros.length === 0) return res.json({ creados: 0, actualizados, eliminados });
 
   const subIds = subrubros.map(s => s._id);
   const subMap = Object.fromEntries(subrubros.map(s => [s._id, s]));
@@ -257,6 +277,8 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
     const sub = subMap[v.subrubro_id];
     const baseConcepto = sub?.nombre || 'Vencimiento';
     const concepto = v.concepto ? `${baseConcepto} — ${v.concepto}` : baseConcepto;
+    // Deuda a cobrar → ingreso pendiente de cobro; factura de proveedor → gasto.
+    const esDeuda = sub?.tipo_subrubro === 'deuda';
     const _id = startId != null ? startId + i : await Counter.next('caja');
     return {
       updateOne: {
@@ -267,7 +289,7 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
             // El caja item vive en la fecha de vencimiento. Si no se paga, el GET
             // lo arrastra hacia adelante mediante el lookback de fechas anteriores.
             fecha: v.fecha_vencimiento,
-            tipo: 'gasto',
+            tipo: esDeuda ? 'ingreso_extra' : 'gasto',
             concepto,
             monto: Number(saldoDe(v)) || 0,   // saldo actual, no monto original
             // Método heredado de la factura: si se cargó con efectivo/transferencia en
@@ -334,7 +356,9 @@ router.get('/', asyncHandler(async (req, res) => {
       { fecha },
       {
         fecha: { $lt: fecha },
-        tipo: 'gasto',
+        // gasto = factura por pagar · ingreso_extra = deuda por cobrar: ambos se
+        // arrastran hacia adelante mientras sigan sin confirmar.
+        tipo: { $in: ['gasto', 'ingreso_extra'] },
         confirmado: false,
         movimiento_id: { $ne: null },
       },

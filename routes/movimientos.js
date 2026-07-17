@@ -10,7 +10,9 @@ const { audit } = require('../middleware/audit');
 
 router.get('/vencimientos/proximos', asyncHandler(async (req, res) => {
   const dias = Number(req.query.dias) || 30;
-  res.json(await db.getVencimientos(dias));
+  // tipo: 'factura' (default, boletas a pagar) | 'deuda' (deudas a cobrar).
+  const tipo = req.query.tipo === 'deuda' ? 'deuda' : 'factura';
+  res.json(await db.getVencimientos(dias, tipo));
 }));
 
 router.get('/search', asyncHandler(async (req, res) => {
