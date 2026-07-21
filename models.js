@@ -58,6 +58,12 @@ const subrubroSchema = new mongoose.Schema({
   //   'efectivo' / 'transferencia' → se asigna automáticamente y bloquea el selector al crear un pago.
   //   'ambas' → el usuario elige el método manualmente (comportamiento por defecto).
   metodo_pago_default: { type: String, enum: ['efectivo', 'transferencia', 'ambas'], default: 'ambas' },
+  // true = el proveedor otorga descuentos por pago, variables factura por factura y
+  // conocidos recién al pagar. Al confirmar el pago en la Caja del Día se habilita el
+  // acordeón de descuento; el monto descontado genera una NC automática vinculada a
+  // la factura, de modo que el saldo del subrubro cierre en 0. Solo aplica a
+  // subrubros de tipo 'factura' (una deuda a cobrar no lleva descuento por pago).
+  aplica_descuento: { type: Boolean, default: false },
 });
 subrubroSchema.index({ rubro_id: 1 });
 const Subrubro = mongoose.model('Subrubro', subrubroSchema);
@@ -141,6 +147,16 @@ const cajaSchema = new mongoose.Schema({
   // Subrubro (sincronización Subrubro → Caja). null = ítem normal de Caja (manual,
   // vencimiento auto-sync, saldos, etc.). Distingue qué ítems borrar al borrar el pago.
   origen: { type: String, enum: ['subrubro', null], default: null },
+  // --- Descuento por pago (subrubros con aplica_descuento) ---
+  // Al confirmar, `monto` pasa a ser el NETO efectivamente pagado (lo que sale de la
+  // caja) y estos campos guardan el detalle para poder mostrarlo y revertirlo:
+  descuento: { type: Number, default: 0 },              // monto descontado (0 = sin descuento)
+  // Porcentaje pactado, cuando el descuento se cargó como % en vez de monto fijo.
+  // Es informativo: el importe autoritativo siempre es `descuento` (el % se resuelve
+  // a pesos en el backend al confirmar). null = se cargó un monto fijo.
+  descuento_pct: { type: Number, default: null },
+  monto_bruto: { type: Number, default: null },         // monto original antes del descuento
+  nc_mov_id: { type: Number, default: null },           // NC generada automáticamente por el descuento
   // true = generado automáticamente por el auto-sync de vencimientos. Marca qué ítems
   // puede reconciliar (actualizar monto/fecha o eliminar) el auto-sync sin pisar gastos
   // cargados a mano por el usuario.

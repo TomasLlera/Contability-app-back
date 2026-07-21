@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { CajaMovimiento, CajaDescarte, CajaConfig, Counter, Subrubro, Movimiento } = require('../models');
-const { computeSaldosFacturas } = require('../db');
+const db = require('../db');
+const { computeSaldosFacturas } = db;
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const { asyncHandler } = require('../middleware/errorHandler');
@@ -345,6 +346,58 @@ router.get('/facturas-pendientes', asyncHandler(async (req, res) => {
   })));
 }));
 
+// Adjunta el tipo de comprobante de origen ('factura' | 'remito' | null) a cada
+// ítem de caja enlazado a un movimiento. Es un campo DERIVADO de solo lectura: el
+// dato vive en Movimiento.documento y la Caja lo muestra como badge. Los ítems
+// manuales (movimiento_id null) quedan con documento null.
+async function attachDocumento(movs) {
+  const ids = [...new Set(movs.map(m => m.movimiento_id).filter(id => id != null))];
+  if (ids.length === 0) return movs.map(m => ({ ...m, documento: null }));
+  const facturas = await Movimiento.find({ _id: { $in: ids } }, { documento: 1 }).lean();
+  const docMap = new Map(facturas.map(f => [f._id, f.documento || null]));
+  return movs.map(m => ({ ...m, documento: docMap.get(m.movimiento_id) ?? null }));
+}
+
+// GET /api/caja/descuentos?desde=&hasta=&subrubro_id=
+// Seguimiento de descuentos por pago aplicados en un rango. Alimenta el card del
+// dashboard, el historial del subrubro y el filtro del historial de caja.
+// Devuelve el detalle y los totales ya agregados (total descontado, cantidad de
+// pagos y desglose por subrubro) para no recalcularlos en cada consumidor.
+router.get('/descuentos', asyncHandler(async (req, res) => {
+  const { desde, hasta, subrubro_id } = req.query;
+  const filter = { descuento: { $gt: 0 } };
+  if (desde) filter.fecha = { ...filter.fecha, $gte: desde };
+  if (hasta) filter.fecha = { ...filter.fecha, $lte: hasta };
+  if (subrubro_id) filter.subrubro_id = Number(subrubro_id);
+
+  const items = await CajaMovimiento.find(filter).sort({ fecha: -1, _id: -1 }).lean();
+
+  const subIds = [...new Set(items.map(i => i.subrubro_id).filter(id => id != null))];
+  const subs = subIds.length ? await Subrubro.find({ _id: { $in: subIds } }, { nombre: 1 }).lean() : [];
+  const nombreSub = new Map(subs.map(s => [s._id, s.nombre]));
+
+  const porSubrubro = new Map();
+  for (const i of items) {
+    const k = i.subrubro_id ?? 0;
+    const acc = porSubrubro.get(k) || { subrubro_id: i.subrubro_id ?? null, nombre: nombreSub.get(i.subrubro_id) || 'Sin subrubro', total: 0, count: 0 };
+    acc.total += i.descuento || 0;
+    acc.count += 1;
+    porSubrubro.set(k, acc);
+  }
+
+  res.json({
+    total: items.reduce((s, i) => s + (i.descuento || 0), 0),
+    count: items.length,
+    // Base bruta sobre la que se descontó — permite mostrar el % efectivo del período.
+    total_bruto: items.reduce((s, i) => s + (Number(i.monto_bruto ?? i.monto) || 0), 0),
+    por_subrubro: [...porSubrubro.values()].sort((a, b) => b.total - a.total),
+    items: withIds(items).map(i => ({
+      ...i,
+      subrubro_nombre: nombreSub.get(i.subrubro_id) || null,
+    })),
+  });
+}));
+
 // GET /api/caja?fecha=YYYY-MM-DD
 // Incluye vencimientos sincronizados de días anteriores que aún no fueron
 // pagados ni confirmados — siguen pendientes hasta abonarse.
@@ -364,7 +417,7 @@ router.get('/', asyncHandler(async (req, res) => {
       },
     ],
   }).sort({ fecha: 1, _id: 1 }).lean();
-  res.json(withIds(movs));
+  res.json(await attachDocumento(withIds(movs)));
 }));
 
 // GET /api/caja/rango?desde=YYYY-MM-DD&hasta=YYYY-MM-DD&page=&limit=
@@ -430,6 +483,135 @@ router.post('/', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
     }
     throw err;
   }
+}));
+
+// POST /api/caja/:id/confirmar   body: { descuento?: number, fecha?: 'YYYY-MM-DD' }
+//
+// Confirma un ítem de Caja como pagado/cobrado en UNA sola operación del servidor:
+// registra el pago (o abono) en el subrubro de origen y, si se aplicó un descuento
+// por pago, genera además la Nota de Crédito que lo respalda. Antes esto lo
+// orquestaba el frontend con dos llamadas sueltas; centralizarlo acá es lo que
+// permite que el pago y su NC no puedan quedar desparejos, y que la auditoría
+// registre la operación completa (incluido quién descontó y cuánto).
+//
+// Semántica del descuento: el ítem de Caja pasa a valer el NETO efectivamente
+// pagado (lo que sale de la caja), y el descuento se refleja en el subrubro como
+// una NC vinculada a la factura. Saldo factura = monto − pago neto − NC = 0.
+router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const item = await CajaMovimiento.findById(id).lean();
+  if (!item) return res.status(404).json({ error: 'Movimiento de caja no encontrado' });
+  if (item.confirmado === true) return res.status(409).json({ error: 'El movimiento ya está confirmado' });
+  if (!item.metodo) return res.status(400).json({ error: 'Definí el método de pago antes de confirmar' });
+
+  const fecha = req.body.fecha || item.fecha;
+  // El bruto es el monto que la Caja muestra hoy; si por un reintento el ítem ya
+  // tuviera monto_bruto, ese manda (no se descuenta dos veces sobre el neto).
+  const bruto = Number(item.monto_bruto ?? item.monto) || 0;
+
+  const sub = item.subrubro_id ? await Subrubro.findById(Number(item.subrubro_id)).lean() : null;
+
+  // El descuento se puede cargar como monto fijo o como porcentaje. El % se resuelve
+  // a pesos ACÁ (no en el cliente) para que el importe que termina en la NC sea el que
+  // el servidor calculó, con un único criterio de redondeo a centavos.
+  const pct = req.body.descuento_pct != null && req.body.descuento_pct !== ''
+    ? Number(req.body.descuento_pct)
+    : null;
+  if (pct != null && (!Number.isFinite(pct) || pct <= 0 || pct >= 100)) {
+    return res.status(400).json({ error: 'El porcentaje de descuento debe estar entre 0 y 100' });
+  }
+  const descuento = pct != null
+    ? Math.round(bruto * (pct / 100) * 100) / 100
+    : Number(req.body.descuento) || 0;
+
+  if (descuento) {
+    if (!sub?.aplica_descuento) return res.status(400).json({ error: 'El subrubro no admite descuentos por pago' });
+    if (!item.movimiento_id)   return res.status(400).json({ error: 'Solo se puede descontar sobre un pago vinculado a una factura' });
+    if (descuento < 0)         return res.status(400).json({ error: 'El descuento no puede ser negativo' });
+    if (descuento >= bruto)    return res.status(400).json({ error: 'El descuento no puede ser mayor o igual al monto de la factura' });
+  }
+  const neto = bruto - descuento;
+
+  const esCobro = item.tipo === 'ingreso_extra';
+  let pagoId = null;
+  let ncId = null;
+
+  if (item.subrubro_id) {
+    // NC primero: si fallara, todavía no se registró el pago y el ítem queda sin
+    // confirmar, en un estado reintentable. Al revés dejaría un pago sin su NC.
+    if (descuento) {
+      const nc = await db.createMovimiento(item.subrubro_id, {
+        tipo: 'nota_credito',
+        pago: descuento,
+        fecha,
+        concepto: `Descuento por pago${pct != null ? ` (${pct}%)` : ''}: ${item.concepto}`,
+        facturas_vinculadas_ids: [Number(item.movimiento_id)],
+        caja_mov_id: id,
+        // Determinística: una entrada de caja genera como mucho UNA NC de descuento.
+        idempotency_key: `caja-descuento-${id}`,
+      });
+      ncId = nc?.id ?? null;
+    }
+    const pago = await db.createMovimiento(item.subrubro_id, {
+      tipo: 'pago',
+      pago: neto,
+      fecha,
+      concepto: `${esCobro ? 'Abono caja' : 'Pago caja'}: ${item.concepto}`,
+      metodo_pago: item.metodo,
+      caja_mov_id: id,
+      facturas_vinculadas_ids: item.movimiento_id ? [Number(item.movimiento_id)] : [],
+      idempotency_key: `caja-confirm-${id}`,
+    });
+    pagoId = pago?.id ?? null;
+  }
+
+  await CajaMovimiento.findByIdAndUpdate(id, {
+    $set: {
+      confirmado: true,
+      fecha,
+      monto: neto,
+      descuento,
+      descuento_pct: descuento ? pct : null,
+      monto_bruto: descuento ? bruto : null,
+      pago_mov_id: pagoId,
+      nc_mov_id: ncId,
+    },
+  });
+
+  // Enriquece el diff de auditoría: deja explícito el descuento aplicado y la NC
+  // generada, que es información que no se deduce del body de la request.
+  res.json({ ok: true, id, monto: neto, monto_bruto: bruto, descuento, descuento_pct: pct, pago_mov_id: pagoId, nc_mov_id: ncId });
+}));
+
+// POST /api/caja/:id/revertir
+// Deshace una confirmación: borra el pago y la NC de descuento generados en el
+// subrubro y devuelve el ítem de Caja a su monto bruto, sin descuento.
+router.post('/:id/revertir', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const item = await CajaMovimiento.findById(id).lean();
+  if (!item) return res.status(404).json({ error: 'Movimiento de caja no encontrado' });
+
+  // Borrar el pago y la NC es lo que libera sus idempotency_key, de modo que el
+  // ítem pueda volver a confirmarse después.
+  for (const movId of [item.pago_mov_id, item.nc_mov_id]) {
+    if (movId != null) {
+      try { await db.deleteMovimiento(movId); }
+      catch (e) { logger.warn({ err: e, movimiento_id: movId, caja_id: id }, 'No se pudo borrar el movimiento al revertir la confirmación'); }
+    }
+  }
+
+  await CajaMovimiento.findByIdAndUpdate(id, {
+    $set: {
+      confirmado: false,
+      monto: Number(item.monto_bruto ?? item.monto) || 0,
+      descuento: 0,
+      descuento_pct: null,
+      monto_bruto: null,
+      pago_mov_id: null,
+      nc_mov_id: null,
+    },
+  });
+  res.json({ ok: true, id });
 }));
 
 // PUT /api/caja/:id

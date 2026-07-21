@@ -513,6 +513,10 @@ const db = {
       if (!['factura', 'deuda'].includes(extra.tipo_subrubro)) throw new Error("tipo_subrubro debe ser 'factura' o 'deuda'");
       doc.tipo_subrubro = extra.tipo_subrubro;
     }
+    // El descuento por pago no aplica a las deudas a cobrar: se fuerza false.
+    if (extra.aplica_descuento !== undefined) {
+      doc.aplica_descuento = doc.tipo_subrubro === 'deuda' ? false : Boolean(extra.aplica_descuento);
+    }
     return withId((await Subrubro.create(doc)).toObject());
   },
   async updateSubrubro(id, fields = {}) {
@@ -567,6 +571,10 @@ const db = {
       if (!['factura', 'deuda'].includes(ts)) throw new Error("tipo_subrubro debe ser 'factura' o 'deuda'");
       upd.tipo_subrubro = ts;
     }
+    if (fields.aplica_descuento !== undefined) upd.aplica_descuento = Boolean(fields.aplica_descuento);
+    // Una deuda a cobrar nunca lleva descuento por pago: si el subrubro pasa a 'deuda'
+    // (ahora o ya lo era y no se está cambiando), el flag se apaga.
+    if (upd.tipo_subrubro === 'deuda') upd.aplica_descuento = false;
     await Subrubro.findByIdAndUpdate(Number(id), upd);
     // Si se fijó un método de pago ('efectivo'/'transferencia'), aplicarlo a TODOS los
     // pagos existentes del subrubro (el método del subrubro manda). Con 'ambas' no se toca nada.
