@@ -162,3 +162,102 @@ describe('Registro → Tarjetas', () => {
     expect(await TarjetaTransaccion.countDocuments()).toBe(0);
   });
 });
+
+describe('IVA de Tarjetas y cruce con Venta Sistema', () => {
+  // Ejemplo del pedido: 50.000 QR + 30.000 débito + 60.000 crédito + 10.000 prepaga
+  // = 150.000 → IVA 21% = 31.500.
+  const cargarMesTarjetas = async () => {
+    await crearTarjeta({ tipo: 'qr',      fecha: '2026-07-03', monto: 50000 });
+    await crearTarjeta({ tipo: 'debito',  fecha: '2026-07-10', monto: 30000 });
+    await crearTarjeta({ tipo: 'credito', fecha: '2026-07-17', monto: 60000 });
+    await crearTarjeta({ tipo: 'prepaga', fecha: '2026-07-24', monto: 10000 });
+  };
+
+  it('el resumen mensual de tarjetas expone el IVA 21% del total', async () => {
+    await cargarMesTarjetas();
+    const res = await auth(request(app).get('/api/registro/tarjetas/mes/2026-07'));
+    expect(res.status).toBe(200);
+    expect(res.body.total).toBe(150000);
+    expect(res.body.iva_21).toBe(31500);
+    expect(res.body.alicuota).toBe(0.21);
+  });
+
+  it('GET /tarjetas/iva/:mes devuelve total e IVA del mes', async () => {
+    await cargarMesTarjetas();
+    const res = await auth(request(app).get('/api/registro/tarjetas/iva/2026-07'));
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      mes: '2026-07', alicuota: 0.21,
+      total_tarjetas: 150000, iva_tarjetas: 31500, transacciones: 4,
+    });
+  });
+
+  it('el IVA sigue a las transacciones: al borrar una, baja solo', async () => {
+    const { body: tx } = await crearTarjeta({ tipo: 'qr', fecha: '2026-07-03', monto: 50000 });
+    await crearTarjeta({ tipo: 'debito', fecha: '2026-07-10', monto: 30000 });
+    expect((await auth(request(app).get('/api/registro/tarjetas/iva/2026-07'))).body.iva_tarjetas).toBe(16800);
+
+    await auth(request(app).delete(`/api/registro/tarjetas/${tx.id}`));
+    expect((await auth(request(app).get('/api/registro/tarjetas/iva/2026-07'))).body.iva_tarjetas).toBe(6300);
+  });
+
+  it('el mes de ventas del sistema expone su propio IVA 21%', async () => {
+    await crearVenta({ fecha: '2026-07-05', monto: 100000 });
+    const res = await auth(request(app).get('/api/registro/ventas-sistema/mes/2026-07'));
+    expect(res.body.total).toBe(100000);
+    expect(res.body.iva_21).toBe(21000);
+  });
+
+  it('alerta cuando tarjetas supera a venta sistema (falta cargar en el sistema)', async () => {
+    await cargarMesTarjetas();                                    // IVA 31.500
+    await crearVenta({ fecha: '2026-07-05', monto: 100000 });      // IVA 21.000
+
+    const res = await auth(request(app).get('/api/registro/comparativa-iva/2026-07'));
+    expect(res.status).toBe(200);
+    expect(res.body.tarjetas).toMatchObject({ total: 150000, iva: 31500 });
+    expect(res.body.venta_sistema).toMatchObject({ total: 100000, iva: 21000 });
+    expect(res.body.diferencia).toBe(10500);
+    expect(res.body.alerta).toBe(true);
+    expect(res.body.estado).toBe('faltan_en_sistema');
+  });
+
+  it('alerta a la inversa cuando venta sistema supera a tarjetas', async () => {
+    await crearTarjeta({ tipo: 'qr', fecha: '2026-07-03', monto: 50000 });  // IVA 10.500
+    await crearVenta({ fecha: '2026-07-05', monto: 100000 });               // IVA 21.000
+
+    const res = await auth(request(app).get('/api/registro/comparativa-iva/2026-07'));
+    expect(res.body.diferencia).toBe(-10500);
+    expect(res.body.alerta).toBe(true);
+    expect(res.body.estado).toBe('faltan_en_tarjetas');
+  });
+
+  it('sin alerta cuando coinciden, y sin_datos si el mes está vacío', async () => {
+    await crearTarjeta({ tipo: 'qr', fecha: '2026-07-03', monto: 80000 });
+    await crearVenta({ fecha: '2026-07-05', monto: 80000 });
+
+    const igual = await auth(request(app).get('/api/registro/comparativa-iva/2026-07'));
+    expect(igual.body.diferencia).toBe(0);
+    expect(igual.body.alerta).toBe(false);
+    expect(igual.body.estado).toBe('coincide');
+
+    const vacio = await auth(request(app).get('/api/registro/comparativa-iva/2026-09'));
+    expect(vacio.body.estado).toBe('sin_datos');
+    expect(vacio.body.alerta).toBe(false);
+  });
+
+  it('desglosa la diferencia por día', async () => {
+    await crearTarjeta({ tipo: 'qr', fecha: '2026-07-03', monto: 50000 });
+    await crearVenta({ fecha: '2026-07-03', monto: 50000 });   // ese día cierra
+    await crearTarjeta({ tipo: 'debito', fecha: '2026-07-10', monto: 30000 }); // este no
+
+    const { body } = await auth(request(app).get('/api/registro/comparativa-iva/2026-07'));
+    expect(body.por_dia).toHaveLength(31);
+    expect(body.por_dia[2]).toMatchObject({ dia: 3, iva_tarjetas: 10500, iva_venta_sistema: 10500, diferencia: 0 });
+    expect(body.por_dia[9]).toMatchObject({ dia: 10, iva_tarjetas: 6300, iva_venta_sistema: 0, diferencia: 6300 });
+  });
+
+  it('rechaza un mes con formato inválido', async () => {
+    expect((await auth(request(app).get('/api/registro/comparativa-iva/2026-7'))).status).toBe(400);
+    expect((await auth(request(app).get('/api/registro/tarjetas/iva/julio'))).status).toBe(400);
+  });
+});

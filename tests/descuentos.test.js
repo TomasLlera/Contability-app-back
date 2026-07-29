@@ -2,7 +2,7 @@ const { setupTestDb } = require('./setup');
 const request = require('supertest');
 const bcrypt = require('bcryptjs');
 const app = require('../server');
-const { User, Counter, Local, Rubro, Subrubro, Movimiento, CajaMovimiento } = require('../models');
+const { User, Counter, Local, Rubro, Subrubro, Movimiento, CajaMovimiento, CajaConfig } = require('../models');
 const { computeSaldosFacturas } = require('../db');
 
 setupTestDb();
@@ -10,6 +10,11 @@ setupTestDb();
 let adminToken, rubroId, subConDesc, subSinDesc;
 
 const hoy = () => new Date().toISOString().split('T')[0];
+const addDias = (n) => {
+  const d = new Date();
+  d.setDate(d.getDate() + n);
+  return d.toISOString().split('T')[0];
+};
 
 async function bootstrap() {
   const ah = await bcrypt.hash('admin123', 4);
@@ -208,5 +213,67 @@ describe('descuento por pago', () => {
     await auth(request(app).post(`/api/caja/${cajaId}/confirmar`)).send({ descuento: 500 });
     const res = await auth(request(app).post(`/api/caja/${cajaId}/confirmar`)).send({ descuento: 500 });
     expect(res.status).toBe(409);
+  });
+
+  // El descuento y su Nota de Crédito son puntuales: se ven el día en que se
+  // confirmó el pago y no vuelven a asomar en la Caja de los días siguientes.
+  describe('el descuento no reaparece en días posteriores', () => {
+    it('el ítem confirmado con descuento no se arrastra al día siguiente', async () => {
+      const { cajaId } = await facturaConItemCaja(subConDesc, 10000);
+      await auth(request(app).post(`/api/caja/${cajaId}/confirmar`)).send({ descuento: 500 });
+
+      // Hoy sí aparece, con el descuento aplicado.
+      const dia = await auth(request(app).get('/api/caja').query({ fecha: hoy() }));
+      expect(dia.body.find(m => m.id === cajaId)?.descuento).toBe(500);
+
+      // Mañana y pasado, no: el arrastre hacia adelante es solo para pendientes.
+      for (const f of [addDias(1), addDias(2)]) {
+        const res = await auth(request(app).get('/api/caja').query({ fecha: f }));
+        expect(res.body.map(m => m.id)).not.toContain(cajaId);
+      }
+    });
+
+    it('la NC no genera ítem de caja ni se re-sincroniza al día siguiente', async () => {
+      await CajaConfig.findByIdAndUpdate('main',
+        { $set: { rubros_sync: [rubroId], dias_anticipacion_caja: 5, empleados: [], proveedores: [] } },
+        { upsert: true });
+
+      // Con método cargado: el ítem de caja lo hereda y se puede confirmar.
+      const fac = await auth(request(app).post(`/api/movimientos/${subConDesc}`))
+        .send({ monto: 10000, fecha: hoy(), tipo: 'factura', fecha_vencimiento: hoy(), metodo_pago: 'efectivo' });
+      await auth(request(app).post(`/api/caja/auto-sync?fecha=${hoy()}`));
+      const item = await CajaMovimiento.findOne({ movimiento_id: fac.body.id }).lean();
+
+      const conf = await auth(request(app).post(`/api/caja/${item._id}/confirmar`)).send({ descuento: 500, fecha: hoy() });
+      expect(conf.status).toBe(200);
+      const nc = await Movimiento.findOne({ tipo: 'nota_credito', subrubro_id: subConDesc }).lean();
+      expect(nc).toBeTruthy();
+      expect(nc.fecha).toBe(hoy());
+
+      // Sincronizar los días siguientes no crea nada nuevo: la NC no es una factura
+      // y la factura original ya quedó saldada (pago + NC).
+      for (const f of [addDias(1), addDias(2)]) {
+        const sync = await auth(request(app).post(`/api/caja/auto-sync?fecha=${f}`));
+        expect(sync.body.creados).toBe(0);
+        const res = await auth(request(app).get('/api/caja').query({ fecha: f }));
+        expect(res.body).toHaveLength(0);
+      }
+
+      // Ni un solo ítem de caja apunta a la NC, y el del pago sigue siendo uno solo.
+      expect(await CajaMovimiento.countDocuments({ movimiento_id: nc._id })).toBe(0);
+      expect(await CajaMovimiento.countDocuments({ subrubro_id: subConDesc })).toBe(1);
+    });
+
+    it('el seguimiento de descuentos lo imputa solo a su fecha', async () => {
+      const { cajaId } = await facturaConItemCaja(subConDesc, 10000);
+      await auth(request(app).post(`/api/caja/${cajaId}/confirmar`)).send({ descuento: 500 });
+
+      const hoyRes = await auth(request(app).get('/api/caja/descuentos')).query({ desde: hoy(), hasta: hoy() });
+      expect(hoyRes.body.total).toBeCloseTo(500, 2);
+
+      const mananaRes = await auth(request(app).get('/api/caja/descuentos')).query({ desde: addDias(1), hasta: addDias(1) });
+      expect(mananaRes.body.count).toBe(0);
+      expect(mananaRes.body.total).toBe(0);
+    });
   });
 });
