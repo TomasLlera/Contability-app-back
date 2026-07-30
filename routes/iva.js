@@ -3,8 +3,7 @@ const router = express.Router();
 const multer = require('multer');
 const XLSX = require('xlsx');
 const PDFDocument = require('pdfkit');
-const { IvaCompra, IvaVenta, IvaConfig, Counter, Movimiento, TarjetaTransaccion } = require('../models');
-const { ivaDe } = require('../utils/iva');
+const { IvaCompra, IvaVenta, IvaConfig, Counter, Movimiento } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const upload = multer({ storage: multer.memoryStorage() });
@@ -377,7 +376,7 @@ const esNotaCredito = (tipo) => norm(tipo).includes('credito');
 // el desglose `por_tipo` (montos crudos por tipo + flag es_nc) para que el front
 // pueda filtrar/sumar por tipo de comprobante.
 async function buildResumen() {
-  const [comprasAgg, ventasAgg, movPercepAgg, tarjetasAgg] = await Promise.all([
+  const [comprasAgg, ventasAgg, movPercepAgg] = await Promise.all([
     IvaCompra.aggregate([
       { $group: {
           _id: { mes: '$mes', tipo: '$tipo' },
@@ -409,18 +408,12 @@ async function buildResumen() {
           ingresos_brutos: { $sum: '$ingresos_brutos' },
       } },
     ]),
-    // Débito fiscal de lo cobrado con tarjeta (Registro → Tarjetas). Se agrega por mes
-    // y entra al cruce como VENTA: es IVA de ventas igual que una carga manual, solo
-    // que su origen es el total de tarjetas y no una fila cargada a mano.
-    TarjetaTransaccion.aggregate([
-      { $group: { _id: '$mes', total: { $sum: '$monto' }, items: { $sum: 1 } } },
-    ]),
   ]);
 
   const emptyCompras = () => ({ imp_total: 0, total_iva: 0, iva_21: 0, neto_gravado: 0, percepcion_iva: 0, ingresos_brutos: 0, items: 0, facturas: 0, notas_credito: 0, por_tipo: {} });
-  // `ventas` es el total que entra al cruce; `ventas_manual` y `ventas_tarjetas` lo
-  // desglosan por origen, para que en pantalla se vea de dónde sale cada peso.
-  const emptyMes = (mes) => ({ mes, compras: emptyCompras(), ventas: 0, ventas_items: 0, ventas_manual: 0, ventas_tarjetas: 0, tarjetas_total: 0 });
+  // `ventas` es el débito fiscal del mes: sale íntegramente de las cargas manuales de
+  // IVA → Ventas (una fila por carga), que es el único origen de ventas del cruce.
+  const emptyMes = (mes) => ({ mes, compras: emptyCompras(), ventas: 0, ventas_items: 0 });
   const map = {};
   const tiposSet = new Map(); // tipo -> es_nc (lista global de tipos para el filtro)
 
@@ -463,24 +456,8 @@ async function buildResumen() {
   for (const v of ventasAgg) {
     if (!v._id) continue;
     if (!map[v._id]) map[v._id] = emptyMes(v._id);
-    map[v._id].ventas_manual = v.total;
+    map[v._id].ventas = v.total;
     map[v._id].ventas_items = v.items;
-  }
-
-  // El IVA de tarjetas REEMPLAZA a la carga manual en los meses donde hay tarjetas
-  // cargadas: la carga manual de débito fiscal ya incluye lo cobrado con tarjeta, así
-  // que sumar los dos contaría esa facturación dos veces e inflaría la diferencia.
-  // En los meses sin tarjetas manda la carga manual, como hasta ahora.
-  for (const t of tarjetasAgg) {
-    if (!t._id) continue;
-    if (!map[t._id]) map[t._id] = emptyMes(t._id);
-    map[t._id].tarjetas_total = t.total;
-    map[t._id].ventas_tarjetas = ivaDe(t.total);
-  }
-  for (const m of Object.values(map)) {
-    m.ventas = m.ventas_tarjetas > 0 ? m.ventas_tarjetas : m.ventas_manual;
-    // Deja explícito de dónde salió el número que entra al cruce.
-    m.ventas_origen = m.ventas_tarjetas > 0 ? 'tarjetas' : 'manual';
   }
 
   // La diferencia del cruce usa el IVA acumulado en compras (crédito fiscal), no el Imp. Total.

@@ -304,46 +304,38 @@ describe('IVA — Export del cruce mensual', () => {
   });
 });
 
-describe('IVA de ventas sincronizado desde Tarjetas', () => {
+describe('IVA → Ventas es 100% carga manual', () => {
   const auth = (req) => req.set('Authorization', `Bearer ${adminToken}`);
   const crearTarjeta = (body) => auth(request(app).post('/api/registro/tarjetas')).send(body);
   const crearVentaIva = (body) => auth(request(app).post('/api/iva/ventas')).send(body);
   const mesDe = (body, mes) => (body.meses || []).find(m => m.mes === mes);
 
-  it('el IVA de tarjetas entra como venta del mes y alimenta la diferencia', async () => {
-    await crearTarjeta({ tipo: 'qr', fecha: '2026-07-03', monto: 100000 });
-    await crearTarjeta({ tipo: 'debito', fecha: '2026-07-10', monto: 50000 });
+  it('las cargas manuales del mes se suman entre sí', async () => {
+    await crearVentaIva({ fecha: '2026-07-05', total: 90000, concepto: 'iva debito fiscal 21%' });
+    await crearVentaIva({ fecha: '2026-07-20', total: 10000, concepto: 'ajuste' });
 
     const { body } = await auth(request(app).get('/api/iva/resumen'));
     const julio = mesDe(body, '2026-07');
-    expect(julio.tarjetas_total).toBe(150000);
-    expect(julio.ventas_tarjetas).toBe(31500);
-    expect(julio.ventas).toBe(31500);
-    expect(julio.ventas_origen).toBe('tarjetas');
+    expect(julio.ventas).toBe(100000);
+    expect(julio.ventas_items).toBe(2);
     // Sin compras ese mes, la diferencia es la venta completa.
-    expect(julio.diferencia).toBe(31500);
+    expect(julio.diferencia).toBe(100000);
   });
 
-  it('con tarjetas cargadas, la carga manual NO se suma (la reemplaza)', async () => {
-    await crearTarjeta({ tipo: 'qr', fecha: '2026-07-03', monto: 150000 }); // IVA 31.500
+  it('las tarjetas del mes no anulan ni alteran la carga manual', async () => {
+    await crearTarjeta({ tipo: 'qr', fecha: '2026-07-03', monto: 150000 });
     await crearVentaIva({ fecha: '2026-07-05', total: 90000, concepto: 'iva debito fiscal 21%' });
 
     const { body } = await auth(request(app).get('/api/iva/resumen'));
     const julio = mesDe(body, '2026-07');
-    expect(julio.ventas_manual).toBe(90000);
-    expect(julio.ventas_tarjetas).toBe(31500);
-    // Lo que entra al cruce es el de tarjetas, no la suma (121.500 sería doble conteo).
-    expect(julio.ventas).toBe(31500);
-    expect(julio.ventas_origen).toBe('tarjetas');
+    expect(julio.ventas).toBe(90000);
+    expect(julio.ventas_items).toBe(1);
   });
 
-  it('sin tarjetas en el mes, sigue mandando la carga manual', async () => {
-    await crearVentaIva({ fecha: '2026-08-05', total: 90000, concepto: 'iva debito fiscal 21%' });
+  it('un mes con tarjetas pero sin carga manual no aparece en el cruce', async () => {
+    await crearTarjeta({ tipo: 'qr', fecha: '2026-08-03', monto: 150000 });
 
     const { body } = await auth(request(app).get('/api/iva/resumen'));
-    const agosto = mesDe(body, '2026-08');
-    expect(agosto.ventas_tarjetas).toBe(0);
-    expect(agosto.ventas).toBe(90000);
-    expect(agosto.ventas_origen).toBe('manual');
+    expect(mesDe(body, '2026-08')).toBeUndefined();
   });
 });

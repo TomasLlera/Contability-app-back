@@ -304,19 +304,27 @@ router.get('/ventas-sistema', asyncHandler(async (req, res) => {
   for (const v of ventas) (porMes[v.mes] ||= []).push(v);
   const totalDe = (lista) => lista.reduce((s, v) => s + (v.monto || 0), 0);
 
+  // Las ventas cargadas antes de que existiera el tipo se leen como ticket (mismo
+  // criterio que routes/registro.js): no inventa IVA sobre facturación no declarada.
+  const esFacturado = (v) => v.tipo === 'facturado';
+  const totalTipoDe = (lista, facturado) => lista.filter(v => esFacturado(v) === facturado).reduce((s, v) => s + (v.monto || 0), 0);
+  const IVA_ALICUOTA = 0.21;
+
   const wb = nuevoWorkbook();
   const sub = meses.length === 1 ? nombreMes(desde) : `${nombreMes(desde)} — ${nombreMes(hasta)}`;
 
   // ── Hoja 1: Resumen mensual ──
   const wsR = wb.addWorksheet('Resumen mensual');
-  const HEAD = ['Mes', 'Total', 'Cantidad', 'Promedio diario', 'Dif. vs mes ant.', '% Cambio', 'Tendencia'];
+  const HEAD = ['Mes', 'Ticket', 'Facturado', 'IVA 21% (facturado)', 'Total', 'Cantidad', 'Promedio diario', 'Dif. vs mes ant.', '% Cambio', 'Tendencia'];
   let r = escribirTitulo(wsR, 'Ventas por sistema — Resumen mensual', sub, HEAD.length);
   escribirHeader(wsR, r, HEAD); r++;
   const dataStart = r;
-  let totGeneral = 0;
+  let totGeneral = 0, totTicket = 0, totFacturado = 0;
   for (const mes of meses) {
     const lista = porMes[mes] || [];
     const total = totalDe(lista);
+    const ticket = totalTipoDe(lista, false);
+    const facturado = totalTipoDe(lista, true);
     const totalPrev = totalDe(porMes[prevMesStr(mes)] || []);
     const dif = total - totalPrev;
     const pct = totalPrev ? dif / Math.abs(totalPrev) : null;
@@ -324,48 +332,57 @@ router.get('/ventas-sistema', asyncHandler(async (req, res) => {
     const t = tend(dif);
     const row = wsR.getRow(r);
     row.getCell(1).value = nombreMes(mes);
-    row.getCell(2).value = total;
-    row.getCell(3).value = lista.length;
-    row.getCell(4).value = diasConVentas ? total / diasConVentas : 0;
-    row.getCell(5).value = dif;
-    row.getCell(6).value = pct === null ? '—' : pct;
-    row.getCell(7).value = flechaTendencia(t);
-    [2, 4, 5].forEach(c => { row.getCell(c).numFmt = MONEDA; });
-    if (pct !== null) { row.getCell(6).numFmt = '0.0%'; row.getCell(6).font = { color: { argb: dif >= 0 ? COLORS.green : COLORS.red } }; }
-    colorearSigno(row.getCell(5), dif);
-    row.getCell(7).font = { color: { argb: colorTend(t) }, bold: true };
-    row.getCell(7).alignment = { horizontal: 'center' };
-    totGeneral += total;
+    row.getCell(2).value = ticket;
+    row.getCell(3).value = facturado;
+    row.getCell(4).value = facturado * IVA_ALICUOTA;
+    row.getCell(5).value = total;
+    row.getCell(6).value = lista.length;
+    row.getCell(7).value = diasConVentas ? total / diasConVentas : 0;
+    row.getCell(8).value = dif;
+    row.getCell(9).value = pct === null ? '—' : pct;
+    row.getCell(10).value = flechaTendencia(t);
+    [2, 3, 4, 5, 7, 8].forEach(c => { row.getCell(c).numFmt = MONEDA; });
+    if (pct !== null) { row.getCell(9).numFmt = '0.0%'; row.getCell(9).font = { color: { argb: dif >= 0 ? COLORS.green : COLORS.red } }; }
+    colorearSigno(row.getCell(8), dif);
+    row.getCell(10).font = { color: { argb: colorTend(t) }, bold: true };
+    row.getCell(10).alignment = { horizontal: 'center' };
+    totGeneral += total; totTicket += ticket; totFacturado += facturado;
     r++;
   }
   const dataEnd = r - 1;
   if (meses.length > 1) {
     const tr = wsR.getRow(r);
-    tr.getCell(1).value = 'TOTAL'; tr.getCell(2).value = totGeneral; tr.getCell(2).numFmt = MONEDA;
+    tr.getCell(1).value = 'TOTAL';
+    tr.getCell(2).value = totTicket;
+    tr.getCell(3).value = totFacturado;
+    tr.getCell(4).value = totFacturado * IVA_ALICUOTA;
+    tr.getCell(5).value = totGeneral;
+    [2, 3, 4, 5].forEach(c => { tr.getCell(c).numFmt = MONEDA; });
     for (let c = 1; c <= HEAD.length; c++) { tr.getCell(c).font = { bold: true }; tr.getCell(c).border = { top: { style: 'thin', color: { argb: COLORS.header } } }; }
   }
-  if (dataEnd >= dataStart) { zebra(wsR, dataStart, dataEnd, HEAD.length); agregarDataBar(wsR, `B${dataStart}:B${dataEnd}`); }
+  if (dataEnd >= dataStart) { zebra(wsR, dataStart, dataEnd, HEAD.length); agregarDataBar(wsR, `E${dataStart}:E${dataEnd}`); }
   else wsR.getRow(r).getCell(1).value = 'Sin ventas en el período';
-  wsR.getColumn(1).width = 18; [2, 3, 4, 5].forEach(c => { wsR.getColumn(c).width = 16; }); wsR.getColumn(6).width = 12; wsR.getColumn(7).width = 16;
+  wsR.getColumn(1).width = 18; [2, 3, 4, 5, 7, 8].forEach(c => { wsR.getColumn(c).width = 18; }); wsR.getColumn(6).width = 12; wsR.getColumn(9).width = 12; wsR.getColumn(10).width = 16;
 
   // ── Hoja 2: Detalle ──
   const wsD = wb.addWorksheet('Detalle');
-  let d = escribirTitulo(wsD, 'Ventas por sistema — Detalle', sub, 4);
-  escribirHeader(wsD, d, ['Fecha', 'Mes', 'Concepto', 'Monto']); d++;
+  let d = escribirTitulo(wsD, 'Ventas por sistema — Detalle', sub, 5);
+  escribirHeader(wsD, d, ['Tipo', 'Fecha', 'Mes', 'Concepto', 'Monto']); d++;
   const detStart = d;
   const detalle = ventas.filter(v => v.mes >= desde); // excluye el mes base (solo para comparar)
   for (const v of detalle) {
     const row = wsD.getRow(d);
-    row.getCell(1).value = v.fecha;
-    row.getCell(2).value = nombreMes(v.mes);
-    row.getCell(3).value = v.concepto || '—';
-    row.getCell(4).value = v.monto || 0; row.getCell(4).numFmt = MONEDA;
+    row.getCell(1).value = esFacturado(v) ? 'Facturado' : 'Ticket';
+    row.getCell(2).value = v.fecha;
+    row.getCell(3).value = nombreMes(v.mes);
+    row.getCell(4).value = v.concepto || '—';
+    row.getCell(5).value = v.monto || 0; row.getCell(5).numFmt = MONEDA;
     d++;
   }
   const detEnd = d - 1;
-  if (detEnd >= detStart) { zebra(wsD, detStart, detEnd, 4); agregarDataBar(wsD, `D${detStart}:D${detEnd}`); }
+  if (detEnd >= detStart) { zebra(wsD, detStart, detEnd, 5); agregarDataBar(wsD, `E${detStart}:E${detEnd}`); }
   else wsD.getRow(d).getCell(1).value = 'Sin ventas en el período';
-  wsD.getColumn(1).width = 12; wsD.getColumn(2).width = 16; wsD.getColumn(3).width = 34; wsD.getColumn(4).width = 16;
+  wsD.getColumn(1).width = 12; wsD.getColumn(2).width = 12; wsD.getColumn(3).width = 16; wsD.getColumn(4).width = 34; wsD.getColumn(5).width = 16;
 
   const fname = meses.length === 1 ? `ventas_sistema_${desde}.xlsx` : `ventas_sistema_${desde}_a_${hasta}.xlsx`;
   await enviarWorkbook(res, wb, fname);

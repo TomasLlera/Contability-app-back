@@ -331,6 +331,14 @@ const IvaVenta = mongoose.model('IvaVenta', ivaVentaSchema);
 // --- Registro: Venta Sistema (ventas propias, carga diaria) ---
 const ventaSistemaSchema = new mongoose.Schema({
   _id: Number,
+  // 'ticket' = venta sin comprobante fiscal, 'facturado' = factura emitida. Solo lo
+  // facturado genera débito fiscal: el IVA 21% se calcula ÚNICAMENTE sobre el total
+  // facturado, y es también el número que se cruza contra el total de tarjetas.
+  //
+  // El default es 'ticket' a propósito: las ventas cargadas antes de que existiera
+  // este campo no dicen si se facturaron, y suponerlas facturadas inventaría IVA
+  // sobre facturación que nunca se declaró. Se reclasifican editando la fila.
+  tipo: { type: String, enum: ['ticket', 'facturado'], default: 'ticket' },
   fecha: String,                              // YYYY-MM-DD
   mes: String,                                // YYYY-MM (denormalizado para agrupar)
   monto: { type: Number, default: 0 },
@@ -340,6 +348,7 @@ const ventaSistemaSchema = new mongoose.Schema({
   updated_at: String,
 });
 ventaSistemaSchema.index({ mes: 1 });
+ventaSistemaSchema.index({ mes: 1, tipo: 1 });
 ventaSistemaSchema.index({ fecha: 1 });
 const VentaSistema = mongoose.model('VentaSistema', ventaSistemaSchema);
 

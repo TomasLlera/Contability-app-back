@@ -10,14 +10,21 @@ const withId = doc => doc ? { ...doc, id: doc._id } : doc;
 // Tipos de pago con tarjeta. El orden es el que usa el front para las 4 columnas.
 const TIPOS = ['qr', 'debito', 'credito', 'prepaga'];
 
-// Alícuota de IVA aplicada a los totales de Tarjetas y de Venta Sistema. Definida en
-// utils/iva para que el cruce mensual (routes/iva.js) use exactamente la misma regla.
-const { IVA_ALICUOTA, round2, ivaDe } = require('../utils/iva');
+// Tipos de venta del sistema. El orden es el que usa el front para las 2 columnas.
+const TIPOS_VENTA = ['ticket', 'facturado'];
 
-// Umbral por debajo del cual dos IVA se consideran iguales. Los totales salen de
+const round2 = (n) => Math.round(((n || 0) + Number.EPSILON) * 100) / 100;
+
+// IVA débito fiscal: se aplica directo sobre el total facturado (total × 0,21), no se
+// despeja de un precio final (total ÷ 1,21 × 0,21) — es el criterio con el que se
+// cargan los totales. Solo lo facturado lo genera; el ticket no.
+const IVA_ALICUOTA = 0.21;
+const ivaDe = (total) => round2((total || 0) * IVA_ALICUOTA);
+
+// Umbral por debajo del cual dos totales se consideran iguales. Los totales salen de
 // sumar decimales, así que exigir igualdad exacta marcaría diferencias que no
 // existen: un peso es ruido de redondeo, no una venta sin registrar.
-const TOLERANCIA_IVA = 1;
+const TOLERANCIA = 1;
 
 // --- Helpers de parseo/fechas ---------------------------------------------
 
@@ -63,42 +70,43 @@ function comparar(actual, anterior) {
   return { diferencia, porcentaje: pct };
 }
 
-// Cruce del IVA de Tarjetas contra el de Venta Sistema. La diferencia se lee SIEMPRE
-// como tarjetas − sistema, así el signo dice de qué lado falta la carga.
+// Cruce del total cobrado con tarjeta contra el total FACTURADO en Venta Sistema (el
+// ticket queda afuera: no es facturación). La diferencia se lee SIEMPRE como
+// tarjetas − facturado, así el signo dice de qué lado falta la carga.
 //
-// Que sistema supere a tarjetas no siempre es un error (la venta en efectivo no pasa
-// por tarjeta), por eso la sugerencia de ese caso lo aclara en vez de dar por hecho
-// que falta cargar algo.
-function compararIva(iva_tarjetas, iva_venta_sistema) {
-  const diferencia = round2(iva_tarjetas - iva_venta_sistema);
-  const base = Math.max(iva_tarjetas, iva_venta_sistema);
+// Que lo facturado supere a las tarjetas no siempre es un error (se puede facturar
+// contra efectivo o transferencia), por eso la sugerencia de ese caso lo aclara en vez
+// de dar por hecho que falta cargar algo.
+function compararTotales(total_tarjetas, total_facturado) {
+  const diferencia = round2(total_tarjetas - total_facturado);
+  const base = Math.max(total_tarjetas, total_facturado);
   const porcentaje = base ? round2((diferencia / base) * 100) : null;
 
-  if (iva_tarjetas === 0 && iva_venta_sistema === 0) {
+  if (total_tarjetas === 0 && total_facturado === 0) {
     return {
       diferencia: 0, porcentaje: null, alerta: false, estado: 'sin_datos',
       mensaje: 'Todavía no hay datos cargados en este mes',
       sugerencia: null,
     };
   }
-  if (Math.abs(diferencia) <= TOLERANCIA_IVA) {
+  if (Math.abs(diferencia) <= TOLERANCIA) {
     return {
       diferencia, porcentaje, alerta: false, estado: 'coincide',
-      mensaje: 'Facturación coincide perfectamente',
+      mensaje: 'Coincide: lo cobrado con tarjeta está facturado',
       sugerencia: null,
     };
   }
   if (diferencia > 0) {
     return {
       diferencia, porcentaje, alerta: true, estado: 'faltan_en_sistema',
-      mensaje: 'Hay ventas registradas en tarjetas que no están en Venta Sistema',
-      sugerencia: 'Revisá los cierres del mes y cargá lo que falte en Registro → Venta Sistema.',
+      mensaje: 'Hay ventas cobradas por tarjeta que no están facturadas',
+      sugerencia: 'Revisá los cierres del mes: puede haber ventas cargadas como ticket que en realidad se facturaron, o facturación sin cargar en Registro → Venta Sistema.',
     };
   }
   return {
     diferencia, porcentaje, alerta: true, estado: 'faltan_en_tarjetas',
-    mensaje: 'Hay ventas en Venta Sistema que no se registraron en Tarjetas',
-    sugerencia: 'Puede ser venta en efectivo (no pasa por tarjeta) o cargas de tarjeta pendientes.',
+    mensaje: 'Hay ventas facturadas que no entraron por tarjeta',
+    sugerencia: 'Puede ser facturación cobrada en efectivo o por transferencia (no pasa por tarjeta), o cargas de tarjeta pendientes.',
   };
 }
 
@@ -117,23 +125,66 @@ function bloquesSemana(dias) {
 // VENTA SISTEMA
 // =========================================================================
 
+// Las ventas cargadas antes de que existiera el tipo no lo tienen guardado, y .lean()
+// devuelve el documento crudo (no aplica los defaults de mongoose): se leen como
+// 'ticket', el criterio conservador — no inventa IVA sobre facturación que nunca se
+// declaró como tal. Se reclasifican editando la fila.
+const tipoVenta = (v) => (TIPOS_VENTA.includes(v.tipo) ? v.tipo : 'ticket');
+
+// Totales por tipo de venta. Siempre devuelve las 2 claves (aunque estén en 0) para
+// que el front pueda renderizar las 2 columnas fijas.
+function agruparVentasPorTipo(ventas) {
+  const base = Object.fromEntries(TIPOS_VENTA.map(t => [t, { tipo: t, total: 0, cantidad: 0 }]));
+  for (const v of ventas) {
+    const g = base[tipoVenta(v)];
+    g.total += v.monto || 0;
+    g.cantidad += 1;
+  }
+  for (const t of TIPOS_VENTA) base[t].total = round2(base[t].total);
+  return base;
+}
+
+// El total del mes/día es SIEMPRE ticket + facturado.
+const totalVentasDe = (porTipo) => round2(TIPOS_VENTA.reduce((s, t) => s + porTipo[t].total, 0));
+
+// Toda venta sale con `tipo` resuelto, así el front nunca tiene que adivinarlo.
+const ventaOut = (v) => ({ ...withId(v), tipo: tipoVenta(v) });
+
+// Acumulados de un conjunto de ventas: los 2 subtotales, el total (su suma) y el IVA
+// 21% del facturado. Es la forma que consumen el día, el mes y el mes anterior.
+function acumuladoVentas(ventas) {
+  const por_tipo = agruparVentasPorTipo(ventas);
+  const total_facturado = por_tipo.facturado.total;
+  return {
+    por_tipo,
+    total: totalVentasDe(por_tipo),
+    total_ticket: por_tipo.ticket.total,
+    total_facturado,
+    iva_21: ivaDe(total_facturado),
+    alicuota: IVA_ALICUOTA,
+  };
+}
+
 // GET /api/registro/ventas-sistema?mes=YYYY-MM — listado plano (sin mes = todas)
 router.get('/ventas-sistema', async (req, res, next) => {
   try {
     const filtro = parseMes(req.query.mes) ? { mes: req.query.mes } : {};
     const ventas = await VentaSistema.find(filtro).sort({ fecha: -1, _id: -1 }).lean();
-    res.json(ventas.map(withId));
+    res.json(ventas.map(ventaOut));
   } catch (err) { next(err); }
 });
 
-// GET /api/registro/ventas-sistema/dia/:fecha — ventas de un día + total
+// GET /api/registro/ventas-sistema/dia/:fecha — 2 columnas (ticket/facturado), total
+// consolidado, IVA del facturado y detalle.
 router.get('/ventas-sistema/dia/:fecha', async (req, res, next) => {
   try {
     const fecha = parseFecha(req.params.fecha);
     if (!fecha) return res.status(400).json({ error: 'Fecha inválida' });
     const ventas = await VentaSistema.find({ fecha }).sort({ _id: -1 }).lean();
-    const total = ventas.reduce((s, v) => s + (v.monto || 0), 0);
-    res.json({ fecha, total, iva_21: ivaDe(total), alicuota: IVA_ALICUOTA, cantidad: ventas.length, ventas: ventas.map(withId) });
+    res.json({
+      fecha, ...acumuladoVentas(ventas),
+      cantidad: ventas.length, ventas: ventas.map(ventaOut),
+    });
   } catch (err) { next(err); }
 });
 
@@ -150,13 +201,24 @@ router.get('/ventas-sistema/mes/:mes', async (req, res, next) => {
       VentaSistema.find({ mes: prev }).lean(),
     ]);
 
-    const total = ventas.reduce((s, v) => s + (v.monto || 0), 0);
-    const totalPrev = ventasPrev.reduce((s, v) => s + (v.monto || 0), 0);
+    const acum = acumuladoVentas(ventas);
+    const acumPrev = acumuladoVentas(ventasPrev);
+    const total = acum.total;
+    const totalPrev = acumPrev.total;
 
-    // Serie diaria completa (días sin ventas van en 0) para que el gráfico no tenga huecos.
+    // Serie diaria completa (días sin ventas van en 0) para que el gráfico no tenga
+    // huecos. Cada día trae los 2 tipos por separado además del total, para poder
+    // apilarlos en la evolución diaria.
     const dias = diasDelMes(mes);
-    const serie = Array.from({ length: dias }, (_, i) => ({ dia: i + 1, fecha: `${mes}-${String(i + 1).padStart(2, '0')}`, total: 0 }));
-    for (const v of ventas) serie[diaDe(v.fecha) - 1].total += v.monto || 0;
+    const serie = Array.from({ length: dias }, (_, i) => ({
+      dia: i + 1, fecha: `${mes}-${String(i + 1).padStart(2, '0')}`,
+      ...Object.fromEntries(TIPOS_VENTA.map(t => [t, 0])), total: 0,
+    }));
+    for (const v of ventas) {
+      const d = serie[diaDe(v.fecha) - 1];
+      d[tipoVenta(v)] += v.monto || 0;
+      d.total += v.monto || 0;
+    }
 
     const diasPrev = diasDelMes(prev);
     const seriePrev = Array.from({ length: diasPrev }, (_, i) => ({ dia: i + 1, total: 0 }));
@@ -182,13 +244,24 @@ router.get('/ventas-sistema/mes/:mes', async (req, res, next) => {
     };
 
     res.json({
-      mes, total, cantidad: ventas.length,
-      // Débito fiscal del mes según los totales cargados en Venta Sistema.
-      iva_21: ivaDe(total), alicuota: IVA_ALICUOTA,
-      mes_anterior: { mes: prev, total: totalPrev, iva_21: ivaDe(totalPrev), serie: seriePrev },
+      mes, cantidad: ventas.length,
+      // total, total_ticket, total_facturado, iva_21 (21% del facturado), alicuota, por_tipo
+      ...acum,
+      mes_anterior: {
+        mes: prev, total: totalPrev,
+        total_ticket: acumPrev.total_ticket, total_facturado: acumPrev.total_facturado,
+        iva_21: acumPrev.iva_21, serie: seriePrev,
+      },
       comparativa: comparar(total, totalPrev),
+      // Cada tipo contra el mismo tipo del mes anterior.
+      comparativa_tipos: Object.fromEntries(TIPOS_VENTA.map(t => [
+        t, {
+          actual: acum.por_tipo[t].total, anterior: acumPrev.por_tipo[t].total,
+          ...comparar(acum.por_tipo[t].total, acumPrev.por_tipo[t].total),
+        },
+      ])),
       serie, quincenas, semanas, stats,
-      ventas: ventas.map(withId),
+      ventas: ventas.map(ventaOut),
     });
   } catch (err) { next(err); }
 });
@@ -198,17 +271,21 @@ router.post('/ventas-sistema', requireAdmin, audit('venta_sistema'), async (req,
   try {
     const fecha = parseFecha(req.body.fecha);
     const monto = parseMonto(req.body.monto);
+    // Sin tipo explícito cae en 'ticket': es lo que no genera IVA, así que el default
+    // nunca inventa débito fiscal.
+    const tipo = (req.body.tipo || 'ticket').toString().trim().toLowerCase();
+    if (!TIPOS_VENTA.includes(tipo)) return res.status(400).json({ error: `Tipo inválido (${TIPOS_VENTA.join(', ')})` });
     if (!fecha) return res.status(400).json({ error: 'Fecha inválida' });
     if (isNaN(monto) || monto <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
 
     const id = await Counter.next('ventas_sistema');
     const venta = await VentaSistema.create({
-      _id: id, fecha, mes: fecha.slice(0, 7), monto,
+      _id: id, tipo, fecha, mes: fecha.slice(0, 7), monto,
       concepto: (req.body.concepto || '').toString().trim(),
       user_id: req.user?.userId ?? null,
       created_at: nowTs(), updated_at: nowTs(),
     });
-    res.json(withId(venta.toObject()));
+    res.json(ventaOut(venta.toObject()));
   } catch (err) { next(err); }
 });
 
@@ -216,6 +293,11 @@ router.post('/ventas-sistema', requireAdmin, audit('venta_sistema'), async (req,
 router.put('/ventas-sistema/:id', requireAdmin, audit('venta_sistema'), async (req, res, next) => {
   try {
     const upd = { updated_at: nowTs() };
+    if (req.body.tipo !== undefined) {
+      const tipo = (req.body.tipo || '').toString().trim().toLowerCase();
+      if (!TIPOS_VENTA.includes(tipo)) return res.status(400).json({ error: `Tipo inválido (${TIPOS_VENTA.join(', ')})` });
+      upd.tipo = tipo;
+    }
     if (req.body.fecha !== undefined) {
       const fecha = parseFecha(req.body.fecha);
       if (!fecha) return res.status(400).json({ error: 'Fecha inválida' });
@@ -230,7 +312,7 @@ router.put('/ventas-sistema/:id', requireAdmin, audit('venta_sistema'), async (r
 
     const venta = await VentaSistema.findByIdAndUpdate(Number(req.params.id), upd, { new: true }).lean();
     if (!venta) return res.status(404).json({ error: 'Venta no encontrada' });
-    res.json(withId(venta));
+    res.json(ventaOut(venta));
   } catch (err) { next(err); }
 });
 
@@ -295,7 +377,6 @@ router.get('/tarjetas/dia/:fecha', async (req, res, next) => {
     const total = totalDe(por_tipo);
     res.json({
       fecha, por_tipo, total,
-      iva_21: ivaDe(total), alicuota: IVA_ALICUOTA,
       por_empleado: agruparPorEmpleado(txs),
       transacciones: txs.map(withId),
     });
@@ -339,35 +420,12 @@ router.get('/tarjetas/mes/:mes', async (req, res, next) => {
 
     res.json({
       mes, total, por_tipo,
-      // IVA 21% sobre el total de tarjetas del mes. Es un derivado del total (no se
-      // guarda en la base): así no puede quedar desfasado al alta/edición/baja de
-      // una transacción — el único origen de verdad son las transacciones.
-      iva_21: ivaDe(total), alicuota: IVA_ALICUOTA,
-      mes_anterior: { mes: prev, total: totalPrev, iva_21: ivaDe(totalPrev), por_tipo: por_tipo_prev },
+      mes_anterior: { mes: prev, total: totalPrev, por_tipo: por_tipo_prev },
       comparativa: comparar(total, totalPrev),
       comparativa_tipos,
       por_empleado: agruparPorEmpleado(txs),
       serie,
       transacciones: txs.map(withId),
-    });
-  } catch (err) { next(err); }
-});
-
-// GET /api/registro/tarjetas/iva/:mes — IVA 21% del mes, para consumir desde IVA → Ventas.
-// Sin cuerpo propio en la base: se calcula sobre las transacciones del mes, así que
-// IVA → Ventas y Registro → Tarjetas muestran siempre el mismo número (un solo dato,
-// dos lugares) y nunca hay que sincronizar nada a mano.
-router.get('/tarjetas/iva/:mes', async (req, res, next) => {
-  try {
-    const mes = parseMes(req.params.mes);
-    if (!mes) return res.status(400).json({ error: 'Mes inválido (formato YYYY-MM)' });
-    const txs = await TarjetaTransaccion.find({ mes }, { monto: 1, tipo: 1 }).lean();
-    const por_tipo = agruparPorTipo(txs);
-    const total_tarjetas = round2(totalDe(por_tipo));
-    res.json({
-      mes, alicuota: IVA_ALICUOTA,
-      total_tarjetas, iva_tarjetas: ivaDe(total_tarjetas),
-      por_tipo, transacciones: txs.length,
     });
   } catch (err) { next(err); }
 });
@@ -432,53 +490,64 @@ router.delete('/tarjetas/:id', requireAdmin, audit('tarjeta'), async (req, res, 
 });
 
 // =========================================================================
-// COMPARATIVA IVA — Tarjetas vs Venta Sistema
+// COMPARATIVA MENSUAL — Facturado vs Tarjetas
 // =========================================================================
 
-// GET /api/registro/comparativa-iva/:mes  (mes = 'YYYY-MM')
+// GET /api/registro/comparativa-ventas/:mes  (mes = 'YYYY-MM')
 //
-// Cruza el IVA 21% de lo cobrado con tarjeta contra el IVA 21% de lo registrado en
-// Venta Sistema, para detectar facturación que quedó en un lado y no en el otro.
+// Cruza el total FACTURADO del mes en Venta Sistema contra el total cobrado con
+// tarjeta, para verificar si lo que se facturó se condice con lo que efectivamente
+// entró por tarjeta. El ticket queda fuera del cruce (no es facturación) pero se
+// informa aparte, porque una diferencia suele explicarse justo ahí: ventas cobradas
+// con tarjeta que quedaron cargadas como ticket.
+//
 // Incluye el detalle por día: una diferencia mensual grande suele concentrarse en
 // pocas jornadas, y el desglose es lo que permite ubicarlas.
-router.get('/comparativa-iva/:mes', async (req, res, next) => {
+router.get('/comparativa-ventas/:mes', async (req, res, next) => {
   try {
     const mes = parseMes(req.params.mes);
     if (!mes) return res.status(400).json({ error: 'Mes inválido (formato YYYY-MM)' });
 
     const [txs, ventas] = await Promise.all([
       TarjetaTransaccion.find({ mes }, { monto: 1, tipo: 1, fecha: 1 }).lean(),
-      VentaSistema.find({ mes }, { monto: 1, fecha: 1 }).lean(),
+      VentaSistema.find({ mes }, { monto: 1, tipo: 1, fecha: 1 }).lean(),
     ]);
 
     const por_tipo = agruparPorTipo(txs);
     const total_tarjetas = round2(totalDe(por_tipo));
-    const total_venta_sistema = round2(ventas.reduce((s, v) => s + (v.monto || 0), 0));
-    const iva_tarjetas = ivaDe(total_tarjetas);
-    const iva_venta_sistema = ivaDe(total_venta_sistema);
+    const acum = acumuladoVentas(ventas);
+    const total_facturado = acum.total_facturado;
 
     // Serie diaria completa (los días sin movimiento van en 0) para que el desglose
     // acompañe al calendario del mes y no salte días.
     const dias = diasDelMes(mes);
     const por_dia = Array.from({ length: dias }, (_, i) => ({
       dia: i + 1, fecha: `${mes}-${String(i + 1).padStart(2, '0')}`,
-      total_tarjetas: 0, total_venta_sistema: 0,
+      total_facturado: 0, total_ticket: 0, total_tarjetas: 0,
     }));
     for (const t of txs) por_dia[diaDe(t.fecha) - 1].total_tarjetas += t.monto || 0;
-    for (const v of ventas) por_dia[diaDe(v.fecha) - 1].total_venta_sistema += v.monto || 0;
+    for (const v of ventas) {
+      const d = por_dia[diaDe(v.fecha) - 1];
+      if (tipoVenta(v) === 'facturado') d.total_facturado += v.monto || 0;
+      else d.total_ticket += v.monto || 0;
+    }
     for (const d of por_dia) {
+      d.total_facturado = round2(d.total_facturado);
+      d.total_ticket = round2(d.total_ticket);
       d.total_tarjetas = round2(d.total_tarjetas);
-      d.total_venta_sistema = round2(d.total_venta_sistema);
-      d.iva_tarjetas = ivaDe(d.total_tarjetas);
-      d.iva_venta_sistema = ivaDe(d.total_venta_sistema);
-      d.diferencia = round2(d.iva_tarjetas - d.iva_venta_sistema);
+      d.diferencia = round2(d.total_tarjetas - d.total_facturado);
     }
 
     res.json({
-      mes, alicuota: IVA_ALICUOTA, tolerancia: TOLERANCIA_IVA,
-      tarjetas:       { total: total_tarjetas, iva: iva_tarjetas, transacciones: txs.length, por_tipo },
-      venta_sistema:  { total: total_venta_sistema, iva: iva_venta_sistema, cantidad: ventas.length },
-      ...compararIva(iva_tarjetas, iva_venta_sistema),
+      mes, anio: Number(mes.slice(0, 4)), tolerancia: TOLERANCIA,
+      // Los dos números del cruce.
+      total_facturado, total_tarjetas,
+      venta_sistema: {
+        total: acum.total, total_ticket: acum.total_ticket, total_facturado,
+        iva_21: acum.iva_21, cantidad: ventas.length,
+      },
+      tarjetas: { total: total_tarjetas, transacciones: txs.length, por_tipo },
+      ...compararTotales(total_tarjetas, total_facturado),
       por_dia,
     });
   } catch (err) { next(err); }
