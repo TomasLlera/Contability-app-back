@@ -3,13 +3,17 @@ const router = express.Router();
 const multer = require('multer');
 const XLSX = require('xlsx');
 const PDFDocument = require('pdfkit');
-const { IvaCompra, IvaVenta, IvaConfig, Counter, Movimiento } = require('../models');
+const { IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, Counter, Movimiento } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const upload = multer({ storage: multer.memoryStorage() });
 
 const nowTs = () => new Date().toISOString();
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;
+// Los montos son pesos: redondeamos a 2 decimales para que la resta de varios
+// acumulados no arrastre restos binarios (…0000001) hasta la celda.
+const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+const esMesValido = (mes) => /^\d{4}-(0[1-9]|1[0-2])$/.test(mes || '');
 
 // Definición de columnas esperadas en el Excel (con sinónimos para tolerar variaciones).
 // `tipo` define cómo se parsea el valor; el primer sinónimo es el nombre canónico por defecto.
@@ -362,21 +366,77 @@ router.delete('/ventas/:id', requireAdmin, audit('iva_venta'), async (req, res, 
 });
 
 // =========================================================================
-// CRUCE — diferencia mensual (ventas - compras)
+// CRÉDITOS FISCALES (carga manual)
+// =========================================================================
+// Se acumulan por mes y se RESTAN del saldo mensual, igual que las percepciones.
+// No provienen de comprobantes: son saldos a favor / pagos a cuenta que el
+// contador carga a mano.
+
+router.get('/creditos', async (req, res, next) => {
+  try {
+    const creditos = await IvaCredito.find({}).sort({ fecha: -1, _id: -1 }).lean();
+    res.json(creditos.map(withId));
+  } catch (err) { next(err); }
+});
+
+router.post('/creditos', requireAdmin, audit('iva_credito'), async (req, res, next) => {
+  try {
+    const fecha = parseFecha(req.body.fecha);
+    const monto = parseMonto(req.body.monto);
+    if (!fecha) return res.status(400).json({ error: 'Fecha inválida' });
+    if (!monto) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
+    const id = await Counter.next('iva_creditos');
+    const credito = await IvaCredito.create({
+      _id: id, fecha, mes: fecha.slice(0, 7), monto: round2(monto),
+      concepto: (req.body.concepto || '').toString().trim(), created_at: nowTs(),
+    });
+    res.json(withId(credito.toObject()));
+  } catch (err) { next(err); }
+});
+
+router.put('/creditos/:id', requireAdmin, audit('iva_credito'), async (req, res, next) => {
+  try {
+    const upd = {};
+    if (req.body.fecha !== undefined) {
+      const fecha = parseFecha(req.body.fecha);
+      if (!fecha) return res.status(400).json({ error: 'Fecha inválida' });
+      upd.fecha = fecha; upd.mes = fecha.slice(0, 7);
+    }
+    if (req.body.monto !== undefined) {
+      const monto = parseMonto(req.body.monto);
+      if (!monto) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
+      upd.monto = round2(monto);
+    }
+    if (req.body.concepto !== undefined) upd.concepto = (req.body.concepto || '').toString().trim();
+    const credito = await IvaCredito.findByIdAndUpdate(Number(req.params.id), upd, { new: true }).lean();
+    if (!credito) return res.status(404).json({ error: 'Crédito fiscal no encontrado' });
+    res.json(withId(credito));
+  } catch (err) { next(err); }
+});
+
+router.delete('/creditos/:id', requireAdmin, audit('iva_credito'), async (req, res, next) => {
+  try {
+    await IvaCredito.findByIdAndDelete(Number(req.params.id));
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// =========================================================================
+// CRUCE — saldo mensual de IVA
 // =========================================================================
 
 // Una Nota de Crédito de compra resta (no suma) en los totales. Se detecta por el
 // texto del tipo ("Nota de Crédito ..." → "...credito...").
 const esNotaCredito = (tipo) => norm(tipo).includes('credito');
 
-// Agrega compras + ventas por mes y calcula la diferencia. Reusado por
-// /resumen y por los exports (Excel/PDF).
+// Agrega compras + ventas + créditos fiscales por mes y calcula el saldo. Reusado
+// por /resumen y por los exports (Excel/PDF).
 //
 // Las compras se netean: facturas suman, notas de crédito restan. Además se expone
 // el desglose `por_tipo` (montos crudos por tipo + flag es_nc) para que el front
 // pueda filtrar/sumar por tipo de comprobante.
 async function buildResumen() {
-  const [comprasAgg, ventasAgg, movPercepAgg] = await Promise.all([
+  const [comprasAgg, ventasAgg, movPercepAgg, creditosAgg, ajustes] = await Promise.all([
     IvaCompra.aggregate([
       { $group: {
           _id: { mes: '$mes', tipo: '$tipo' },
@@ -408,12 +468,18 @@ async function buildResumen() {
           ingresos_brutos: { $sum: '$ingresos_brutos' },
       } },
     ]),
+    // Créditos fiscales cargados a mano: se acumulan por mes y restan del saldo.
+    IvaCredito.aggregate([
+      { $group: { _id: '$mes', total: { $sum: '$monto' }, items: { $sum: 1 } } },
+    ]),
+    // Ajustes manuales del saldo (uno por mes como máximo, solo si alguien lo pisó).
+    IvaAjuste.find({}).lean(),
   ]);
 
   const emptyCompras = () => ({ imp_total: 0, total_iva: 0, iva_21: 0, neto_gravado: 0, percepcion_iva: 0, ingresos_brutos: 0, items: 0, facturas: 0, notas_credito: 0, por_tipo: {} });
   // `ventas` es el débito fiscal del mes: sale íntegramente de las cargas manuales de
   // IVA → Ventas (una fila por carga), que es el único origen de ventas del cruce.
-  const emptyMes = (mes) => ({ mes, compras: emptyCompras(), ventas: 0, ventas_items: 0 });
+  const emptyMes = (mes) => ({ mes, compras: emptyCompras(), ventas: 0, ventas_items: 0, creditos_fiscales: 0, creditos_items: 0 });
   const map = {};
   const tiposSet = new Map(); // tipo -> es_nc (lista global de tipos para el filtro)
 
@@ -431,8 +497,8 @@ async function buildResumen() {
     cp.total_iva    += signo * c.total_iva;
     cp.iva_21       += signo * c.iva_21;
     cp.neto_gravado += signo * c.neto_gravado;
-    // Retenciones/percepciones: se acumulan por mes (NC las revierte, igual que el resto)
-    // pero NO entran en la diferencia del cruce (que usa solo total_iva).
+    // Retenciones/percepciones: se acumulan por mes (NC las revierte, igual que el
+    // resto). La percepción de IVA resta del saldo; Ingresos Brutos solo se informa.
     cp.percepcion_iva  += signo * c.percepcion_iva;
     cp.ingresos_brutos += signo * c.ingresos_brutos;
     cp.items        += c.items;
@@ -459,10 +525,53 @@ async function buildResumen() {
     map[v._id].ventas = v.total;
     map[v._id].ventas_items = v.items;
   }
+  for (const c of creditosAgg) {
+    if (!c._id) continue;
+    if (!map[c._id]) map[c._id] = emptyMes(c._id);
+    map[c._id].creditos_fiscales = c.total || 0;
+    map[c._id].creditos_items = c.items;
+  }
+  // Un mes ajustado a mano se muestra aunque ya no tenga movimientos detrás: el saldo
+  // manual es un dato del usuario y desaparecer en silencio sería perderlo.
+  const ajustePorMes = new Map(ajustes.map(a => [a._id, a]));
+  for (const a of ajustes) {
+    if (a._id && a.diferencia_ajustada !== null && a.diferencia_ajustada !== undefined && !map[a._id]) {
+      map[a._id] = emptyMes(a._id);
+    }
+  }
 
-  // La diferencia del cruce usa el IVA acumulado en compras (crédito fiscal), no el Imp. Total.
+  // Saldo del mes = (débito fiscal − crédito fiscal) − pagos a cuenta de IVA:
+  //   (Ventas − IVA compras) − Percep. IVA − Créditos fiscales
+  // Positivo = saldo A PAGAR (el débito supera lo ya pagado a cuenta).
+  // Negativo = saldo libre disponible para el período siguiente.
+  // Ingresos Brutos queda FUERA a propósito: es un impuesto provincial distinto, se
+  // informa por columna pero no suma ni resta acá.
+  // Los acumulados ausentes valen 0 (nunca null): un mes sin percepciones ni créditos
+  // resta 0, no rompe la cuenta.
   const meses = Object.values(map)
-    .map(m => ({ ...m, diferencia: m.ventas - m.compras.total_iva }))
+    .map(m => {
+      const diferencia_calculada = round2(
+        (m.ventas - m.compras.total_iva)
+        - (m.compras.percepcion_iva || 0)
+        - (m.creditos_fiscales || 0)
+      );
+      const aj = ajustePorMes.get(m.mes);
+      const manual = (aj && aj.diferencia_ajustada !== null && aj.diferencia_ajustada !== undefined)
+        ? round2(aj.diferencia_ajustada) : null;
+      return {
+        ...m,
+        diferencia_calculada,
+        diferencia_ajustada: manual,
+        // Valor calculado que había cuando se hizo el ajuste: es contra ese número que
+        // el usuario decidió pisar el saldo, y es lo que se muestra al comparar.
+        ajuste_base: manual !== null ? round2(aj.diferencia_calculada || 0) : null,
+        ajustada_por: manual !== null ? (aj.ajustada_por || '') : null,
+        ajustada_at: manual !== null ? (aj.ajustada_at || null) : null,
+        // `diferencia` es el valor efectivo (ajustado si lo hay, calculado si no):
+        // es el que consumen la tabla, los exports y los totales.
+        diferencia: manual !== null ? manual : diferencia_calculada,
+      };
+    })
     .sort((a, b) => b.mes.localeCompare(a.mes));
 
   const totales = meses.reduce((acc, m) => ({
@@ -475,8 +584,11 @@ async function buildResumen() {
     compras_facturas:      acc.compras_facturas + m.compras.facturas,
     compras_notas_credito: acc.compras_notas_credito + m.compras.notas_credito,
     ventas: acc.ventas + m.ventas,
-    diferencia: acc.diferencia + m.diferencia,
-  }), { compras_imp_total: 0, compras_total_iva: 0, compras_iva_21: 0, compras_neto_gravado: 0, compras_percepcion_iva: 0, compras_ingresos_brutos: 0, compras_facturas: 0, compras_notas_credito: 0, ventas: 0, diferencia: 0 });
+    creditos_fiscales: acc.creditos_fiscales + m.creditos_fiscales,
+    diferencia: round2(acc.diferencia + m.diferencia),
+    diferencia_calculada: round2(acc.diferencia_calculada + m.diferencia_calculada),
+    meses_ajustados: acc.meses_ajustados + (m.diferencia_ajustada !== null ? 1 : 0),
+  }), { compras_imp_total: 0, compras_total_iva: 0, compras_iva_21: 0, compras_neto_gravado: 0, compras_percepcion_iva: 0, compras_ingresos_brutos: 0, compras_facturas: 0, compras_notas_credito: 0, ventas: 0, creditos_fiscales: 0, diferencia: 0, diferencia_calculada: 0, meses_ajustados: 0 });
 
   const tipos = [...tiposSet.entries()]
     .map(([tipo, es_nc]) => ({ tipo, es_nc }))
@@ -492,13 +604,70 @@ const labelMes = (mes) => {
   return `${MESES_ES[Number(m) - 1] || m} ${y}`;
 };
 const fmtMonto = (n) => (n || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const saldoLabel = (dif) => ((dif || 0) >= 0 ? 'A favor' : 'En contra');
+// El signo define el significado del saldo: positivo = falta pagar, negativo = sobra
+// crédito para el período siguiente. NO es "a favor / en contra".
+const saldoLabel = (dif) => {
+  const n = dif || 0;
+  if (n > 0) return 'Saldo a pagar';
+  if (n < 0) return 'Saldo libre disponible';
+  return 'Sin saldo';
+};
 
-// GET /api/iva/resumen — agrupa por mes. Compras desglosa los 4 campos sumables;
-// el cruce usa Imp. Total de compras vs total de ventas.
+// GET /api/iva/resumen — agrupa por mes con el saldo calculado y, si lo hay, el
+// ajuste manual que lo pisa.
 router.get('/resumen', async (req, res, next) => {
   try {
     res.json(await buildResumen());
+  } catch (err) { next(err); }
+});
+
+// =========================================================================
+// AJUSTE MANUAL DEL SALDO MENSUAL
+// =========================================================================
+// El :id de estas rutas es el mes ('YYYY-MM'), que es el _id de IvaAjuste. Se llama
+// `id` (y no `mes`) para que el middleware de auditoría capture el estado previo
+// automáticamente vía MODEL_MAP.
+
+// PUT /api/iva/ajuste/:id — pisa a mano el saldo calculado del mes
+router.put('/ajuste/:id', requireAdmin, audit('iva_ajuste'), async (req, res, next) => {
+  try {
+    const mes = (req.params.id || '').trim();
+    if (!esMesValido(mes)) return res.status(400).json({ error: 'Mes inválido (formato YYYY-MM)' });
+
+    const raw = req.body.monto;
+    if (raw === undefined || raw === null || raw === '') {
+      return res.status(400).json({ error: 'El monto es obligatorio' });
+    }
+    const monto = round2(parseMonto(raw));
+    if (!Number.isFinite(monto)) return res.status(400).json({ error: 'Monto inválido' });
+
+    // El calculado se recalcula acá, no se toma del cliente: es el único valor
+    // confiable contra el que comparar y al que restaurar después.
+    const { meses } = await buildResumen();
+    const actual = meses.find(m => m.mes === mes);
+    const calculada = actual ? actual.diferencia_calculada : 0;
+    const anterior = actual ? actual.diferencia : calculada;
+
+    const doc = {
+      diferencia_calculada: calculada,
+      diferencia_ajustada: monto,
+      ajustada_por: req.user?.usuario || 'desconocido',
+      ajustada_at: nowTs(),
+    };
+    await IvaAjuste.findByIdAndUpdate(mes, doc, { upsert: true, setDefaultsOnInsert: true });
+    res.json({ ok: true, mes, anterior, ...doc });
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/iva/ajuste/:id — quita el ajuste y vuelve al valor calculado
+router.delete('/ajuste/:id', requireAdmin, audit('iva_ajuste'), async (req, res, next) => {
+  try {
+    const mes = (req.params.id || '').trim();
+    if (!esMesValido(mes)) return res.status(400).json({ error: 'Mes inválido (formato YYYY-MM)' });
+    await IvaAjuste.findByIdAndDelete(mes);
+    const { meses } = await buildResumen();
+    const actual = meses.find(m => m.mes === mes);
+    res.json({ ok: true, mes, diferencia: actual ? actual.diferencia_calculada : 0 });
   } catch (err) { next(err); }
 });
 
@@ -506,6 +675,8 @@ router.get('/resumen', async (req, res, next) => {
 router.get('/export-resumen', async (req, res, next) => {
   try {
     const { meses, totales } = await buildResumen();
+    // 'Diferencia' es el valor efectivo (el ajustado si el mes tiene ajuste manual).
+    // 'Calculado' queda al lado para que el ajuste sea auditable desde el Excel.
     const rows = meses.map(m => ({
       'Mes': labelMes(m.mes),
       'Compras (Imp. Total)': m.compras.imp_total,
@@ -513,9 +684,12 @@ router.get('/export-resumen', async (req, res, next) => {
       'Neto Gravado': m.compras.neto_gravado,
       'Percepción IVA': m.compras.percepcion_iva,
       'Ingresos Brutos': m.compras.ingresos_brutos,
+      'Créditos Fiscales': m.creditos_fiscales,
       'Ventas': m.ventas,
       'Diferencia': m.diferencia,
       'Saldo': saldoLabel(m.diferencia),
+      'Ajustado': m.diferencia_ajustada !== null ? 'Sí' : '',
+      'Calculado': m.diferencia_calculada,
     }));
     rows.push({
       'Mes': 'TOTALES',
@@ -524,18 +698,21 @@ router.get('/export-resumen', async (req, res, next) => {
       'Neto Gravado': totales.compras_neto_gravado,
       'Percepción IVA': totales.compras_percepcion_iva,
       'Ingresos Brutos': totales.compras_ingresos_brutos,
+      'Créditos Fiscales': totales.creditos_fiscales,
       'Ventas': totales.ventas,
       'Diferencia': totales.diferencia,
       'Saldo': saldoLabel(totales.diferencia),
+      'Ajustado': totales.meses_ajustados ? `${totales.meses_ajustados} mes(es)` : '',
+      'Calculado': totales.diferencia_calculada,
     });
 
     const ws = XLSX.utils.json_to_sheet(rows, {
-      header: ['Mes', 'Compras (Imp. Total)', 'IVA Compras', 'Neto Gravado', 'Percepción IVA', 'Ingresos Brutos', 'Ventas', 'Diferencia', 'Saldo'],
+      header: ['Mes', 'Compras (Imp. Total)', 'IVA Compras', 'Neto Gravado', 'Percepción IVA', 'Ingresos Brutos', 'Créditos Fiscales', 'Ventas', 'Diferencia', 'Saldo', 'Ajustado', 'Calculado'],
     });
-    ws['!cols'] = [16, 20, 16, 16, 16, 16, 16, 16, 12].map(w => ({ wch: w }));
-    // Formato con 2 decimales en las columnas de montos (B..H), filas de datos + totales.
+    ws['!cols'] = [16, 20, 16, 16, 16, 16, 18, 16, 16, 22, 10, 16].map(w => ({ wch: w }));
+    // Formato con 2 decimales en las columnas de montos (B..I y L), filas de datos + totales.
     for (let r = 1; r <= rows.length; r++) {
-      for (const c of [1, 2, 3, 4, 5, 6, 7]) {
+      for (const c of [1, 2, 3, 4, 5, 6, 7, 8, 11]) {
         const cell = ws[XLSX.utils.encode_cell({ r, c })];
         if (cell && cell.t === 'n') cell.z = '#,##0.00';
       }
@@ -553,22 +730,29 @@ router.get('/export-resumen', async (req, res, next) => {
 router.get('/export-resumen-pdf', async (req, res, next) => {
   try {
     const { meses, totales } = await buildResumen();
-    const doc = new PDFDocument({ margin: 40, size: 'A4' });
+    // Apaisado: con 9 columnas (compras, IVA, las dos percepciones, créditos,
+    // ventas, diferencia y la etiqueta de saldo) el A4 vertical se queda corto.
+    const doc = new PDFDocument({ margin: 40, size: 'A4', layout: 'landscape' });
     res.setHeader('Content-Disposition', 'attachment; filename="iva-cruce.pdf"');
     res.setHeader('Content-Type', 'application/pdf');
     doc.pipe(res);
 
-    doc.fontSize(18).font('Helvetica-Bold').text('Cruce mensual IVA', { align: 'center' });
+    doc.fontSize(18).font('Helvetica-Bold').text('Saldo mensual IVA', { align: 'center' });
     doc.moveDown(0.3);
     doc.fontSize(9).font('Helvetica').fillColor('#666')
       .text(`Emitido: ${new Date().toLocaleString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}`, { align: 'center' });
     doc.fillColor('#000').moveDown(1);
 
+    // La última columna (Saldo) toma el ancho restante: su texto ("Saldo libre
+    // disponible") es el más largo y no debe envolver, o desalinea la fila.
     const cols = [
-      { label: 'Mes', w: 95, align: 'left' },
-      { label: 'Compras (Imp.)', w: 85, align: 'right' },
+      { label: 'Mes', w: 92, align: 'left' },
+      { label: 'Compras (Imp.)', w: 80, align: 'right' },
       { label: 'IVA Compras', w: 75, align: 'right' },
-      { label: 'Ventas', w: 80, align: 'right' },
+      { label: 'Percep. IVA', w: 70, align: 'right' },
+      { label: 'Ing. Brutos', w: 70, align: 'right' },
+      { label: 'Créd. Fiscales', w: 85, align: 'right' },
+      { label: 'Ventas', w: 70, align: 'right' },
       { label: 'Diferencia', w: 80, align: 'right' },
       { label: 'Saldo', w: 0, align: 'right' },
     ];
@@ -593,9 +777,13 @@ router.get('/export-resumen-pdf', async (req, res, next) => {
 
     for (const m of meses) {
       drawRow([
-        labelMes(m.mes),
+        // El asterisco marca el mes con saldo ajustado a mano; el pie lo aclara.
+        labelMes(m.mes) + (m.diferencia_ajustada !== null ? ' *' : ''),
         fmtMonto(m.compras.imp_total),
         fmtMonto(m.compras.total_iva),
+        fmtMonto(m.compras.percepcion_iva),
+        fmtMonto(m.compras.ingresos_brutos),
+        fmtMonto(m.creditos_fiscales),
         fmtMonto(m.ventas),
         fmtMonto(m.diferencia),
         saldoLabel(m.diferencia),
@@ -608,10 +796,25 @@ router.get('/export-resumen-pdf', async (req, res, next) => {
       'TOTALES',
       fmtMonto(totales.compras_imp_total),
       fmtMonto(totales.compras_total_iva),
+      fmtMonto(totales.compras_percepcion_iva),
+      fmtMonto(totales.compras_ingresos_brutos),
+      fmtMonto(totales.creditos_fiscales),
       fmtMonto(totales.ventas),
       fmtMonto(totales.diferencia),
       saldoLabel(totales.diferencia),
     ], { bold: true });
+
+    doc.moveDown(1);
+    doc.fontSize(8).font('Helvetica').fillColor('#666')
+      .text('Diferencia = (Ventas − IVA compras) − Percep. IVA − Créditos fiscales. '
+          + 'Positivo = saldo a pagar; negativo = saldo libre disponible. '
+          + 'Ingresos Brutos se informa pero no entra en el cálculo.', { align: 'left' });
+    if (totales.meses_ajustados) {
+      doc.moveDown(0.3);
+      doc.text(`* Saldo ajustado manualmente (${totales.meses_ajustados} mes/es). `
+             + `Total calculado sin ajustes: ${fmtMonto(totales.diferencia_calculada)}.`, { align: 'left' });
+    }
+    doc.fillColor('#000');
 
     doc.end();
   } catch (err) { next(err); }

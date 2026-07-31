@@ -26,6 +26,8 @@ const SECTORES = [
   { model: 'IvaCompra', file: 'iva_compras' },
   { model: 'IvaVenta', file: 'iva_ventas' },
   { model: 'IvaConfig', file: 'iva_config' },
+  { model: 'IvaCredito', file: 'iva_creditos' },
+  { model: 'IvaAjuste', file: 'iva_ajustes' },
   { model: 'VentaSistema', file: 'ventas_sistema' },
   { model: 'TarjetaTransaccion', file: 'tarjetas' },
   { model: 'User', file: 'usuarios' },     // se exporta SIN password_hash

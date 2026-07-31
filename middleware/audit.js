@@ -19,6 +19,8 @@ const MODEL_MAP = {
   user: models.User,
   iva_compra: models.IvaCompra,
   iva_venta: models.IvaVenta,
+  iva_credito: models.IvaCredito,
+  iva_ajuste: models.IvaAjuste,   // el :id es el mes 'YYYY-MM' (_id String)
   venta_sistema: models.VentaSistema,
   tarjeta: models.TarjetaTransaccion,
 };

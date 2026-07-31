@@ -133,7 +133,7 @@ describe('IVA — Percepción IVA e Ingresos Brutos', () => {
     expect(f.neto_gravado).toBe(100000);
   });
 
-  it('el resumen acumula percepciones por mes sin alterar la diferencia', async () => {
+  it('el resumen acumula percepciones por mes y resta solo la de IVA', async () => {
     await crearCompra({ fecha: '05/06/2026', razon_social: 'A', total_iva: 21000, imp_total: 121000, percepcion_iva: 5000, ingresos_brutos: 3000 });
     await crearCompra({ fecha: '20/06/2026', razon_social: 'B', total_iva: 10000, imp_total: 60000, percepcion_iva: 2000, ingresos_brutos: 1000 });
 
@@ -141,9 +141,12 @@ describe('IVA — Percepción IVA e Ingresos Brutos', () => {
     const junio = res.body.meses.find(m => m.mes === '2026-06');
     expect(junio.compras.percepcion_iva).toBe(7000);
     expect(junio.compras.ingresos_brutos).toBe(4000);
-    // Imp. Total y la diferencia (ventas - IVA compras) ignoran las percepciones
+    // El Imp. Total del comprobante sigue sin incluirlas...
     expect(junio.compras.imp_total).toBe(181000);
-    expect(junio.diferencia).toBe(0 - 31000); // sin ventas: -IVA compras
+    // ...el saldo resta la percepción de IVA, pero NO Ingresos Brutos (impuesto
+    // provincial: se informa nomás): (0 - 31000) - 7000 - 0 créditos = -38000
+    expect(junio.diferencia).toBe(-38000);
+    expect(junio.diferencia_calculada).toBe(-38000);
     expect(res.body.totales.compras_percepcion_iva).toBe(7000);
     expect(res.body.totales.compras_ingresos_brutos).toBe(4000);
   });
@@ -217,11 +220,10 @@ describe('IVA — Ventas (carga manual)', () => {
   });
 });
 
-describe('IVA — Cruce mensual (resumen)', () => {
+describe('IVA — Saldo mensual (resumen)', () => {
 
-  it('calcula la diferencia ventas - compras por mes y los totales', async () => {
-    // Marzo: compras imp 181500, ventas 200000 → +18500 (a favor)
-    // Abril: compras imp 24200, ventas 15000 → -9200 (en contra)
+  it('calcula el saldo del mes y los totales', async () => {
+    // Sin percepciones ni créditos, el saldo es (ventas - IVA compras).
     await importExcel(adminToken, buildXlsx([FILA_MARZO_1, FILA_MARZO_2, FILA_ABRIL_1]), 'todo.xlsx');
     await request(app).post('/api/iva/ventas').set('Authorization', `Bearer ${adminToken}`).send({ fecha: '2024-03-20', total: 200000 });
     await request(app).post('/api/iva/ventas').set('Authorization', `Bearer ${adminToken}`).send({ fecha: '2024-04-15', total: 15000 });
@@ -236,10 +238,49 @@ describe('IVA — Cruce mensual (resumen)', () => {
     expect(marzo.ventas).toBe(200000);
     expect(marzo.diferencia).toBe(168500); // ventas 200000 - IVA compras 31500
     expect(abril.diferencia).toBe(10800);  // ventas 15000 - IVA compras 4200
+    // Sin ajuste manual, el efectivo es el calculado y no hay marcas de ajuste.
+    expect(marzo.diferencia_ajustada).toBeNull();
+    expect(marzo.diferencia_calculada).toBe(168500);
 
     expect(res.body.totales.compras_imp_total).toBe(205700);
     expect(res.body.totales.ventas).toBe(215000);
     expect(res.body.totales.diferencia).toBe(179300); // 168500 + 10800
+    expect(res.body.totales.meses_ajustados).toBe(0);
+  });
+
+  it('resta percepción de IVA y créditos fiscales, pero NO Ingresos Brutos', async () => {
+    // Ventas 200000 − IVA compras 21000 − percep 5000 − créditos 10000 = 164000.
+    // Los 3000 de IIBB se informan pero no tocan el saldo.
+    await request(app).post('/api/iva/compras').set('Authorization', `Bearer ${adminToken}`)
+      .send({ fecha: '05/03/2024', razon_social: 'A', total_iva: 21000, imp_total: 121000, percepcion_iva: 5000, ingresos_brutos: 3000 });
+    await request(app).post('/api/iva/ventas').set('Authorization', `Bearer ${adminToken}`).send({ fecha: '2024-03-20', total: 200000 });
+    await request(app).post('/api/iva/creditos').set('Authorization', `Bearer ${adminToken}`).send({ fecha: '2024-03-25', monto: 10000, concepto: 'Saldo técnico' });
+
+    const res = await request(app).get('/api/iva/resumen').set('Authorization', `Bearer ${adminToken}`);
+    const marzo = res.body.meses.find(m => m.mes === '2024-03');
+    expect(marzo.creditos_fiscales).toBe(10000);
+    expect(marzo.creditos_items).toBe(1);
+    expect(marzo.compras.ingresos_brutos).toBe(3000); // se informa...
+    expect(marzo.diferencia).toBe(164000);            // ...pero no resta
+    expect(res.body.totales.creditos_fiscales).toBe(10000);
+  });
+
+  it('Ingresos Brutos no mueve el saldo aunque cambie', async () => {
+    await request(app).post('/api/iva/compras').set('Authorization', `Bearer ${adminToken}`)
+      .send({ fecha: '05/03/2024', razon_social: 'A', total_iva: 1000, imp_total: 6000, ingresos_brutos: 99999 });
+    const res = await request(app).get('/api/iva/resumen').set('Authorization', `Bearer ${adminToken}`);
+    const marzo = res.body.meses.find(m => m.mes === '2024-03');
+    expect(marzo.compras.ingresos_brutos).toBe(99999);
+    expect(marzo.diferencia).toBe(-1000); // solo (0 ventas - 1000 IVA compras)
+  });
+
+  it('un mes sin créditos cargados resta 0 (no rompe la cuenta)', async () => {
+    await importExcel(adminToken, buildXlsx([FILA_ABRIL_1]), 'abril.xlsx');
+    const res = await request(app).get('/api/iva/resumen').set('Authorization', `Bearer ${adminToken}`);
+    const abril = res.body.meses.find(m => m.mes === '2024-04');
+    expect(abril.creditos_fiscales).toBe(0);
+    expect(abril.diferencia).toBe(-4200); // 0 ventas - 4200 IVA compras - 0 - 0 - 0
+    expect(Number.isFinite(abril.diferencia)).toBe(true);
   });
 
   it('meses vienen ordenados del más reciente al más antiguo', async () => {
@@ -265,6 +306,163 @@ describe('IVA — Cruce mensual (resumen)', () => {
     expect(res.body.totales.compras_imp_total).toBe(60500);
     expect(res.body.totales.compras_notas_credito).toBe(60500);
     expect(res.body.tipos.find(t => t.tipo === 'Nota de Crédito A').es_nc).toBe(true);
+  });
+});
+
+describe('IVA — Créditos fiscales', () => {
+  const auth = (req) => req.set('Authorization', `Bearer ${adminToken}`);
+  const crear = (body) => auth(request(app).post('/api/iva/creditos')).send(body);
+
+  it('crea un crédito y lo agrupa por mes', async () => {
+    const res = await crear({ fecha: '2026-09-10', monto: 12500.5, concepto: 'Retención sufrida' });
+    expect(res.status).toBe(200);
+    expect(res.body.mes).toBe('2026-09');
+    expect(res.body.monto).toBe(12500.5);
+    expect(res.body.concepto).toBe('Retención sufrida');
+  });
+
+  it('rechaza monto 0 o fecha inválida', async () => {
+    const r1 = await crear({ fecha: '2026-09-10', monto: 0 });
+    expect(r1.status).toBe(400);
+    const r2 = await crear({ fecha: 'no-fecha', monto: 100 });
+    expect(r2.status).toBe(400);
+  });
+
+  it('viewer no puede cargar créditos (403)', async () => {
+    const res = await request(app).post('/api/iva/creditos')
+      .set('Authorization', `Bearer ${viewerToken}`).send({ fecha: '2026-09-10', monto: 100 });
+    expect(res.status).toBe(403);
+  });
+
+  it('edita y elimina, y el acumulado del mes sigue el cambio', async () => {
+    const c = await crear({ fecha: '2026-09-10', monto: 5000 });
+    let { body } = await auth(request(app).get('/api/iva/resumen'));
+    expect(body.meses.find(m => m.mes === '2026-09').creditos_fiscales).toBe(5000);
+
+    // Editar el monto y mover el crédito de mes
+    const upd = await auth(request(app).put(`/api/iva/creditos/${c.body.id}`)).send({ monto: 8000, fecha: '2026-10-02' });
+    expect(upd.status).toBe(200);
+    expect(upd.body.mes).toBe('2026-10');
+
+    ({ body } = await auth(request(app).get('/api/iva/resumen')));
+    expect(body.meses.find(m => m.mes === '2026-09')).toBeUndefined();
+    expect(body.meses.find(m => m.mes === '2026-10').creditos_fiscales).toBe(8000);
+
+    const del = await auth(request(app).delete(`/api/iva/creditos/${c.body.id}`));
+    expect(del.status).toBe(200);
+    ({ body } = await auth(request(app).get('/api/iva/resumen')));
+    expect(body.meses.find(m => m.mes === '2026-10')).toBeUndefined();
+  });
+
+  it('varios créditos del mismo mes se acumulan', async () => {
+    await crear({ fecha: '2026-09-05', monto: 1000 });
+    await crear({ fecha: '2026-09-20', monto: 2500 });
+    const { body } = await auth(request(app).get('/api/iva/resumen'));
+    const sep = body.meses.find(m => m.mes === '2026-09');
+    expect(sep.creditos_fiscales).toBe(3500);
+    expect(sep.creditos_items).toBe(2);
+  });
+});
+
+describe('IVA — Ajuste manual del saldo mensual', () => {
+  const auth = (req) => req.set('Authorization', `Bearer ${adminToken}`);
+  const mesDe = async (mes) => (await auth(request(app).get('/api/iva/resumen'))).body.meses.find(m => m.mes === mes);
+
+  const sembrarMarzo = async () => {
+    await importExcel(adminToken, buildXlsx([FILA_MARZO_1]), 'm.xlsx'); // IVA compras 21000
+    await auth(request(app).post('/api/iva/ventas')).send({ fecha: '2024-03-20', total: 50000 });
+    // calculado = 50000 - 21000 = 29000
+  };
+
+  it('guarda el ajuste, conserva el calculado y marca quién/cuándo', async () => {
+    await sembrarMarzo();
+    expect((await mesDe('2024-03')).diferencia).toBe(29000);
+
+    const res = await auth(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: 12345.67 });
+    expect(res.status).toBe(200);
+    expect(res.body.anterior).toBe(29000);
+
+    const marzo = await mesDe('2024-03');
+    expect(marzo.diferencia).toBe(12345.67);          // efectivo = ajustado
+    expect(marzo.diferencia_ajustada).toBe(12345.67);
+    expect(marzo.diferencia_calculada).toBe(29000);   // el calculado se sigue exponiendo
+    expect(marzo.ajuste_base).toBe(29000);            // valor original al ajustar
+    expect(marzo.ajustada_por).toBe('admin');
+    expect(marzo.ajustada_at).toBeTruthy();
+  });
+
+  it('el ajuste manda sobre los cambios posteriores de datos', async () => {
+    await sembrarMarzo();
+    await auth(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: 1000 });
+    // Nueva venta: el calculado cambia, el efectivo sigue siendo el ajuste manual
+    await auth(request(app).post('/api/iva/ventas')).send({ fecha: '2024-03-25', total: 10000 });
+
+    const marzo = await mesDe('2024-03');
+    expect(marzo.diferencia_calculada).toBe(39000);
+    expect(marzo.diferencia).toBe(1000);
+    expect(marzo.ajuste_base).toBe(29000); // el original del momento del ajuste
+  });
+
+  it('restaurar borra el ajuste y vuelve al calculado', async () => {
+    await sembrarMarzo();
+    await auth(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: 1 });
+    expect((await mesDe('2024-03')).diferencia).toBe(1);
+
+    const del = await auth(request(app).delete('/api/iva/ajuste/2024-03'));
+    expect(del.status).toBe(200);
+    expect(del.body.diferencia).toBe(29000);
+
+    const marzo = await mesDe('2024-03');
+    expect(marzo.diferencia).toBe(29000);
+    expect(marzo.diferencia_ajustada).toBeNull();
+  });
+
+  it('acepta un ajuste negativo (saldo libre) y el 0', async () => {
+    await sembrarMarzo();
+    await auth(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: -500 });
+    expect((await mesDe('2024-03')).diferencia).toBe(-500);
+    await auth(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: 0 });
+    expect((await mesDe('2024-03')).diferencia).toBe(0);
+  });
+
+  it('rechaza mes inválido y monto vacío', async () => {
+    const r1 = await auth(request(app).put('/api/iva/ajuste/2024-13')).send({ monto: 100 });
+    expect(r1.status).toBe(400);
+    const r2 = await auth(request(app).put('/api/iva/ajuste/marzo')).send({ monto: 100 });
+    expect(r2.status).toBe(400);
+    const r3 = await auth(request(app).put('/api/iva/ajuste/2024-03')).send({});
+    expect(r3.status).toBe(400);
+  });
+
+  it('viewer no puede ajustar ni restaurar (403)', async () => {
+    const v = (req) => req.set('Authorization', `Bearer ${viewerToken}`);
+    expect((await v(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: 1 })).status).toBe(403);
+    expect((await v(request(app).delete('/api/iva/ajuste/2024-03'))).status).toBe(403);
+  });
+
+  it('un mes que solo tiene ajuste manual sigue apareciendo', async () => {
+    await auth(request(app).put('/api/iva/ajuste/2027-01')).send({ monto: 7777 });
+    const ene = await mesDe('2027-01');
+    expect(ene).toBeDefined();
+    expect(ene.diferencia).toBe(7777);
+    expect(ene.diferencia_calculada).toBe(0);
+  });
+
+  it('registra el ajuste en auditoría con valor anterior y nuevo', async () => {
+    await sembrarMarzo();
+    await auth(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: 500 });
+    await auth(request(app).put('/api/iva/ajuste/2024-03')).send({ monto: 900 });
+
+    const { Audit } = require('../models');
+    const entradas = await Audit.find({ recurso: 'iva_ajuste' }).sort({ _id: 1 }).lean();
+    expect(entradas).toHaveLength(2);
+    expect(entradas[0].usuario).toBe('admin');
+    expect(entradas[0].recurso_id).toBe('2024-03');
+    expect(entradas[0].diff.response.anterior).toBe(29000);
+    expect(entradas[0].diff.payload.monto).toBe(500);
+    // El segundo ajuste captura el estado previo (el ajuste anterior)
+    expect(entradas[1].diff.before.diferencia_ajustada).toBe(500);
+    expect(entradas[1].diff.response.diferencia_ajustada).toBe(900);
   });
 });
 

@@ -328,6 +328,36 @@ ivaVentaSchema.index({ mes: 1 });
 ivaVentaSchema.index({ fecha: 1 });
 const IvaVenta = mongoose.model('IvaVenta', ivaVentaSchema);
 
+// --- IVA: Créditos fiscales (carga manual) ---
+// Saldos a favor / pagos a cuenta que no vienen de un comprobante de compra
+// (saldo técnico del período anterior, retenciones sufridas, etc.). Se acumulan
+// por mes y se RESTAN del saldo mensual, igual que las percepciones.
+const ivaCreditoSchema = new mongoose.Schema({
+  _id: Number,
+  fecha: String,                              // YYYY-MM-DD (fecha del crédito)
+  mes: String,                                // YYYY-MM (denormalizado; incluye el año)
+  monto: { type: Number, default: 0 },
+  concepto: { type: String, default: '' },
+  created_at: String,                         // fecha/hora de carga (ISO)
+});
+ivaCreditoSchema.index({ mes: 1 });
+ivaCreditoSchema.index({ fecha: 1 });
+const IvaCredito = mongoose.model('IvaCredito', ivaCreditoSchema);
+
+// --- IVA: Ajuste manual del saldo mensual ---
+// Un documento por mes (_id = 'YYYY-MM'). Solo existe si alguien pisó a mano el
+// saldo calculado: guarda el valor manual, el calculado que había en ese momento
+// (para comparar y restaurar) y quién/cuándo lo hizo. Sin documento, el mes usa
+// siempre el calculado.
+const ivaAjusteSchema = new mongoose.Schema({
+  _id: String,                                        // 'YYYY-MM'
+  diferencia_calculada: { type: Number, default: 0 }, // valor original al momento del ajuste
+  diferencia_ajustada: { type: Number, default: null },
+  ajustada_por: { type: String, default: '' },
+  ajustada_at: String,
+});
+const IvaAjuste = mongoose.model('IvaAjuste', ivaAjusteSchema);
+
 // --- Registro: Venta Sistema (ventas propias, carga diaria) ---
 const ventaSistemaSchema = new mongoose.Schema({
   _id: Number,
@@ -402,4 +432,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, VentaSistema, TarjetaTransaccion, Audit };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Audit };

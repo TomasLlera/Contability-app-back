@@ -46,9 +46,11 @@ describe('Movimientos — Percepción IVA / Ingresos Brutos → resumen IVA', ()
     const mayo = await mesResumen('2026-05');
     expect(mayo.compras.percepcion_iva).toBe(500);
     expect(mayo.compras.ingresos_brutos).toBe(300);
-    // No afecta imp_total ni la diferencia (no hay IvaCompra ni ventas ese mes)
+    // No afecta imp_total (no son parte del comprobante). Del saldo resta solo la
+    // percepción de IVA; los 300 de IIBB se informan pero no operan:
+    // (0 - 0) - 500 = -500 (saldo libre).
     expect(mayo.compras.imp_total).toBe(0);
-    expect(mayo.diferencia).toBe(0);
+    expect(mayo.diferencia).toBe(-500);
   });
 
   it('una nota de crédito resta sus percepciones (neto factura - NC)', async () => {
