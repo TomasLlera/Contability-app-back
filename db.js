@@ -809,10 +809,18 @@ const db = {
       const sub = await Subrubro.findById(mov.subrubro_id).lean();
       await syncCajaRemito(mov, sub, esRemito);
     }
+    // Un pago que vino de la Caja no lleva espejo: ya tiene su propio ítem allá. Pero
+    // si ese ítem desapareció, el pago quedaba invisible para la Caja de forma
+    // permanente — editarlo no lo revivía, porque esta rama se salteaba por tener
+    // caja_mov_id. Comprobar que el ítem exista convierte la edición en la vía de
+    // recuperación: si se perdió, el pago se re-espeja como uno del subrubro.
+    let cajaHuerfano = false;
+    if (veniaDeCaja && mov.tipo === 'pago') {
+      cajaHuerfano = !(await CajaMovimiento.exists({ _id: Number(mov.caja_mov_id) }));
+    }
     // Mantener en sync el espejo de Caja de un pago del subrubro: actualizar si sigue
-    // siendo pago, o borrarlo si dejó de serlo. No aplica a pagos que vinieron de la
-    // Caja (esos ya tienen su propio ítem y no llevan espejo).
-    if (!veniaDeCaja && (mov.tipo === 'pago' || eraPago)) {
+    // siendo pago, o borrarlo si dejó de serlo.
+    if ((!veniaDeCaja || cajaHuerfano) && (mov.tipo === 'pago' || eraPago)) {
       const subP = await Subrubro.findById(mov.subrubro_id).lean();
       await syncCajaPago(mov, subP, mov.tipo === 'pago');
     }

@@ -62,6 +62,30 @@ const diasDelMes = (mes) => {
 
 const diaDe = (fecha) => Number(fecha.slice(8, 10));
 
+const hoyStr = () => new Date().toISOString().slice(0, 10);
+
+// Día en el que conviene abrir la carga: el SIGUIENTE al último que ya tiene datos,
+// para retomar donde se dejó en vez de abrir siempre en hoy. Si se carga el 3 y lo
+// último cargado es el 31, abre el 1.
+// Topes: nunca un día futuro (se cae a hoy) y, si nunca se cargó nada, hoy.
+function proximoDiaDeCarga(ultimaFecha) {
+  if (!ultimaFecha) return hoyStr();
+  const d = new Date(`${ultimaFecha}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  const siguiente = d.toISOString().slice(0, 10);
+  const hoy = hoyStr();
+  return siguiente > hoy ? hoy : siguiente;
+}
+
+// Construye el handler de /proximo-dia para un modelo con campo `fecha`.
+const proximoDiaHandler = (Model) => async (req, res, next) => {
+  try {
+    const ultimo = await Model.findOne({}, { fecha: 1 }).sort({ fecha: -1 }).lean();
+    const fecha = proximoDiaDeCarga(ultimo?.fecha);
+    res.json({ fecha, ultima_carga: ultimo?.fecha || null, hoy: hoyStr() });
+  } catch (err) { next(err); }
+};
+
 // Diferencia absoluta + porcentual contra el mes anterior.
 // pct = null cuando el mes anterior fue 0 (no existe variación porcentual sobre cero).
 function comparar(actual, anterior) {
@@ -176,6 +200,10 @@ router.get('/ventas-sistema', async (req, res, next) => {
 
 // GET /api/registro/ventas-sistema/dia/:fecha — 2 columnas (ticket/facturado), total
 // consolidado, IVA del facturado y detalle.
+// GET /api/registro/ventas-sistema/proximo-dia — día donde retomar la carga.
+// Va ANTES de /dia/:fecha para que no lo capture ninguna ruta paramétrica.
+router.get('/ventas-sistema/proximo-dia', proximoDiaHandler(VentaSistema));
+
 router.get('/ventas-sistema/dia/:fecha', async (req, res, next) => {
   try {
     const fecha = parseFecha(req.params.fecha);
@@ -368,6 +396,9 @@ router.get('/tarjetas', async (req, res, next) => {
 });
 
 // GET /api/registro/tarjetas/dia/:fecha — 4 columnas + total consolidado + detalle
+// GET /api/registro/tarjetas/proximo-dia — día donde retomar la carga.
+router.get('/tarjetas/proximo-dia', proximoDiaHandler(TarjetaTransaccion));
+
 router.get('/tarjetas/dia/:fecha', async (req, res, next) => {
   try {
     const fecha = parseFecha(req.params.fecha);

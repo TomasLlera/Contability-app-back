@@ -178,13 +178,21 @@ async function reconciliarAutoSync() {
     if (metFactura && (item.metodo || null) !== metFactura) set.metodo = metFactura;
     if (!item.auto_sync) set.auto_sync = true; // backfill de la firma legacy
     if (Object.keys(set).length) {
-      updateOps.push({ updateOne: { filter: { _id: item._id }, update: { $set: set } } });
+      // Misma guarda que en el borrado: si el ítem se confirmó mientras corría el
+      // reconciliador, no se le pisa monto/fecha/concepto — a partir de la
+      // confirmación el dato autoritativo es el del pago real.
+      updateOps.push({ updateOne: { filter: { _id: item._id, confirmado: false }, update: { $set: set } } });
     }
   }
 
   let eliminados = 0, actualizados = 0;
   if (toDelete.length) {
-    const r = await CajaMovimiento.deleteMany({ _id: { $in: toDelete } });
+    // `confirmado: false` NO es redundante con el find de arriba: entre aquella
+    // lectura y este borrado el usuario pudo haber confirmado el ítem, y confirmar
+    // marca la factura como pagada — que es justamente la condición que lo puso en
+    // toDelete. Sin esta guarda el reconciliador borraba pagos recién confirmados
+    // (el ítem desaparecía de la Caja mientras el pago quedaba vivo en el Subrubro).
+    const r = await CajaMovimiento.deleteMany({ _id: { $in: toDelete }, confirmado: false });
     eliminados = r.deletedCount || 0;
   }
   if (updateOps.length) {
@@ -420,6 +428,46 @@ router.get('/', asyncHandler(async (req, res) => {
   res.json(await attachDocumento(withIds(movs)));
 }));
 
+// GET /api/caja/saldo-anterior?fecha=YYYY-MM-DD
+// Saldo de efectivo con el que abre `fecha`: parte del último saldo_inicial cargado a
+// mano —en cualquier fecha anterior, SIN ventana— y le encadena los movimientos de
+// efectivo confirmados hasta el día previo.
+//
+// Vive en el backend a propósito. El front lo resolvía trayendo los últimos 30 días y
+// encadenándolos en el cliente; cuando el último ancla quedaba fuera de esa ventana la
+// cadena arrancaba de CERO y el saldo se desplomaba de un día para el otro sin aviso.
+router.get('/saldo-anterior', asyncHandler(async (req, res) => {
+  const { fecha } = req.query;
+  if (!fecha) return res.status(400).json({ error: 'fecha requerida' });
+
+  const ancla = await CajaMovimiento
+    .findOne({ tipo: 'saldo_inicial', fecha: { $lte: fecha } })
+    .sort({ fecha: -1, _id: -1 })
+    .lean();
+  // Sin ningún ancla no se puede afirmar un saldo: se devuelve null y la Caja muestra
+  // "Sin datos" en lugar de un cero que se leería como un saldo real.
+  if (!ancla) return res.json({ saldo: null, ancla_fecha: null, ancla_monto: null });
+
+  // Desde el día del ancla inclusive (el saldo_inicial es la apertura de ese día)
+  // hasta el día anterior al pedido.
+  const movs = await CajaMovimiento.find(
+    {
+      fecha: { $gte: ancla.fecha, $lt: fecha },
+      tipo: { $in: ['empleado', 'ingreso_extra', 'gasto'] },
+      metodo: 'efectivo',
+    },
+    { tipo: 1, monto: 1, confirmado: 1 },
+  ).lean();
+
+  // confirmado === false = pendiente (gasto sin pagar / deuda sin cobrar): no movió plata.
+  const saldo = movs.reduce(
+    (s, m) => (m.confirmado === false ? s : s + (m.tipo === 'gasto' ? -1 : 1) * (m.monto || 0)),
+    ancla.monto || 0,
+  );
+
+  res.json({ saldo, ancla_fecha: ancla.fecha, ancla_monto: ancla.monto ?? 0 });
+}));
+
 // GET /api/caja/rango?desde=YYYY-MM-DD&hasta=YYYY-MM-DD&page=&limit=
 router.get('/rango', asyncHandler(async (req, res) => {
   const { desde, hasta } = req.query;
@@ -536,39 +584,59 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
   let pagoId = null;
   let ncId = null;
 
-  if (item.subrubro_id) {
-    // NC primero: si fallara, todavía no se registró el pago y el ítem queda sin
-    // confirmar, en un estado reintentable. Al revés dejaría un pago sin su NC.
-    if (descuento) {
-      const nc = await db.createMovimiento(item.subrubro_id, {
-        tipo: 'nota_credito',
-        pago: descuento,
+  // Reserva ATÓMICA antes de tocar el subrubro. Registrar el pago marca la factura
+  // como pagada, y el reconciliador del auto-sync borra los ítems pendientes cuya
+  // factura ya está paga: si el ítem seguía en `confirmado: false` durante ese lapso,
+  // un auto-sync concurrente (otra pestaña, otro usuario, el refresco por foco) lo
+  // borraba y el pago quedaba huérfano, invisible para la Caja.
+  // El filtro `$ne: true` cubre también los registros legacy con confirmado null.
+  const claim = await CajaMovimiento.findOneAndUpdate(
+    { _id: id, confirmado: { $ne: true } },
+    { $set: { confirmado: true, fecha } },
+  );
+  if (!claim) return res.status(409).json({ error: 'El movimiento ya está confirmado' });
+
+  try {
+    if (item.subrubro_id) {
+      // NC primero: si fallara, todavía no se registró el pago y el ítem vuelve atrás
+      // en un estado reintentable. Al revés dejaría un pago sin su NC.
+      if (descuento) {
+        const nc = await db.createMovimiento(item.subrubro_id, {
+          tipo: 'nota_credito',
+          pago: descuento,
+          fecha,
+          concepto: `Descuento por pago${pct != null ? ` (${pct}%)` : ''}: ${item.concepto}`,
+          facturas_vinculadas_ids: [Number(item.movimiento_id)],
+          caja_mov_id: id,
+          // Determinística: una entrada de caja genera como mucho UNA NC de descuento.
+          idempotency_key: `caja-descuento-${id}`,
+        });
+        ncId = nc?.id ?? null;
+      }
+      const pago = await db.createMovimiento(item.subrubro_id, {
+        tipo: 'pago',
+        pago: neto,
         fecha,
-        concepto: `Descuento por pago${pct != null ? ` (${pct}%)` : ''}: ${item.concepto}`,
-        facturas_vinculadas_ids: [Number(item.movimiento_id)],
+        concepto: `${esCobro ? 'Abono caja' : 'Pago caja'}: ${item.concepto}`,
+        metodo_pago: item.metodo,
         caja_mov_id: id,
-        // Determinística: una entrada de caja genera como mucho UNA NC de descuento.
-        idempotency_key: `caja-descuento-${id}`,
+        facturas_vinculadas_ids: item.movimiento_id ? [Number(item.movimiento_id)] : [],
+        idempotency_key: `caja-confirm-${id}`,
       });
-      ncId = nc?.id ?? null;
+      pagoId = pago?.id ?? null;
     }
-    const pago = await db.createMovimiento(item.subrubro_id, {
-      tipo: 'pago',
-      pago: neto,
-      fecha,
-      concepto: `${esCobro ? 'Abono caja' : 'Pago caja'}: ${item.concepto}`,
-      metodo_pago: item.metodo,
-      caja_mov_id: id,
-      facturas_vinculadas_ids: item.movimiento_id ? [Number(item.movimiento_id)] : [],
-      idempotency_key: `caja-confirm-${id}`,
-    });
-    pagoId = pago?.id ?? null;
+  } catch (err) {
+    // Devolver el ítem a como estaba: si el pago no se registró, la Caja no puede
+    // quedar diciendo que sí. Las idempotency_key liberadas permiten reintentar.
+    await CajaMovimiento.updateOne(
+      { _id: id },
+      { $set: { confirmado: item.confirmado ?? null, fecha: item.fecha } },
+    );
+    throw err;
   }
 
   await CajaMovimiento.findByIdAndUpdate(id, {
     $set: {
-      confirmado: true,
-      fecha,
       monto: neto,
       descuento,
       descuento_pct: descuento ? pct : null,
