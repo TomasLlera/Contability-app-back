@@ -144,13 +144,25 @@ const withIds = arr => arr.map(withId);
 const r2 = (n) => Math.round((n || 0) * 100) / 100;
 
 // Calcula el SALDO pendiente de cada factura del subrubro a partir de la lista
-// completa de movimientos. Al monto original le resta, en este orden:
+// completa de movimientos, y además la TRAZA de cómo se llegó a ese saldo: qué
+// pago/NC imputó cuánto sobre cada factura. Al monto original le resta, en este
+// orden:
 //   1) pagos / notas de crédito VINCULADOS explícitamente a esa factura, y
 //   2) pagos "libres" (sin vinculación) aplicados FIFO por antigüedad.
 // Una NC o un pago parcial dejan la factura con saldo > 0 (sigue pendiente por el
 // resto); si lo aplicado cubre el total, el saldo queda en 0 (factura saldada).
-// Devuelve un Map fid -> saldo (>= 0). No modifica el monto original.
-function computeSaldosFacturas(movs) {
+// No modifica el monto original.
+//
+// Devuelve:
+//   saldos     — Map facturaId → saldo pendiente (>= 0)
+//   porFactura — Map facturaId → [{ mov_id, monto, tipo, explicito }]  (quién la pagó)
+//   porPago    — Map pagoId    → { aplicado: [{ mov_id, monto, explicito }], sin_aplicar }
+//
+// `explicito` distingue la vinculación manual (paso 1) de la imputación
+// automática FIFO (paso 2). Contablemente pesan igual, pero solo la primera fue
+// una decisión del usuario: la UI las muestra distinto y `sin_aplicar` deja ver
+// el crédito que quedó a favor sin cubrir ninguna factura.
+function computeAplicaciones(movs) {
   const ordenadas = [...movs].sort((a, b) => {
     if (!a.fecha && !b.fecha) return a._id - b._id;
     if (!a.fecha) return 1;
@@ -158,41 +170,64 @@ function computeSaldosFacturas(movs) {
     return a.fecha.localeCompare(b.fecha) || a._id - b._id;
   });
 
-  const saldo = new Map();
+  const saldos = new Map();
   for (const m of ordenadas) {
-    if (m.tipo === 'factura') saldo.set(m._id, r2(m.monto));
+    if (m.tipo === 'factura') saldos.set(m._id, r2(m.monto));
   }
 
-  // 1) Pagos / NC vinculados a facturas puntuales (respeta la elección manual).
-  for (const m of ordenadas) {
-    if ((m.tipo !== 'pago' && m.tipo !== 'nota_credito') || !m.facturas_vinculadas_ids?.length) continue;
-    let restante = r2(m.pago);
-    const vinc = new Set(m.facturas_vinculadas_ids.map(Number));
+  // Los ajustes quedan afuera a propósito: mueven el saldo del subrubro pero no
+  // se imputan contra una factura puntual (mismo criterio que la versión previa).
+  const pagos = ordenadas.filter(m => m.tipo === 'pago' || m.tipo === 'nota_credito');
+  const porFactura = new Map();
+  const porPago = new Map(pagos.map(p => [p._id, { aplicado: [], sin_aplicar: r2(p.pago) }]));
+
+  // Imputa `restante` del pago sobre las facturas que pasen `elegible`, en orden
+  // de antigüedad, y anota la traza en los dos sentidos. Devuelve lo no imputado.
+  const imputar = (pago, elegible) => {
+    let restante = r2(pago.pago);
     for (const f of ordenadas) {
       if (restante <= 0) break;
-      if (f.tipo !== 'factura' || !vinc.has(f._id)) continue;
-      const s = saldo.get(f._id) || 0;
-      const aplicar = Math.min(restante, s);
-      saldo.set(f._id, r2(s - aplicar));
+      if (f.tipo !== 'factura' || !elegible(f)) continue;
+      const s = saldos.get(f._id) || 0;
+      if (s <= 0) continue;
+      const aplicar = r2(Math.min(restante, s));
+      saldos.set(f._id, r2(s - aplicar));
       restante = r2(restante - aplicar);
+      if (!porFactura.has(f._id)) porFactura.set(f._id, []);
+      const explicito = !!pago.facturas_vinculadas_ids?.length;
+      // Viaja la fecha/método de la contraparte: el desglose de una factura debe
+      // poder listar un pago aunque ese pago haya quedado fuera del período mostrado.
+      porFactura.get(f._id).push({
+        mov_id: pago._id, monto: aplicar, tipo: pago.tipo, explicito,
+        fecha: pago.fecha || null, metodo_pago: pago.metodo_pago || null,
+      });
+      porPago.get(pago._id).aplicado.push({ mov_id: f._id, monto: aplicar, explicito, fecha: f.fecha || null });
     }
+    porPago.get(pago._id).sin_aplicar = restante;
+  };
+
+  // 1) Pagos / NC vinculados a facturas puntuales (respeta la elección manual).
+  for (const m of pagos) {
+    if (!m.facturas_vinculadas_ids?.length) continue;
+    const vinc = new Set(m.facturas_vinculadas_ids.map(Number));
+    imputar(m, f => vinc.has(f._id));
   }
 
   // 2) Pagos libres (sin vinculación) → FIFO sobre las facturas con saldo.
-  let libre = ordenadas
-    .filter(m => (m.tipo === 'pago' || m.tipo === 'nota_credito') && !(m.facturas_vinculadas_ids?.length))
-    .reduce((s, m) => s + (m.pago || 0), 0);
-  libre = r2(libre);
-  for (const m of ordenadas) {
-    if (m.tipo !== 'factura' || libre <= 0) continue;
-    const s = saldo.get(m._id) || 0;
-    if (s <= 0) continue;
-    const aplicar = Math.min(libre, s);
-    saldo.set(m._id, r2(s - aplicar));
-    libre = r2(libre - aplicar);
+  // Recorrerlos de a uno en vez de sumarlos en un pozo único da el mismo saldo
+  // final (se llenan las mismas facturas, en el mismo orden, hasta agotar el
+  // crédito) pero permite saber qué pago cubrió qué factura.
+  for (const m of pagos) {
+    if (m.facturas_vinculadas_ids?.length) continue;
+    imputar(m, () => true);
   }
 
-  return saldo;
+  return { saldos, porFactura, porPago };
+}
+
+// Atajo para los consumidores que solo necesitan el saldo por factura.
+function computeSaldosFacturas(movs) {
+  return computeAplicaciones(movs).saldos;
 }
 
 async function recalcularPagos(subrubroId) {
@@ -624,21 +659,44 @@ const db = {
   },
 
   // --- MOVIMIENTOS ---
-  async getMovimientos(subrubroId, anio, mes) {
+  // `opts` acota el período mostrado, de forma excluyente:
+  //   { anio, mes }     → ese mes completo
+  //   { desde, hasta }  → rango de fechas ISO (cualquiera de los dos es opcional)
+  //   {}                → histórico completo
+  // Los movimientos SIN fecha quedan fuera de cualquier período acotado (mismo
+  // criterio que ya usaba el filtro por mes y que usa el export a Excel).
+  async getMovimientos(subrubroId, opts = {}) {
+    const { anio, mes, desde, hasta } = opts;
     const iid = Number(subrubroId);
     const filter = { subrubro_id: iid };
     if (anio && mes) {
       const prefix = `${anio}-${String(mes).padStart(2, '0')}`;
       filter.fecha = { $regex: `^${prefix}` };
+    } else if (desde || hasta) {
+      // `fecha` se guarda como 'YYYY-MM-DD', así que el orden lexicográfico es el
+      // cronológico y la comparación de strings alcanza (usa el índice subrubro_id+fecha).
+      filter.fecha = {};
+      if (desde) filter.fecha.$gte = desde;
+      if (hasta) filter.fecha.$lte = hasta;
     }
+    const acotado = Boolean((anio && mes) || desde || hasta);
     const movs = await Movimiento.find(filter).lean();
     // El saldo por factura necesita TODOS los movimientos del subrubro: una NC o
     // un pago vinculado puede estar en un mes distinto al de la factura.
-    const todos = (anio && mes) ? await Movimiento.find({ subrubro_id: iid }).lean() : movs;
-    const saldo = computeSaldosFacturas(todos);
-    const conSaldo = movs.map(m =>
-      m.tipo === 'factura' ? { ...m, saldo: saldo.get(m._id) ?? (m.monto || 0) } : m
-    );
+    const todos = acotado ? await Movimiento.find({ subrubro_id: iid }).lean() : movs;
+    const { saldos, porFactura, porPago } = computeAplicaciones(todos);
+    // Cada movimiento viaja con su lado de la relación factura ↔ pago/NC para que
+    // el frontend pueda resaltar el vínculo sin recalcular la imputación.
+    const conSaldo = movs.map(m => {
+      if (m.tipo === 'factura') {
+        return { ...m, saldo: saldos.get(m._id) ?? (m.monto || 0), pagos_aplicados: porFactura.get(m._id) || [] };
+      }
+      if (m.tipo === 'pago' || m.tipo === 'nota_credito') {
+        const traza = porPago.get(m._id);
+        return { ...m, facturas_aplicadas: traza?.aplicado || [], sin_aplicar: traza?.sin_aplicar ?? r2(m.pago) };
+      }
+      return m;
+    });
     // Dentro de cada día: primero facturas (ingresos, +), luego pagos/NC/ajustes
     // (egresos, −). Misma detección de "factura" que usa el frontend.
     const rankTipo = (m) => (m.tipo === 'factura' || (!m.tipo && (m.monto || 0) > 0)) ? 0 : 1;
@@ -1028,18 +1086,20 @@ const db = {
     return saldo;
   },
 
-  // Saldo acumulado de todos los movimientos ANTERIORES al mes indicado
-  async getSaldoAnterior(subrubroId, anio, mes) {
+  // Saldo acumulado de todos los movimientos ANTERIORES a `corte` (fecha ISO
+  // 'YYYY-MM-DD'). Es el punto de partida del total corrido de la vista: el
+  // primer día del mes seleccionado, o el inicio del rango elegido.
+  async getSaldoAnterior(subrubroId, corte) {
     const sub = await Subrubro.findById(Number(subrubroId)).lean();
     if (!sub) return 0;
     const campos = await Campo.find({ rubro_id: sub.rubro_id }).lean();
     const camposSuma = new Set(campos.filter(c => c.tipo === 'suma').map(c => c.nombre));
     const camposResta = new Set(campos.filter(c => c.tipo === 'resta').map(c => c.nombre));
-    const prefix = `${anio}-${String(mes).padStart(2, '0')}`;
-    // Movimientos anteriores al mes: fecha existe y es menor al primer día del mes
+    // Los movimientos sin fecha no matchean $lt, así que quedan fuera del
+    // acumulado previo — igual que quedan fuera del período mostrado.
     const movs = await Movimiento.find({
       subrubro_id: Number(subrubroId),
-      fecha: { $lt: `${prefix}-01` },
+      fecha: { $lt: corte },
     }).lean();
     let saldo = sub.monto_base || 0;
     for (const m of movs) {
@@ -1410,3 +1470,4 @@ module.exports.calcularProximoDiaMes = calcularProximoDiaMes;
 module.exports.calcularVencimientoSub = calcularVencimientoSub;
 module.exports.recomputarVencimientosSubrubro = recomputarVencimientosSubrubro;
 module.exports.computeSaldosFacturas = computeSaldosFacturas;
+module.exports.computeAplicaciones = computeAplicaciones;

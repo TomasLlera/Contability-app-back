@@ -21,15 +21,31 @@ router.get('/search', asyncHandler(async (req, res) => {
   res.json(await db.searchMovimientos(q, limit));
 }));
 
+const ES_FECHA_ISO = /^\d{4}-\d{2}-\d{2}$/;
+
+// Período mostrado: { anio, mes } (un mes) o { desde, hasta } (rango libre; los
+// dos extremos son opcionales). Sin ninguno de los dos devuelve el histórico.
 router.get('/:subrubroId', asyncHandler(async (req, res) => {
-  const { anio, mes } = req.query;
+  const { anio, mes, desde, hasta } = req.query;
+  for (const [k, v] of Object.entries({ desde, hasta })) {
+    if (v && !ES_FECHA_ISO.test(v)) {
+      const e = new Error(`Parámetro "${k}" inválido: se espera una fecha YYYY-MM-DD`);
+      e.statusCode = 400;
+      throw e;
+    }
+  }
+  // Punto de partida del total corrido: lo acumulado antes del período mostrado.
+  const corte = (anio && mes)
+    ? `${anio}-${String(mes).padStart(2, '0')}-01`
+    : (desde || null);
+
   const [movs, sub, saldo_total] = await Promise.all([
-    db.getMovimientos(req.params.subrubroId, anio, mes),
+    db.getMovimientos(req.params.subrubroId, { anio, mes, desde, hasta }),
     db.getSubrubro(req.params.subrubroId),
     db.getSaldoTotal(req.params.subrubroId),
   ]);
-  const saldo_anterior = (anio && mes)
-    ? await db.getSaldoAnterior(req.params.subrubroId, anio, mes)
+  const saldo_anterior = corte
+    ? await db.getSaldoAnterior(req.params.subrubroId, corte)
     : (sub?.monto_base ?? 0);
   res.json({ movimientos: movs, monto_base: sub?.monto_base ?? 0, saldo_total, saldo_anterior });
 }));
