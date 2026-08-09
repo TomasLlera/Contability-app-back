@@ -415,6 +415,89 @@ tarjetaSchema.index({ fecha: 1 });
 tarjetaSchema.index({ mes: 1, empleado: 1 });
 const TarjetaTransaccion = mongoose.model('TarjetaTransaccion', tarjetaSchema);
 
+// --- Recordatorios ---
+// Memos operativos que aparecen como popup en el Dashboard: avisos de pedidos a
+// proveedores, tareas recurrentes, notas del día.
+const recordatorioSchema = new mongoose.Schema({
+  _id: Number,
+  titulo: { type: String, required: true },
+  mensaje: { type: String, default: '' },
+
+  // Cuándo se ACTIVA (qué días corresponde mostrarlo):
+  //   'unico'   → una única fecha (`fecha_especifica`); después se archiva solo.
+  //   'semanal' → los días de `dias_semana` (0=domingo … 6=sábado), todas las semanas.
+  //   'hoy'     → puntual del día en que se creó; se archiva igual que 'unico'.
+  tipo_programacion: { type: String, enum: ['unico', 'semanal', 'hoy'], default: 'hoy' },
+  fecha_especifica: { type: String, default: null },   // 'YYYY-MM-DD' (unico / hoy)
+  dias_semana: { type: [Number], default: [] },        // 0-6 (semanal)
+
+  // Cuántas veces reaparece DENTRO de un día en que está activo:
+  //   'una_vez'        → solo al iniciar sesión.
+  //   'cada_x_horas'   → cada `frecuencia_valor` horas desde la última aparición.
+  //   'n_veces'        → `frecuencia_valor` veces repartidas en el horario laboral.
+  //   'horarios_fijos' → en cada 'HH:MM' de `horarios`.
+  // La primera aparición del día es siempre al iniciar sesión, sea cual sea el tipo.
+  frecuencia_tipo: { type: String, enum: ['una_vez', 'cada_x_horas', 'n_veces', 'horarios_fijos'], default: 'una_vez' },
+  frecuencia_valor: { type: Number, default: 1 },
+  horarios: { type: [String], default: [] },           // 'HH:MM'
+
+  // Vínculo opcional. El popup lista estos subrubros, cada uno con link directo.
+  rubro_id: { type: Number, default: null },
+  subrubros_ids: { type: [Number], default: [] },
+  // Subconjunto de `subrubros_ids` que va primero y con acento visual en el popup.
+  // Reemplaza la costumbre de nombrar a los urgentes dentro del mensaje: la prioridad
+  // se ve en el chip y no se repite en el texto.
+  subrubros_prioritarios_ids: { type: [Number], default: [] },
+
+  activo: { type: Boolean, default: true },
+  // Se pone en true cuando un 'unico'/'hoy' quedó atrás. Un archivado no vuelve a
+  // aparecer nunca, pero sigue listado en Configuración.
+  archivado: { type: Boolean, default: false },
+
+  // 'global' = lo ven todos los usuarios · 'personal' = solo `usuario_id` (su creador).
+  // El seguimiento de completado/postergado es SIEMPRE por usuario: que uno lo marque
+  // no lo silencia para el resto.
+  alcance: { type: String, enum: ['global', 'personal'], default: 'global' },
+  usuario_id: { type: Number, default: null },
+
+  creado_por: { type: String, default: '' },
+  created_at: String,
+  updated_at: String,
+});
+recordatorioSchema.index({ activo: 1, archivado: 1 });
+recordatorioSchema.index({ alcance: 1, usuario_id: 1 });
+const Recordatorio = mongoose.model('Recordatorio', recordatorioSchema);
+
+// --- Recordatorio: evento diario ---
+// UN documento por (recordatorio, usuario, día). Es la memoria de qué se mostró y qué
+// hizo el usuario: vive en la base y no en el navegador, así que cerrar sesión y
+// volver a entrar el mismo día respeta lo ya completado.
+//
+// Se guarda un doc por DÍA y no uno por aparición porque lo que decide si hay que
+// volver a mostrar es siempre el estado del día: la última aparición y la acción
+// vigente. `apariciones` conserva cuántas veces se mostró.
+const recordatorioEventoSchema = new mongoose.Schema({
+  recordatorio_id: { type: Number, required: true },
+  usuario_id: { type: Number, required: true },
+  fecha: { type: String, required: true },   // 'YYYY-MM-DD' (día local del negocio)
+  primera_aparicion_at: String,              // ISO
+  mostrado_at: String,                       // ISO de la ÚLTIMA aparición
+  apariciones: { type: Number, default: 0 },
+  // 'pendiente' = se mostró y el usuario no resolvió nada. Un día ya pasado que quedó
+  // en 'pendiente' o 'postergado' cuenta como IGNORADO en el historial.
+  accion: { type: String, enum: ['pendiente', 'completado', 'postergado'], default: 'pendiente' },
+  accion_at: { type: String, default: null },
+  // Checklist del día: subrubros que este usuario ya despachó. Vive acá y no en el
+  // navegador para que tildar desde el mostrador se vea desde la oficina, y para que
+  // al día siguiente el recordatorio arranque limpio sin tener que borrar nada.
+  items_hechos: { type: [Number], default: [] },
+});
+// Único: garantiza un solo doc por recordatorio/usuario/día aunque dos pestañas
+// pidan pendientes a la vez.
+recordatorioEventoSchema.index({ recordatorio_id: 1, usuario_id: 1, fecha: 1 }, { unique: true });
+recordatorioEventoSchema.index({ fecha: -1 });
+const RecordatorioEvento = mongoose.model('RecordatorioEvento', recordatorioEventoSchema);
+
 // --- Audit Log ---
 const auditSchema = new mongoose.Schema({
   _id: Number,
@@ -432,4 +515,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Audit };
+module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Recordatorio, RecordatorioEvento, Audit };

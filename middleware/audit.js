@@ -23,6 +23,7 @@ const MODEL_MAP = {
   iva_ajuste: models.IvaAjuste,   // el :id es el mes 'YYYY-MM' (_id String)
   venta_sistema: models.VentaSistema,
   tarjeta: models.TarjetaTransaccion,
+  recordatorio: models.Recordatorio,
 };
 
 function redact(obj) {

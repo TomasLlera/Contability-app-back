@@ -30,6 +30,10 @@ const SECTORES = [
   { model: 'IvaAjuste', file: 'iva_ajustes' },
   { model: 'VentaSistema', file: 'ventas_sistema' },
   { model: 'TarjetaTransaccion', file: 'tarjetas' },
+  // Los recordatorios se respaldan; sus eventos (qué se mostró/completó cada día) no:
+  // son telemetría operativa acotada, igual que CajaDescarte, y restaurarlos falsearía
+  // el historial. Al importar, cada usuario arranca el día limpio.
+  { model: 'Recordatorio', file: 'recordatorios' },
   { model: 'User', file: 'usuarios' },     // se exporta SIN password_hash
   { model: 'Audit', file: 'auditoria' },
   { model: 'Counter', file: 'counters' },   // preserva los auto-increment
