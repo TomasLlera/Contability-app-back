@@ -3,6 +3,7 @@ const router = express.Router();
 const { Audit } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
 const { asyncHandler } = require('../middleware/errorHandler');
+const { buscarInconsistencias } = require('../utils/inconsistencias');
 
 // GET /api/audit?recurso=&recurso_id=&usuario=&desde=&hasta=&page=1&limit=50
 router.get('/', requireAdmin, asyncHandler(async (req, res) => {
@@ -25,6 +26,12 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
     Audit.countDocuments(filter),
   ]);
   res.json({ items, total, page, limit });
+}));
+
+// GET /api/audit/inconsistencias — verificaciones de integridad Caja ↔ Subrubros.
+// Solo lectura: lista los casos para revisarlos, no corrige nada.
+router.get('/inconsistencias', requireAdmin, asyncHandler(async (req, res) => {
+  res.json(await buscarInconsistencias());
 }));
 
 // GET /api/audit/:id — detalle completo de un registro (incluye diff before/after)
