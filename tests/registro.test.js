@@ -2,13 +2,21 @@ const { setupTestDb } = require('./setup');
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
 const app = require('../server');
-const { VentaSistema, TarjetaTransaccion } = require('../models');
+const { VentaSistema, TarjetaTransaccion, User } = require('../models');
 
 setupTestDb();
 
 // Firmamos los tokens directo (sin /auth/login) para no toparnos con el rate-limit.
 const adminToken = jwt.sign({ usuario: 'admin', role: 'admin', userId: 1 }, process.env.JWT_SECRET);
 const viewerToken = jwt.sign({ usuario: 'viewer', role: 'viewer', userId: 2 }, process.env.JWT_SECRET);
+
+// El middleware JWT confirma que el usuario del token exista y esté activo.
+beforeEach(async () => {
+  await User.create([
+    { _id: 1, usuario: 'admin', role: 'admin', activo: true },
+    { _id: 2, usuario: 'viewer', role: 'viewer', activo: true },
+  ]);
+});
 
 const auth = (req, token = adminToken) => req.set('Authorization', `Bearer ${token}`);
 

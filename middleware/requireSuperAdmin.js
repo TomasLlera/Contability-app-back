@@ -1,17 +1,5 @@
-const jwt = require('jsonwebtoken');
+const { requireRole } = require('./authJwt');
 
 // Requiere rol superadmin: control total del sistema, incluida la gestión de usuarios.
-module.exports = function requireSuperAdmin(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No autorizado' });
-  try {
-    const decoded = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
-    if (decoded.role !== 'superadmin') {
-      return res.status(403).json({ error: 'Se requiere rol Super Administrador' });
-    }
-    req.user = req.user || decoded;
-    next();
-  } catch {
-    res.status(401).json({ error: 'Token inválido o expirado' });
-  }
-};
+// El rol es el VIGENTE en la base, no el que quedó grabado en el token.
+module.exports = requireRole(['superadmin'], 'Se requiere rol Super Administrador');

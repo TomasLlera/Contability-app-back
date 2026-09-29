@@ -60,18 +60,9 @@ const loginLimiter = rateLimit({
 app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth', require('./routes/auth'));
 
-// JWT middleware — protege todas las rutas siguientes
-const jwt = require('jsonwebtoken');
-app.use((req, res, next) => {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No autorizado' });
-  try {
-    req.user = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: 'Token inválido o expirado' });
-  }
-});
+// JWT middleware — protege todas las rutas siguientes. Además de la firma, confirma
+// que el usuario siga activo y toma su rol actual (ver middleware/authJwt.js).
+app.use(require('./middleware/authJwt').requireAuth);
 
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/locales', require('./routes/locales'));

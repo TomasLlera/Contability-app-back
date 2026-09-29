@@ -248,6 +248,9 @@ const User = mongoose.model('User', new mongoose.Schema({
   // (no usuarios) · viewer → solo lectura.
   role: { type: String, enum: ['superadmin', 'admin', 'viewer'], default: 'viewer' },
   activo: { type: Boolean, default: true },
+  // Versión de sesión: viaja en el token (`tv`) y se incrementa al cambiar la
+  // contraseña, lo que invalida todos los tokens emitidos antes.
+  token_version: { type: Number, default: 0 },
   created_at: String,
 }));
 

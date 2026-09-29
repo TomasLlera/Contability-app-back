@@ -3,7 +3,7 @@ const request = require('supertest');
 const jwt = require('jsonwebtoken');
 const XLSX = require('xlsx');
 const app = require('../server');
-const { IvaCompra, IvaVenta, IvaConfig } = require('../models');
+const { IvaCompra, IvaVenta, IvaConfig, User } = require('../models');
 
 setupTestDb();
 
@@ -11,6 +11,14 @@ setupTestDb();
 // del login, que se satura al hacer muchos logins en una misma suite.
 const adminToken = jwt.sign({ usuario: 'admin', role: 'admin', userId: 1 }, process.env.JWT_SECRET);
 const viewerToken = jwt.sign({ usuario: 'viewer', role: 'viewer', userId: 2 }, process.env.JWT_SECRET);
+
+// El middleware JWT confirma que el usuario del token exista y esté activo.
+beforeEach(async () => {
+  await User.create([
+    { _id: 1, usuario: 'admin', role: 'admin', activo: true },
+    { _id: 2, usuario: 'viewer', role: 'viewer', activo: true },
+  ]);
+});
 
 const HEADERS = ['Fecha', 'Tipo', 'Documento', 'Nro Doc Emisor', 'Razon Social', 'IVA 21', 'Neto Grav. 21%', 'Neto Gravado', 'Otros Atributos', 'Total IVA', 'Imp. Total'];
 

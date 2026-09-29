@@ -1,17 +1,5 @@
-const jwt = require('jsonwebtoken');
+const { requireRole } = require('./authJwt');
 
-// Requiere rol admin O superadmin (superadmin es superconjunto de admin).
-module.exports = function requireAdmin(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No autorizado' });
-  try {
-    const decoded = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
-    if (decoded.role !== 'admin' && decoded.role !== 'superadmin') {
-      return res.status(403).json({ error: 'Se requiere rol administrador' });
-    }
-    req.user = req.user || decoded;
-    next();
-  } catch {
-    res.status(401).json({ error: 'Token inválido o expirado' });
-  }
-};
+// Requiere rol admin O superadmin (superadmin es superconjunto de admin). El rol es
+// el VIGENTE en la base, no el que quedó grabado en el token.
+module.exports = requireRole(['admin', 'superadmin'], 'Se requiere rol administrador');

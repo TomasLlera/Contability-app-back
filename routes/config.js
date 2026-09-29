@@ -9,6 +9,9 @@ async function sendVencimientosEmail(to, vencimientos) {
   const resend = new Resend(process.env.RESEND_API_KEY);
 
   const fmt = (n) => new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS', maximumFractionDigits: 0 }).format(n ?? 0);
+  // Los nombres de subrubro/rubro los carga el usuario: se escapan antes de meterlos
+  // en el HTML del email.
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
   const rows = vencimientos.map(v => {
     const estado = v.dias_restantes < 0
@@ -18,10 +21,10 @@ async function sendVencimientosEmail(to, vencimientos) {
         : `<span style="color:#d97706">Vence en ${v.dias_restantes} día${v.dias_restantes !== 1 ? 's' : ''}</span>`;
     return `
       <tr style="border-bottom:1px solid #e2e8f0">
-        <td style="padding:10px 12px">${v.subrubro?.nombre || '-'}</td>
-        <td style="padding:10px 12px;color:#64748b">${v.rubro?.nombre || '-'}</td>
+        <td style="padding:10px 12px">${esc(v.subrubro?.nombre || '-')}</td>
+        <td style="padding:10px 12px;color:#64748b">${esc(v.rubro?.nombre || '-')}</td>
         <td style="padding:10px 12px;font-weight:600">${fmt(v.monto)}</td>
-        <td style="padding:10px 12px">${v.fecha_vencimiento}</td>
+        <td style="padding:10px 12px">${esc(v.fecha_vencimiento)}</td>
         <td style="padding:10px 12px">${estado}</td>
       </tr>`;
   }).join('');

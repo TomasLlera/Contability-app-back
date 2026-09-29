@@ -5,6 +5,9 @@ const { User, Counter } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
 const requireSuperAdmin = require('../middleware/requireSuperAdmin');
 const { audit } = require('../middleware/audit');
+// Cambiar rol/estado, contraseña o borrar invalida la caché de sesiones: el cambio
+// rige desde la próxima request de ese usuario, no cuando venza su token.
+const { invalidarUsuario } = require('../middleware/authJwt');
 
 const ROLES = ['superadmin', 'admin', 'viewer'];
 
@@ -62,6 +65,7 @@ router.put('/:id', requireSuperAdmin, audit('user'), async (req, res, next) => {
 
     if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
     await User.findByIdAndUpdate(id, updates);
+    invalidarUsuario(id);
     const updated = await User.findById(id, { password_hash: 0 }).lean();
     res.json({ ...updated, id: updated._id });
   } catch (err) { next(err); }
@@ -78,6 +82,7 @@ router.delete('/:id', requireSuperAdmin, audit('user'), async (req, res, next) =
       if (restantes === 0) return res.status(400).json({ error: 'No podés eliminar el único Super Administrador' });
     }
     await User.findByIdAndDelete(id);
+    invalidarUsuario(id);
     res.json({ ok: true });
   } catch (err) { next(err); }
 });
@@ -88,7 +93,9 @@ router.put('/:id/password', requireSuperAdmin, audit('user_password'), async (re
     const { password } = req.body;
     if (!password || password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
     const hash = await bcrypt.hash(password, 10);
-    await User.findByIdAndUpdate(Number(req.params.id), { password_hash: hash });
+    // Nueva versión de sesión: los tokens emitidos con la contraseña vieja dejan de valer.
+    await User.findByIdAndUpdate(Number(req.params.id), { password_hash: hash, $inc: { token_version: 1 } });
+    invalidarUsuario(req.params.id);
     res.json({ ok: true });
   } catch (err) { next(err); }
 });
