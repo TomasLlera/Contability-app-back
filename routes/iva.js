@@ -6,7 +6,8 @@ const PDFDocument = require('pdfkit');
 const { IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, Counter, Movimiento } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
-const upload = multer({ storage: multer.memoryStorage() });
+// Límite de 10 MB: el archivo se procesa en memoria (antes no había tope).
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const nowTs = () => new Date().toISOString();
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;

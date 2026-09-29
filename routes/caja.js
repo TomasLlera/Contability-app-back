@@ -7,7 +7,7 @@ const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const { asyncHandler } = require('../middleware/errorHandler');
 const logger = require('../logger');
-const { hoyLocal, sumarDias } = require('../utils/tz');
+const { hoyLocal, sumarDias, esFechaValida } = require('../utils/tz');
 
 const now = () => new Date().toISOString();
 
@@ -17,11 +17,6 @@ function withId(doc) {
   return { ...o, id: o._id };
 }
 function withIds(docs) { return docs.map(withId); }
-
-// 'YYYY-MM-DD' que además es un día real del calendario (descarta 2026-02-30).
-const esFechaValida = (f) =>
-  typeof f === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(f) &&
-  new Date(`${f}T00:00:00Z`).toISOString().slice(0, 10) === f;
 
 // Ventana mínima de "próximos vencimientos". La Caja de hoy los muestra aparte para
 // poder pagarlos por adelantado sin navegar a su fecha (confirmar en un día futuro
@@ -35,6 +30,24 @@ const diasVentana = (cfg) => Math.max(Number(cfg?.dias_anticipacion_caja ?? 3) |
 // fecha: los pendientes manuales anteriores quedan como estaban para no alterar el
 // saldo de caja de hoy.
 const ARRASTRE_MANUAL_DESDE = process.env.CAJA_ARRASTRE_MANUAL_DESDE || '2026-09-29';
+
+const TIPOS_CAJA = ['saldo_inicial', 'saldo_cuenta', 'ingreso_extra', 'empleado', 'gasto'];
+
+// Validación de los campos de un ítem de Caja (alta y edición; los ausentes no se
+// validan). Devuelve el mensaje de error o null. Antes un monto negativo o una fecha
+// imposible se guardaban tal cual, y un monto no numérico daba 500.
+function validarCamposCaja({ fecha, tipo, monto, metodo }, tipoActual) {
+  if (fecha !== undefined && !esFechaValida(fecha)) return 'Fecha inválida';
+  if (tipo !== undefined && !TIPOS_CAJA.includes(tipo)) return `Tipo inválido: ${tipo}`;
+  if (monto !== undefined) {
+    const n = Number(monto);
+    if (!Number.isFinite(n)) return 'El monto debe ser un número';
+    // El saldo en cuenta puede ser 0 o negativo (cuenta en descubierto); el resto no.
+    if ((tipo ?? tipoActual) !== 'saldo_cuenta' && n <= 0) return 'El monto debe ser mayor a 0';
+  }
+  if (metodo !== undefined && metodo !== null && !['efectivo', 'transferencia'].includes(metodo)) return `Método inválido: ${metodo}`;
+  return null;
+}
 
 // Campos que necesitan el cálculo de saldos y el auto-sync. Las lecturas masivas de
 // movimientos traían además campos_extra, idempotency_key, percepciones, etc.:
@@ -586,6 +599,8 @@ router.get('/rango', asyncHandler(async (req, res) => {
 router.post('/', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
   const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial, movimiento_id, confirmado, idempotency_key } = req.body;
   if (!fecha || !tipo || !concepto || !monto) return res.status(400).json({ error: 'Faltan campos' });
+  const errorCampos = validarCamposCaja({ fecha, tipo, monto, metodo });
+  if (errorCampos) return res.status(400).json({ error: errorCampos });
   // Guarda de idempotencia: una misma alta reintentada (doble clic / reenvío)
   // devuelve la entrada ya creada en lugar de duplicarla.
   if (idempotency_key) {
@@ -928,7 +943,8 @@ router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) =>
   if (conFactura && cambiaTipo) {
     return res.status(400).json({ error: 'No se puede cambiar el tipo de un ítem vinculado a una factura' });
   }
-  if (fecha !== undefined && !esFechaValida(fecha)) return res.status(400).json({ error: 'Fecha inválida' });
+  const errorCampos = validarCamposCaja({ fecha, tipo, monto, metodo }, actual.tipo);
+  if (errorCampos) return res.status(400).json({ error: errorCampos });
 
   const upd = {};
   if (fecha !== undefined) upd.fecha = fecha;

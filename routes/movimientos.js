@@ -3,7 +3,8 @@ const router = express.Router();
 const db = require('../db');
 const XLSX = require('xlsx');
 const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
+// Límite de 10 MB: el archivo se procesa en memoria (antes no había tope).
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const { asyncHandler } = require('../middleware/errorHandler');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
@@ -242,9 +243,11 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
         const fecha_vencimiento = parseDate(pickCol(row, effVenc));
         const pago = parseMonto(pickCol(row, effPago)) || 0;
 
+        // Un importe negativo en la columna de montos es una nota de crédito: antes
+        // se tomaba el valor absoluto y entraba como una factura más.
         const montos = effMonto
-          .map(col => ({ col, monto: parseMonto(row[col]) }))
-          .filter(({ monto }) => monto !== null && monto > 0);
+          .map(col => ({ col, monto: parseMontoConSigno(row[col]) }))
+          .filter(({ monto }) => monto !== null && monto !== 0);
 
         const campos_extra = {};
         for (const { colName, campoNombre } of campoCols) {
@@ -274,13 +277,25 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
         const nroFactura = extraerNroFactura(campos_extra);
         if (montos.length > 0) {
           for (const { monto } of montos) {
+            if (monto < 0) {
+              // Nota de crédito: se imputa como cualquier NC no vinculada (FIFO).
+              const nc = Math.abs(monto);
+              if (mode === 'skip_duplicates' && fecha && pagosExistentes.has(`${fecha}|${nc}`)) { duplicates++; continue; }
+              allMovsToInsert.push({ subrubro_id: subrubro._id, monto: 0, pago: nc, fecha, fecha_vencimiento: null, campos_extra, tipo: 'nota_credito', documento: null, facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
+              if (fecha) pagosExistentes.add(`${fecha}|${nc}`);
+              created++;
+              continue;
+            }
             if (mode === 'skip_duplicates') {
               const isDup = nroFactura
                 ? nrosExistentes.has(nroFactura)
                 : (fecha ? fechaMontoExistentes.has(`${fecha}|${monto}`) : false);
               if (isDup) { duplicates++; continue; }
             }
-            allMovsToInsert.push({ subrubro_id: subrubro._id, monto, pago: 0, fecha, fecha_vencimiento: fecha_vencimiento || null, campos_extra, tipo: 'factura', documento, facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
+            // Sin columna de vencimiento, se calcula con la regla del subrubro, igual
+            // que en el alta manual (antes quedaba sin vencimiento y no llegaba a Caja).
+            const venc = fecha_vencimiento || (fecha ? db.calcularVencimientoSub(fecha, subrubro) : null) || null;
+            allMovsToInsert.push({ subrubro_id: subrubro._id, monto, pago: 0, fecha, fecha_vencimiento: venc, campos_extra, tipo: 'factura', documento, facturas_vinculadas_ids: [], pagado: false, concepto: '', _ajuste_pago_id: null });
             if (nroFactura) nrosExistentes.add(nroFactura);
             else if (fecha) fechaMontoExistentes.add(`${fecha}|${monto}`);
             created++;
@@ -497,12 +512,22 @@ function corregirPicos(fechas) {
   return res;
 }
 
-function parseMonto(val) {
+// Importe con signo, en formato de número de Excel o texto es-AR ("$ 1.234,56",
+// "-500", "(500)" contable). null si no es un número.
+function parseMontoConSigno(val) {
   if (val === null || val === undefined) return null;
-  if (typeof val === 'number') return Math.abs(val);
-  const str = String(val).replace(/[$\s]/g, '');
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  let str = String(val).replace(/[$\s]/g, '');
+  let signo = 1;
+  if (/^\(.*\)$/.test(str)) { signo = -1; str = str.slice(1, -1); }
   const n = parseFloat(str.replace(/\./g, '').replace(',', '.'));
-  return isNaN(n) ? null : Math.abs(n);
+  return isNaN(n) ? null : signo * n;
+}
+
+// Importe en valor absoluto (columna de pagos: el signo no cambia el sentido).
+function parseMonto(val) {
+  const n = parseMontoConSigno(val);
+  return n === null ? null : Math.abs(n);
 }
 
 module.exports = router;

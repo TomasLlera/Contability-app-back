@@ -1,6 +1,39 @@
 const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento } = require('./models');
 const logger = require('./logger');
-const { hoyLocal } = require('./utils/tz');
+const { hoyLocal, esFechaValida } = require('./utils/tz');
+
+// Error de datos de entrada: el errorHandler lo responde como 400 con el mensaje.
+// Antes estas validaciones tiraban un Error común y salían como 500.
+function errorValidacion(mensaje) {
+  const e = new Error(mensaje);
+  e.statusCode = 400;
+  return e;
+}
+
+function errorNoEncontrado(mensaje) {
+  const e = new Error(mensaje);
+  e.statusCode = 404;
+  return e;
+}
+
+const TIPOS_MOVIMIENTO = ['factura', 'pago', 'nota_credito'];
+
+// Validaciones comunes de un movimiento en el borde (alta y edición).
+function validarMovimiento({ tipo, fecha, fecha_vencimiento, monto, pago }) {
+  if (tipo != null && tipo !== '' && !TIPOS_MOVIMIENTO.includes(tipo)) {
+    throw errorValidacion(`Tipo de movimiento inválido: ${tipo}`);
+  }
+  if (fecha != null && fecha !== '' && !esFechaValida(fecha)) throw errorValidacion(`Fecha inválida: ${fecha}`);
+  if (fecha_vencimiento != null && fecha_vencimiento !== '' && !esFechaValida(fecha_vencimiento)) {
+    throw errorValidacion(`Fecha de vencimiento inválida: ${fecha_vencimiento}`);
+  }
+  for (const [nombre, v] of [['monto', monto], ['pago', pago]]) {
+    if (v == null || v === '') continue;
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw errorValidacion(`El ${nombre} debe ser un número`);
+    if (n < 0) throw errorValidacion(`El ${nombre} no puede ser negativo`);
+  }
+}
 
 // Busca un movimiento ya creado con esta idempotency_key. Se usa como guarda de
 // duplicados: si la misma alta se reintenta (doble clic, reenvío de red, doble
@@ -40,7 +73,7 @@ function extraerNroFactura(campos_extra) {
 }
 
 function validarFecha(fecha) {
-  if (fecha && fecha > hoy()) throw new Error(`La fecha ${fecha} no puede ser posterior a hoy`);
+  if (fecha && fecha > hoy()) throw errorValidacion(`La fecha ${fecha} no puede ser posterior a hoy`);
 }
 
 // Normaliza el método de pago a 'efectivo' | 'transferencia' | null.
@@ -48,7 +81,7 @@ function normalizarMetodoPago(v) {
   if (v === null || v === undefined || v === '') return null;
   const s = String(v).trim().toLowerCase();
   if (s === 'efectivo' || s === 'transferencia') return s;
-  throw new Error(`metodo_pago inválido: ${v}`);
+  throw errorValidacion(`metodo_pago inválido: ${v}`);
 }
 
 // Dada una fecha 'YYYY-MM-DD' y un plazo en días (N), devuelve la fecha + N días.
@@ -143,6 +176,11 @@ async function recomputarVencimientosSubrubro(subId) {
 
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;
 const withIds = arr => arr.map(withId);
+
+// Texto del usuario usado dentro de una expresión regular: se escapa. Sin esto,
+// "Frutas (A)" no coincidía consigo mismo, "*" rompía con 500 y un patrón como
+// "(a+)+$" en la búsqueda forzaba backtracking sobre toda la colección.
+const escaparRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const r2 = (n) => Math.round((n || 0) * 100) / 100;
 
@@ -495,8 +533,8 @@ const db = {
     return withIds(await Rubro.find(filter).sort({ nombre: 1 }).lean());
   },
   async createRubro(nombre, localId) {
-    const existing = await Rubro.findOne({ local_id: Number(localId), nombre: { $regex: new RegExp(`^${nombre}$`, 'i') } });
-    if (existing) throw new Error('El rubro ya existe en este local');
+    const existing = await Rubro.findOne({ local_id: Number(localId), nombre: { $regex: new RegExp(`^${escaparRegex(String(nombre).trim())}$`, 'i') } });
+    if (existing) throw errorValidacion('El rubro ya existe en este local');
     const id = await Counter.next('rubros');
     return withId((await Rubro.create({ _id: id, nombre, local_id: Number(localId), created_at: now() })).toObject());
   },
@@ -580,29 +618,29 @@ const db = {
     if (extra.notas !== undefined) doc.notas = String(extra.notas || '').trim();
     if (extra.dia_vencimiento !== undefined && extra.dia_vencimiento !== null && extra.dia_vencimiento !== '') {
       const d = Number(extra.dia_vencimiento);
-      if (!Number.isInteger(d) || d < 1 || d > 365) throw new Error('dia_vencimiento debe ser un entero entre 1 y 365');
+      if (!Number.isInteger(d) || d < 1 || d > 365) throw errorValidacion('dia_vencimiento debe ser un entero entre 1 y 365');
       doc.dia_vencimiento = d;
     }
     if (extra.modo_vencimiento !== undefined && extra.modo_vencimiento !== null && extra.modo_vencimiento !== '') {
-      if (!['dias', 'dia_semana', 'dia_mes'].includes(extra.modo_vencimiento)) throw new Error("modo_vencimiento debe ser 'dias', 'dia_semana' o 'dia_mes'");
+      if (!['dias', 'dia_semana', 'dia_mes'].includes(extra.modo_vencimiento)) throw errorValidacion("modo_vencimiento debe ser 'dias', 'dia_semana' o 'dia_mes'");
       doc.modo_vencimiento = extra.modo_vencimiento;
     }
     if (extra.dia_semana_vencimiento !== undefined && extra.dia_semana_vencimiento !== null && extra.dia_semana_vencimiento !== '') {
       const w = Number(extra.dia_semana_vencimiento);
-      if (!Number.isInteger(w) || w < 0 || w > 6) throw new Error('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
+      if (!Number.isInteger(w) || w < 0 || w > 6) throw errorValidacion('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
       doc.dia_semana_vencimiento = w;
     }
     if (extra.dia_mes_vencimiento !== undefined && extra.dia_mes_vencimiento !== null && extra.dia_mes_vencimiento !== '') {
       const dm = Number(extra.dia_mes_vencimiento);
-      if (!Number.isInteger(dm) || dm < 1 || dm > 31) throw new Error('dia_mes_vencimiento debe ser un entero entre 1 y 31');
+      if (!Number.isInteger(dm) || dm < 1 || dm > 31) throw errorValidacion('dia_mes_vencimiento debe ser un entero entre 1 y 31');
       doc.dia_mes_vencimiento = dm;
     }
     if (extra.metodo_pago_default !== undefined && extra.metodo_pago_default !== null && extra.metodo_pago_default !== '') {
-      if (!['efectivo', 'transferencia', 'ambas'].includes(extra.metodo_pago_default)) throw new Error("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
+      if (!['efectivo', 'transferencia', 'ambas'].includes(extra.metodo_pago_default)) throw errorValidacion("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
       doc.metodo_pago_default = extra.metodo_pago_default;
     }
     if (extra.tipo_subrubro !== undefined && extra.tipo_subrubro !== null && extra.tipo_subrubro !== '') {
-      if (!['factura', 'deuda'].includes(extra.tipo_subrubro)) throw new Error("tipo_subrubro debe ser 'factura' o 'deuda'");
+      if (!['factura', 'deuda'].includes(extra.tipo_subrubro)) throw errorValidacion("tipo_subrubro debe ser 'factura' o 'deuda'");
       doc.tipo_subrubro = extra.tipo_subrubro;
     }
     // El descuento por pago no aplica a las deudas a cobrar: se fuerza false.
@@ -626,13 +664,13 @@ const db = {
         upd.dia_vencimiento = null;
       } else {
         const d = Number(fields.dia_vencimiento);
-        if (!Number.isInteger(d) || d < 1 || d > 365) throw new Error('dia_vencimiento debe ser un entero entre 1 y 365');
+        if (!Number.isInteger(d) || d < 1 || d > 365) throw errorValidacion('dia_vencimiento debe ser un entero entre 1 y 365');
         upd.dia_vencimiento = d;
       }
     }
     if (fields.modo_vencimiento !== undefined) {
       const m = fields.modo_vencimiento || 'dias';
-      if (!['dias', 'dia_semana', 'dia_mes'].includes(m)) throw new Error("modo_vencimiento debe ser 'dias', 'dia_semana' o 'dia_mes'");
+      if (!['dias', 'dia_semana', 'dia_mes'].includes(m)) throw errorValidacion("modo_vencimiento debe ser 'dias', 'dia_semana' o 'dia_mes'");
       upd.modo_vencimiento = m;
     }
     if (fields.dia_semana_vencimiento !== undefined) {
@@ -640,7 +678,7 @@ const db = {
         upd.dia_semana_vencimiento = null;
       } else {
         const w = Number(fields.dia_semana_vencimiento);
-        if (!Number.isInteger(w) || w < 0 || w > 6) throw new Error('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
+        if (!Number.isInteger(w) || w < 0 || w > 6) throw errorValidacion('dia_semana_vencimiento debe ser un entero entre 0 (domingo) y 6 (sábado)');
         upd.dia_semana_vencimiento = w;
       }
     }
@@ -649,18 +687,18 @@ const db = {
         upd.dia_mes_vencimiento = null;
       } else {
         const dm = Number(fields.dia_mes_vencimiento);
-        if (!Number.isInteger(dm) || dm < 1 || dm > 31) throw new Error('dia_mes_vencimiento debe ser un entero entre 1 y 31');
+        if (!Number.isInteger(dm) || dm < 1 || dm > 31) throw errorValidacion('dia_mes_vencimiento debe ser un entero entre 1 y 31');
         upd.dia_mes_vencimiento = dm;
       }
     }
     if (fields.metodo_pago_default !== undefined) {
       const mp = fields.metodo_pago_default || 'ambas';
-      if (!['efectivo', 'transferencia', 'ambas'].includes(mp)) throw new Error("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
+      if (!['efectivo', 'transferencia', 'ambas'].includes(mp)) throw errorValidacion("metodo_pago_default debe ser 'efectivo', 'transferencia' o 'ambas'");
       upd.metodo_pago_default = mp;
     }
     if (fields.tipo_subrubro !== undefined) {
       const ts = fields.tipo_subrubro || 'factura';
-      if (!['factura', 'deuda'].includes(ts)) throw new Error("tipo_subrubro debe ser 'factura' o 'deuda'");
+      if (!['factura', 'deuda'].includes(ts)) throw errorValidacion("tipo_subrubro debe ser 'factura' o 'deuda'");
       upd.tipo_subrubro = ts;
     }
     if (fields.aplica_descuento !== undefined) upd.aplica_descuento = Boolean(fields.aplica_descuento);
@@ -767,7 +805,7 @@ const db = {
 
   async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [], percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
-    if (!sub) throw new Error('Subrubro no encontrado');
+    if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
     // Guarda de idempotencia: si ya existe un movimiento con esta clave, es un
     // reintento de la misma alta → devolver el existente sin crear un duplicado.
     if (idempotency_key) {
@@ -781,7 +819,10 @@ const db = {
     // que puede ser futuro; en ese caso no aplicamos la validación de "no posterior
     // a hoy". El resto de los movimientos sí la conservan.
     if (caja_mov_id == null) validarFecha(fecha);
+    validarMovimiento({ tipo, fecha, fecha_vencimiento, monto, pago });
     const tipoFinal = tipo || (Number(monto) > 0 ? 'factura' : 'pago');
+    if (tipoFinal === 'factura' && !(Number(monto) > 0)) throw errorValidacion('El monto de la factura debe ser mayor a 0');
+    if (tipoFinal !== 'factura' && !(Number(pago) > 0)) throw errorValidacion('El monto del pago o la nota de crédito debe ser mayor a 0');
     // Auto-vencimiento: si es una factura sin fecha_vencimiento y el subrubro tiene
     // configurado un criterio de vencimiento, calcularlo según el modo activo
     // ('dias' = N días desde la emisión / 'dia_semana' = próximo día fijo de la semana).
@@ -872,9 +913,10 @@ const db = {
 
   async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, documento, percepcion_iva, ingresos_brutos }) {
     const mov = await Movimiento.findById(Number(id));
-    if (!mov) throw new Error('Movimiento no encontrado');
+    if (!mov) throw errorNoEncontrado('Movimiento no encontrado');
     // Estado previo: para saber si hay que limpiar el gasto de caja de un remito
     // que dejó de serlo (o quedó como pago/NC), o el espejo de Caja de un pago.
+    validarMovimiento({ tipo, fecha, fecha_vencimiento, monto, pago });
     const eraRemito = mov.tipo === 'factura' && mov.documento === 'remito';
     const eraPago = mov.tipo === 'pago';
     const veniaDeCaja = mov.caja_mov_id != null;
@@ -1004,7 +1046,7 @@ const db = {
   async clearMovimientos(subrubroId) {
     const iid = Number(subrubroId);
     const sub = await Subrubro.findById(iid);
-    if (!sub) throw new Error('Subrubro no encontrado');
+    if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
     const { deletedCount } = await Movimiento.deleteMany({ subrubro_id: iid });
     return { deleted: deletedCount };
   },
@@ -1023,7 +1065,7 @@ const db = {
 
   async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null, percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
-    if (!sub) throw new Error('Subrubro no encontrado');
+    if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
     // Guarda de idempotencia (mismo criterio que createMovimiento).
     if (idempotency_key) {
       const existente = await findMovByIdemKey(idempotency_key);
@@ -1032,6 +1074,9 @@ const db = {
         return withId(existente);
       }
     }
+    if (!['pago', 'nota_credito'].includes(tipo)) throw errorValidacion(`Tipo inválido para un pago vinculado: ${tipo}`);
+    validarMovimiento({ fecha, pago: monto_pago });
+    if (!(Number(monto_pago) > 0)) throw errorValidacion('El monto debe ser mayor a 0');
     const idsNum = facturas_vinculadas_ids.map(Number);
     const metodo = tipo === 'pago' ? normalizarMetodoPago(metodo_pago) : null;
 
@@ -1091,7 +1136,9 @@ const db = {
 
   async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago, percepcion_iva, ingresos_brutos }) {
     const mov = await Movimiento.findById(Number(movId));
-    if (!mov) throw new Error('Movimiento no encontrado');
+    if (!mov) throw errorNoEncontrado('Movimiento no encontrado');
+    validarMovimiento({ fecha, pago: monto_pago });
+    if (!(Number(monto_pago) > 0)) throw errorValidacion('El monto debe ser mayor a 0');
     await Movimiento.deleteMany({ _ajuste_pago_id: Number(movId) });
 
     const idsNum = facturas_vinculadas_ids.map(Number);
@@ -1256,7 +1303,7 @@ const db = {
   // --- IMPORT BATCH ---
   async findOrCreateSubrubroForImport(rubroId, nombre) {
     const n = nombre.trim();
-    let sub = await Subrubro.findOne({ rubro_id: Number(rubroId), nombre: { $regex: new RegExp(`^${n}$`, 'i') } }).lean();
+    let sub = await Subrubro.findOne({ rubro_id: Number(rubroId), nombre: { $regex: new RegExp(`^${escaparRegex(n)}$`, 'i') } }).lean();
     if (!sub) {
       const id = await Counter.next('subrubros');
       sub = await Subrubro.create({ _id: id, rubro_id: Number(rubroId), nombre: n, monto_base: 0, created_at: now() });
@@ -1291,7 +1338,7 @@ const db = {
   async searchMovimientos(q, limit = 25) {
     const query = String(q).trim();
     if (query.length < 2) return [];
-    const re = { $regex: query, $options: 'i' };
+    const re = { $regex: escaparRegex(query), $options: 'i' };
     const matchingSubs = await Subrubro.find({ nombre: re }, { _id: 1 }).lean();
     const matchingSubIds = matchingSubs.map(s => s._id);
     const camposExtra = [

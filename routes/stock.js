@@ -5,7 +5,8 @@ const XLSX = require('xlsx');
 const { Producto, MovimientoStock, Counter, Subrubro, Rubro } = require('../models');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
-const upload = multer({ storage: multer.memoryStorage() });
+// Límite de 10 MB: el archivo se procesa en memoria (antes no había tope).
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const { hoyLocal } = require('../utils/tz');
 const now = () => hoyLocal();

@@ -44,4 +44,9 @@ const restarDias = (fecha, n) => sumarDias(fecha, -n);
 // Día de la semana (0-6) de una fecha 'YYYY-MM-DD'.
 const diaSemanaDeFecha = (fecha) => new Date(`${fecha}T00:00:00Z`).getUTCDay();
 
-module.exports = { TZ, hoyLocal, diaSemanaLocal, minutosDelDiaLocal, sumarDias, restarDias, diaSemanaDeFecha };
+// 'YYYY-MM-DD' que además es un día real del calendario (descarta 2026-02-30).
+const esFechaValida = (f) =>
+  typeof f === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(f) &&
+  new Date(`${f}T00:00:00Z`).toISOString().slice(0, 10) === f;
+
+module.exports = { TZ, hoyLocal, diaSemanaLocal, minutosDelDiaLocal, sumarDias, restarDias, diaSemanaDeFecha, esFechaValida };

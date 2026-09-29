@@ -39,6 +39,31 @@ const SECTORES = [
   { model: 'Counter', file: 'counters' },   // preserva los auto-increment
 ];
 
+// Contador (Counter._id) → modelo cuyos _id numera. Tras importar, cada contador se
+// recalcula con el _id máximo de su colección.
+const CONTADORES = {
+  locales: 'Local', rubros: 'Rubro', subrubros: 'Subrubro', movimientos: 'Movimiento',
+  campos_rubro: 'Campo', categorias_movimiento: 'Categoria', caja: 'CajaMovimiento',
+  productos: 'Producto', movimientos_stock: 'MovimientoStock', iva_compras: 'IvaCompra',
+  iva_ventas: 'IvaVenta', iva_creditos: 'IvaCredito', ventas_sistema: 'VentaSistema',
+  tarjetas: 'TarjetaTransaccion', recordatorios: 'Recordatorio', users: 'User', audit: 'Audit',
+};
+
+// Deja cada contador en max(_id) de su colección (y nunca por debajo de lo que ya
+// tenía). Antes se restauraba el valor del backup: en modo "merge" un backup viejo
+// bajaba los contadores por debajo de los _id existentes y las altas siguientes
+// chocaban con E11000; con `users` y `audit` pasaba siempre, porque esas colecciones
+// no se restauran pero su contador sí (y writeAudit tragaba el error en silencio).
+async function recalcularContadores(seqAntes) {
+  for (const [nombre, modelo] of Object.entries(CONTADORES)) {
+    const Model = models[modelo];
+    if (!Model) continue;
+    const max = (await Model.findOne({ _id: { $type: 'number' } }, { _id: 1 }).sort({ _id: -1 }).lean())?._id || 0;
+    const seq = Math.max(max, seqAntes.get(nombre) || 0);
+    await models.Counter.updateOne({ _id: nombre }, { $set: { seq } }, { upsert: true });
+  }
+}
+
 // Colecciones que la importación NO toca por seguridad:
 // - User: el backup no incluye contraseñas; reimportarlo dejaría a todos sin poder entrar.
 // - Audit: es un registro histórico; reinsertarlo duplicaría o falsearía la traza.
@@ -152,9 +177,13 @@ router.post('/import', requireSuperAdmin, upload.single('file'), asyncHandler(as
   const mode = req.body.mode === 'replace' ? 'replace' : 'merge';
   const resultado = {};
   const saltados = [];
+  // Valores actuales de los contadores, antes de que el import los pise.
+  const seqAntes = new Map((await models.Counter.find({}).lean()).map(c => [c._id, c.seq]));
 
   for (const model of presentes) {
     if (NO_IMPORTAR.has(model)) { saltados.push(model); continue; }
+    // Los contadores no se copian del backup: se recalculan al final.
+    if (model === 'Counter') { saltados.push(model); continue; }
     const Model = models[model];
     const docs = Array.isArray(data[model]) ? data[model] : [];
     try {
@@ -176,6 +205,8 @@ router.post('/import', requireSuperAdmin, upload.single('file'), asyncHandler(as
       resultado[model] = `${docs.length} (con avisos: ${err.writeErrors?.length || 1})`;
     }
   }
+
+  await recalcularContadores(seqAntes);
 
   await writeAudit({
     usuario: req.user?.usuario || 'desconocido',
