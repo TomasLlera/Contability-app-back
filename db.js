@@ -1,5 +1,6 @@
 const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento } = require('./models');
 const logger = require('./logger');
+const { hoyLocal } = require('./utils/tz');
 
 // Busca un movimiento ya creado con esta idempotency_key. Se usa como guarda de
 // duplicados: si la misma alta se reintenta (doble clic, reenvío de red, doble
@@ -13,8 +14,10 @@ function now() {
   return new Date().toLocaleString('sv').replace('T', ' ');
 }
 
+// Día de hoy en la zona del negocio (Argentina), no en UTC: entre las 21 y las 24
+// el UTC ya es el día siguiente.
 function hoy() {
-  return new Date().toISOString().split('T')[0];
+  return hoyLocal();
 }
 
 // Mes anterior a `mes` (YYYY-MM) → YYYY-MM.
@@ -1121,8 +1124,9 @@ const db = {
   //               así no aparecen como "facturas vencidas" en dashboard/alertas/caja).
   //   'deuda'   → deudas a COBRAR próximas a vencer (informativas).
   async getVencimientos(diasAdelante = 30, tipoSubrubro = 'factura') {
-    const hoy = new Date();
-    hoy.setHours(0, 0, 0, 0);
+    // Días calendario entre hoy (Argentina) y el vencimiento, en UTC puro: son
+    // fechas sin hora, así que no hay corrimiento de zona.
+    const hoyMs = Date.parse(`${hoy()}T00:00:00Z`);
     let candidatas = await Movimiento.find({ fecha_vencimiento: { $exists: true, $ne: null }, tipo: 'factura', pagado: { $ne: true } }).lean();
     if (candidatas.length === 0) return [];
 
@@ -1155,8 +1159,7 @@ const db = {
     const rubroMap = Object.fromEntries(rubros.map(r => [r._id, { ...r, id: r._id }]));
     return candidatas
       .map(m => {
-        const venc = new Date(m.fecha_vencimiento + 'T00:00:00');
-        const diasRestantes = Math.ceil((venc - hoy) / (1000 * 60 * 60 * 24));
+        const diasRestantes = Math.round((Date.parse(`${m.fecha_vencimiento}T00:00:00Z`) - hoyMs) / 86400000);
         const sub = subMap[m.subrubro_id];
         const rubro = sub ? rubroMap[sub.rubro_id] : null;
         const saldoCalc = saldosPorSub.get(m.subrubro_id)?.get(m._id);

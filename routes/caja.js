@@ -7,6 +7,7 @@ const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const { asyncHandler } = require('../middleware/errorHandler');
 const logger = require('../logger');
+const { hoyLocal, sumarDias } = require('../utils/tz');
 
 const now = () => new Date().toISOString();
 
@@ -17,11 +18,23 @@ function withId(doc) {
 }
 function withIds(docs) { return docs.map(withId); }
 
-function addDaysToStr(dateStr, n) {
-  const d = new Date(dateStr + 'T00:00:00');
-  d.setDate(d.getDate() + n);
-  return d.toISOString().split('T')[0];
-}
+// 'YYYY-MM-DD' que además es un día real del calendario (descarta 2026-02-30).
+const esFechaValida = (f) =>
+  typeof f === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(f) &&
+  new Date(`${f}T00:00:00Z`).toISOString().slice(0, 10) === f;
+
+// Ventana mínima de "próximos vencimientos". La Caja de hoy los muestra aparte para
+// poder pagarlos por adelantado sin navegar a su fecha (confirmar en un día futuro
+// está bloqueado). Aunque la config tenga 0 días de anticipación, se miran al menos
+// estos días hacia adelante.
+const DIAS_PROXIMOS_MIN = 7;
+const diasVentana = (cfg) => Math.max(Number(cfg?.dias_anticipacion_caja ?? 3) || 0, DIAS_PROXIMOS_MIN);
+
+// Los gastos cargados a mano (sin factura) que quedan sin confirmar se arrastran a
+// los días siguientes igual que los vencimientos, pero solo los creados desde esta
+// fecha: los pendientes manuales anteriores quedan como estaban para no alterar el
+// saldo de caja de hoy.
+const ARRASTRE_MANUAL_DESDE = process.env.CAJA_ARRASTRE_MANUAL_DESDE || '2026-09-29';
 
 // GET /api/caja/config
 router.get('/config', asyncHandler(async (req, res) => {
@@ -49,7 +62,7 @@ router.get('/vencimientos-sync', asyncHandler(async (req, res) => {
   if (rubros_sync.length === 0) return res.json([]);
 
   const dias = cfg?.dias_anticipacion_caja ?? 3;
-  const hasta = addDaysToStr(fecha, dias);
+  const hasta = sumarDias(fecha, dias);
 
   // Los subrubros DEUDA (dinero a cobrar) no generan gastos en la Caja: sus
   // vencimientos se muestran aparte como informativos (GET /movimientos/vencimientos
@@ -218,8 +231,10 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   const rubros_sync = cfg?.rubros_sync || [];
   if (rubros_sync.length === 0) return res.json({ creados: 0, actualizados, eliminados });
 
-  const dias = cfg?.dias_anticipacion_caja ?? 3;
-  const hasta = addDaysToStr(fecha, dias);
+  // Crea también los que vencen dentro de la ventana de "próximos": viven en su
+  // fecha de vencimiento (no se arrastran hacia atrás) y la Caja de hoy los lista
+  // aparte para poder pagarlos por adelantado.
+  const hasta = sumarDias(fecha, diasVentana(cfg));
 
   // Incluye también los subrubros DEUDA: sus vencimientos entran a la Caja como
   // INGRESOS pendientes de cobro (tipo ingreso_extra, confirmado:false) en vez de
@@ -411,7 +426,7 @@ router.get('/descuentos', asyncHandler(async (req, res) => {
 // pagados ni confirmados — siguen pendientes hasta abonarse.
 router.get('/', asyncHandler(async (req, res) => {
   const { fecha } = req.query;
-  if (!fecha) return res.status(400).json({ error: 'fecha requerida' });
+  if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
   const movs = await CajaMovimiento.find({
     $or: [
       { fecha },
@@ -423,7 +438,35 @@ router.get('/', asyncHandler(async (req, res) => {
         confirmado: false,
         movimiento_id: { $ne: null },
       },
+      {
+        // Gasto manual (sin factura) que quedó sin confirmar: también se arrastra,
+        // así no hay que volver a su día para pagarlo. Solo los nuevos (ver
+        // ARRASTRE_MANUAL_DESDE).
+        fecha: { $lt: fecha },
+        tipo: 'gasto',
+        confirmado: false,
+        movimiento_id: null,
+        created_at: { $gte: ARRASTRE_MANUAL_DESDE },
+      },
     ],
+  }).sort({ fecha: 1, _id: 1 }).lean();
+  res.json(await attachDocumento(withIds(movs)));
+}));
+
+// GET /api/caja/proximos?fecha=YYYY-MM-DD
+// Pendientes (gastos por pagar y deudas por cobrar) que vencen DESPUÉS de `fecha`,
+// dentro de la ventana de próximos. Viven en su fecha de vencimiento, así que el
+// GET del día no los trae: la Caja de hoy los muestra en una sección aparte para
+// poder pagarlos por adelantado desde hoy.
+router.get('/proximos', asyncHandler(async (req, res) => {
+  const { fecha } = req.query;
+  if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
+  const cfg = await CajaConfig.findById('main').lean();
+  const hasta = sumarDias(fecha, diasVentana(cfg));
+  const movs = await CajaMovimiento.find({
+    fecha: { $gt: fecha, $lte: hasta },
+    tipo: { $in: ['gasto', 'ingreso_extra'] },
+    confirmado: false,
   }).sort({ fecha: 1, _id: 1 }).lean();
   res.json(await attachDocumento(withIds(movs)));
 }));
@@ -552,7 +595,17 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
   if (item.confirmado === true) return res.status(409).json({ error: 'El movimiento ya está confirmado' });
   if (!item.metodo) return res.status(400).json({ error: 'Definí el método de pago antes de confirmar' });
 
-  const fecha = req.body.fecha || item.fecha;
+  // La fecha del pago la fija el servidor con el día de hoy en Argentina. Antes caía
+  // en la fecha del ítem (su vencimiento) o en la que mandara el cliente, que es el
+  // día que se estaba MIRANDO en la Caja: un pendiente arrastrado se confirmaba
+  // desde mañana y el pago quedaba registrado mañana. Se admite una fecha pasada
+  // (el front pide confirmación antes de mandarla), nunca una futura.
+  const hoy = hoyLocal();
+  const fecha = req.body.fecha || hoy;
+  if (!esFechaValida(fecha)) return res.status(400).json({ error: 'Fecha de pago inválida' });
+  if (fecha > hoy) {
+    return res.status(400).json({ error: `No se puede confirmar un pago en una fecha futura (${fecha}). Hoy es ${hoy}.` });
+  }
   // El bruto es el monto que la Caja muestra hoy; si por un reintento el ítem ya
   // tuviera monto_bruto, ese manda (no se descuenta dos veces sobre el neto).
   const bruto = Number(item.monto_bruto ?? item.monto) || 0;

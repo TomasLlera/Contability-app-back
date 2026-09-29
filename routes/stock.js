@@ -7,7 +7,8 @@ const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
 const upload = multer({ storage: multer.memoryStorage() });
 
-const now = () => new Date().toISOString().split('T')[0];
+const { hoyLocal } = require('../utils/tz');
+const now = () => hoyLocal();
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;
 
 // GET /api/stock/productos

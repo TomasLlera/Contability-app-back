@@ -4,10 +4,18 @@ const { asyncHandler } = require('../middleware/errorHandler');
 const { Movimiento, Subrubro, CajaMovimiento } = require('../models');
 const db = require('../db');
 
+const { hoyLocal } = require('../utils/tz');
+
+// Año, mes (1-12) y día de HOY en Argentina. Con la hora del proceso (UTC en Render)
+// el día 1 entre las 21 y las 24 ya contaba como el mes siguiente.
+function hoyPartes() {
+  const [cy, cm, dd] = hoyLocal().split('-').map(Number);
+  return { cy, cm, dd };
+}
+
 // Mes actual en formato YYYY-MM
 function mesActual() {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  return hoyLocal().slice(0, 7);
 }
 
 // Resumen general: totales del mes actual + deuda acumulada total
@@ -95,10 +103,7 @@ async function aggRango(desde, hasta) {
 // Comparativas de dashboard: quincena (días 1-15) y mes a la fecha vs mes anterior.
 // Alimenta las alertas del dashboard (S3).
 router.get('/comparativa', asyncHandler(async (req, res) => {
-  const now = new Date();
-  const cy = now.getFullYear();
-  const cm = now.getMonth() + 1;          // 1-12
-  const dd = now.getDate();               // día del mes actual
+  const { cy, cm, dd } = hoyPartes();     // cm: 1-12 · dd: día del mes actual
 
   // Mes anterior
   const pm = cm === 1 ? 12 : cm - 1;
@@ -156,10 +161,7 @@ async function resumenCajaRango(desde, hasta) {
 
 // Igual que /comparativa pero con métricas de caja (ingresos/egresos/neto).
 router.get('/comparativa-caja', asyncHandler(async (req, res) => {
-  const now = new Date();
-  const cy = now.getFullYear();
-  const cm = now.getMonth() + 1;
-  const dd = now.getDate();
+  const { cy, cm, dd } = hoyPartes();
   const pm = cm === 1 ? 12 : cm - 1;
   const py = cm === 1 ? cy - 1 : cy;
 

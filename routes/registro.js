@@ -62,7 +62,8 @@ const diasDelMes = (mes) => {
 
 const diaDe = (fecha) => Number(fecha.slice(8, 10));
 
-const hoyStr = () => new Date().toISOString().slice(0, 10);
+const { hoyLocal } = require('../utils/tz');
+const hoyStr = () => hoyLocal();
 
 // Día en el que conviene abrir la carga: el SIGUIENTE al último que ya tiene datos,
 // para retomar donde se dejó en vez de abrir siempre en hoy. Si se carga el 3 y lo

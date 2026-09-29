@@ -7,6 +7,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 const { asyncHandler } = require('../middleware/errorHandler');
 const requireAdmin = require('../middleware/requireAdmin');
 const { audit } = require('../middleware/audit');
+const { hoyLocal } = require('../utils/tz');
 
 router.get('/vencimientos/proximos', asyncHandler(async (req, res) => {
   const dias = Number(req.query.dias) || 30;
@@ -189,7 +190,7 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
       return null;
     };
 
-    const fechaHoy = new Date().toISOString().split('T')[0];
+    const fechaHoy = hoyLocal();
     const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
     const results = { sheets: [], totalCreated: 0, totalSkipped: 0 };
     const allMovsToInsert = [];
@@ -451,7 +452,7 @@ function inferirAniosSheet(rows, dateCols) {
   if (!dateCol) return rows;
 
   const aniosAsignados = new Array(rows.length).fill(null);
-  const anioActual = new Date().getFullYear();
+  const anioActual = Number(hoyLocal().slice(0, 4));
   let ultimoIdx = -1;
   for (let i = parciales.length - 1; i >= 0; i--) { if (parciales[i]) { ultimoIdx = i; break; } }
   if (ultimoIdx === -1) return rows;
@@ -461,7 +462,7 @@ function inferirAniosSheet(rows, dateCols) {
   const ultimoParcial = parciales[ultimoIdx];
   if (ultimoParcial) {
     const tentativa = `${anio}-${String(ultimoParcial.month).padStart(2,'0')}-${String(ultimoParcial.day).padStart(2,'0')}`;
-    if (tentativa > new Date().toISOString().split('T')[0]) anio--;
+    if (tentativa > hoyLocal()) anio--;
   }
   aniosAsignados[ultimoIdx] = anio;
   for (let i = ultimoIdx - 1; i >= 0; i--) {

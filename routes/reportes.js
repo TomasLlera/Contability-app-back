@@ -8,10 +8,8 @@ const {
   agregarDataBar, colorearSigno, zebra, flechaTendencia, COLORS,
 } = require('../utils/excelReport');
 
-const mesActualStr = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-};
+const { hoyLocal } = require('../utils/tz');
+const mesActualStr = () => hoyLocal().slice(0, 7);
 const esMesValido = (m) => /^\d{4}-\d{2}$/.test(m || '');
 
 async function enviarWorkbook(res, wb, filename) {
