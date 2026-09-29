@@ -105,7 +105,8 @@ async function start() {
     // parciales de idempotencia (Movimiento / CajaMovimiento), que son el backstop
     // ante altas concurrentes con la misma idempotency_key.
     try {
-      const { Movimiento, CajaMovimiento } = require('./models');
+      const { Movimiento, CajaMovimiento, migrarIndicesCaja } = require('./models');
+      if (await migrarIndicesCaja()) logger.info('Índice único viejo de caja (movimiento_id_1) reemplazado');
       await Promise.all([Movimiento.createIndexes(), CajaMovimiento.createIndexes()]);
     } catch (err) {
       logger.warn({ err: err.message }, 'No se pudieron crear todos los índices');

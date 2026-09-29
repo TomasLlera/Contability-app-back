@@ -74,22 +74,15 @@ describe('Flujo caja: crear factura → autoSync → confirmar pago', () => {
     await request(app).put(`/api/caja/${gasto.id}`)
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ metodo: 'efectivo' });
-    await request(app).put(`/api/caja/${gasto.id}`)
+    // Confirmar es una sola operación del backend (crea el pago en el subrubro).
+    // Confirmar con un PUT de `confirmado` ya no se permite (desincronizaba Caja y
+    // subrubro).
+    const conf = await request(app).post(`/api/caja/${gasto.id}/confirmar`)
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ confirmado: true, fecha: fechaConfirm });
-
-    const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
-      .set('Authorization', `Bearer ${adminToken}`)
-      .send({
-        tipo: 'pago',
-        pago: gasto.monto,
-        fecha: fechaConfirm,
-        concepto: `Pago caja: ${gasto.concepto}`,
-        metodo_pago: 'efectivo',
-        caja_mov_id: gasto.id,
-      });
-    expect(pago.status).toBe(200);
-    console.log('Pago creado:', { id: pago.body.id, pago: pago.body.pago, fecha: pago.body.fecha, metodo_pago: pago.body.metodo_pago, caja_mov_id: pago.body.caja_mov_id });
+      .send({ fecha: fechaConfirm });
+    expect(conf.status).toBe(200);
+    const pago = { body: await Movimiento.findById(conf.body.pago_mov_id).lean() };
+    console.log('Pago creado:', { id: pago.body._id, pago: pago.body.pago, fecha: pago.body.fecha, metodo_pago: pago.body.metodo_pago, caja_mov_id: pago.body.caja_mov_id });
 
     // 5. Verificar estado final
     const factDespues = await Movimiento.findById(facturaId).lean();

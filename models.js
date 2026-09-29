@@ -173,15 +173,39 @@ cajaSchema.index(
   { idempotency_key: 1 },
   { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }
 );
-// Único parcial: cada factura (movimiento_id) puede generar como mucho UN ítem de
-// caja. Garantiza idempotencia del auto-sync ante llamadas concurrentes (p. ej. el
-// doble disparo de efectos en React dev). Los ítems manuales tienen movimiento_id
-// null y quedan fuera del índice gracias al partialFilterExpression.
+// Una factura (movimiento_id) puede tener varios ítems de caja —uno por cada pago
+// parcial ya confirmado— pero como mucho UN pendiente. El único parcial garantiza
+// la idempotencia del auto-sync ante llamadas concurrentes (p. ej. el doble disparo
+// de efectos en React dev). Los ítems manuales (movimiento_id null) y los
+// confirmados quedan fuera del índice gracias al partialFilterExpression.
+// Reemplaza al viejo único `movimiento_id_1`, que impedía los pagos parciales; la
+// migración que lo borra está en `migrarIndicesCaja` (se corre al iniciar).
 cajaSchema.index(
   { movimiento_id: 1 },
-  { unique: true, partialFilterExpression: { movimiento_id: { $type: 'number' } } }
+  {
+    name: 'movimiento_id_pendiente_unico',
+    unique: true,
+    partialFilterExpression: { movimiento_id: { $type: 'number' }, confirmado: false },
+  }
 );
+cajaSchema.index({ movimiento_id: 1, confirmado: 1 });
+// Espejo de un pago del subrubro / pago generado al confirmar: se busca por
+// pago_mov_id en cada alta, edición y borrado de pagos (antes era un COLLSCAN).
+cajaSchema.index({ pago_mov_id: 1 }, { partialFilterExpression: { pago_mov_id: { $type: 'number' } } });
 const CajaMovimiento = mongoose.model('CajaMovimiento', cajaSchema);
+
+// Migración idempotente: borra el índice único viejo sobre movimiento_id (uno por
+// factura) para que se pueda crear el nuevo (uno PENDIENTE por factura). Sin esto,
+// createIndexes no puede reemplazarlo y los pagos parciales chocan con E11000.
+async function migrarIndicesCaja() {
+  let indices;
+  try { indices = await CajaMovimiento.collection.indexes(); }
+  catch { return false; } // la colección todavía no existe
+  const viejo = indices.find(i => i.name === 'movimiento_id_1' && i.unique);
+  if (!viejo) return false;
+  await CajaMovimiento.collection.dropIndex('movimiento_id_1');
+  return true;
+}
 
 // --- Caja Descarte ---
 // Registra que un vencimiento (movimiento_id) fue descartado por el usuario para
@@ -515,4 +539,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Recordatorio, RecordatorioEvento, Audit };
+module.exports = { migrarIndicesCaja, Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Recordatorio, RecordatorioEvento, Audit };

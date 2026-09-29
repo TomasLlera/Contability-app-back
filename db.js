@@ -335,13 +335,13 @@ async function syncCajaRemito(mov, sub, esRemito) {
     auto_sync: false,
     es_especial: false,
   };
-  // Upsert por movimiento_id (índice único parcial): si el remito ya tenía su gasto
-  // lo actualiza; si no, lo crea reservando un _id nuevo. No se pisa `confirmado` si
-  // el usuario ya lo confirmó a mano (solo se refresca fecha/monto/concepto).
-  const existente = await CajaMovimiento.findOne({ movimiento_id: movId });
+  // Solo se toca el ítem PENDIENTE del remito (a lo sumo uno, por el índice único
+  // parcial). Un ítem ya confirmado es un pago real: nunca se le pisa fecha ni
+  // monto. Si el remito tiene pagos parciales confirmados y le queda saldo, el
+  // pendiente por el resto se crea o actualiza aparte.
+  const existente = await CajaMovimiento.findOne({ movimiento_id: movId, confirmado: false });
   if (existente) {
-    const { confirmado, ...refresh } = set;
-    await CajaMovimiento.updateOne({ _id: existente._id }, { $set: refresh });
+    await CajaMovimiento.updateOne({ _id: existente._id }, { $set: set });
   } else {
     const cajaId = await Counter.next('caja');
     try {
@@ -351,6 +351,60 @@ async function syncCajaRemito(mov, sub, esRemito) {
       if (err.code !== 11000) throw err;
     }
   }
+}
+
+// Saldo pendiente actual de una factura (monto − pagos − NC, con la misma imputación
+// que el resto de la app). null si no existe o no es una factura.
+async function saldoFactura(facturaId) {
+  const fac = await Movimiento.findById(Number(facturaId)).lean();
+  if (!fac || fac.tipo !== 'factura') return null;
+  const movs = await Movimiento.find({ subrubro_id: fac.subrubro_id }).lean();
+  return computeSaldosFacturas(movs).get(fac._id) ?? (Number(fac.monto) || 0);
+}
+
+// Devuelve un ítem de Caja confirmado a pendiente, después de que se borraron su
+// pago y su NC de descuento (revertir en Caja, o borrar el pago desde el subrubro).
+// Es el único lugar que hace esto, para que las dos vías dejen el mismo estado:
+//   • sin descuento, bruto restaurado, sin pago_mov_id / nc_mov_id;
+//   • si está vinculado a una factura, vale su saldo actual y absorbe cualquier otro
+//     pendiente de la misma factura (el resto de un pago parcial): queda uno solo;
+//   • si la factura ya quedó saldada por otros pagos, el ítem sobra y se borra.
+async function reabrirItemCaja(cajaId) {
+  const item = await CajaMovimiento.findById(Number(cajaId)).lean();
+  if (!item) return null;
+  let monto = Number(item.monto_bruto ?? item.monto) || 0;
+  if (item.movimiento_id != null) {
+    const saldo = await saldoFactura(item.movimiento_id);
+    if (saldo != null) {
+      await CajaMovimiento.deleteMany({ movimiento_id: item.movimiento_id, confirmado: false, _id: { $ne: item._id } });
+      if (saldo <= 0.005) {
+        await CajaMovimiento.deleteOne({ _id: item._id });
+        return null;
+      }
+      monto = saldo;
+    }
+  }
+  await CajaMovimiento.updateOne({ _id: item._id }, {
+    $set: {
+      confirmado: false, monto,
+      descuento: 0, descuento_pct: null, monto_bruto: null,
+      pago_mov_id: null, nc_mov_id: null,
+    },
+  });
+  return CajaMovimiento.findById(item._id).lean();
+}
+
+// Un pago que nació en la Caja y se edita desde el subrubro: el ítem de Caja que lo
+// representa toma la misma fecha, monto y método. Antes quedaban distintos (14 casos
+// en producción) porque la sincronización solo iba de Caja a subrubro.
+async function syncItemDePagoCaja(pago) {
+  if (pago.tipo !== 'pago' || pago.caja_mov_id == null) return;
+  const set = { fecha: pago.fecha, monto: Number(pago.pago) || 0 };
+  if (pago.metodo_pago) set.metodo = pago.metodo_pago;
+  await CajaMovimiento.updateOne(
+    { _id: Number(pago.caja_mov_id), pago_mov_id: Number(pago._id), confirmado: true },
+    { $set: set },
+  );
 }
 
 // Espeja en la Caja del Día un pago registrado desde un Subrubro (sincronización
@@ -885,6 +939,8 @@ const db = {
       const subP = await Subrubro.findById(mov.subrubro_id).lean();
       await syncCajaPago(mov, subP, mov.tipo === 'pago');
     }
+    // Pago nacido en la Caja cuyo ítem sigue vivo: el ítem acompaña la edición.
+    if (veniaDeCaja && !cajaHuerfano) await syncItemDePagoCaja(mov);
     return withId(mov.toObject());
   },
 
@@ -895,27 +951,38 @@ const db = {
     if (mov.tipo === 'pago' || mov.tipo === 'nota_credito') {
       await Movimiento.deleteMany({ _ajuste_pago_id: Number(id) });
     }
-    // Sync inverso: si este pago vino de una entrada de caja, desconfirmarla.
-    // No la borramos — el gasto queda registrado en caja pero como pendiente, así el
-    // usuario puede volver a confirmarlo o decidir qué hacer con él.
-    if (mov.caja_mov_id) {
+    // Sync inverso: si este pago vino de una confirmación en Caja, ese ítem vuelve a
+    // pendiente con el mismo criterio que "revertir" (reabrirItemCaja, más abajo,
+    // cuando el pago ya no existe): se borra también la NC de descuento que generó
+    // la confirmación. Antes solo se desconfirmaba: la NC quedaba viva y el ítem con
+    // el descuento viejo, y al reconfirmar se pagaba de más.
+    // Incluye, como defensa, cualquier otro ítem que apunte a este pago aunque el
+    // caja_mov_id del pago haya quedado suelto. Se reabren recién después de borrar el
+    // pago (necesitan el saldo nuevo) y siempre vía reabrirItemCaja, que primero
+    // funde el pendiente del resto de un pago parcial: desconfirmarlos a mano chocaba
+    // con el índice de un solo pendiente por factura.
+    const itemsAReabrir = [];
+    if (mov.tipo === 'pago') {
+      const items = await CajaMovimiento.find({ pago_mov_id: Number(id), origen: { $ne: 'subrubro' } }).lean();
+      for (const item of items) {
+        itemsAReabrir.push(item._id);
+        if (item.nc_mov_id != null) await Movimiento.deleteOne({ _id: Number(item.nc_mov_id) });
+      }
+    }
+    // Se borra a mano la NC de descuento: el pago que la acompaña queda y el ítem
+    // de Caja deja de mostrar un descuento que ya no existe. El saldo que la NC
+    // cubría vuelve a la factura y el auto-sync lo muestra como pendiente.
+    if (mov.caja_mov_id && mov.tipo === 'nota_credito') {
       await CajaMovimiento.updateOne(
-        { _id: Number(mov.caja_mov_id), pago_mov_id: Number(id) },
-        { $set: { confirmado: false, pago_mov_id: null } }
+        { _id: Number(mov.caja_mov_id), nc_mov_id: Number(id) },
+        { $set: { nc_mov_id: null, descuento: 0, descuento_pct: null, monto_bruto: null } }
       );
     }
     // Espejo de Caja de un pago del subrubro (sincronización Subrubro → Caja): se
-    // borra junto con el pago. Va ANTES del updateMany de abajo para que se elimine
-    // de verdad (no que quede como gasto pendiente desligado).
+    // borra junto con el pago (no queda como gasto pendiente desligado).
     if (mov.tipo === 'pago') {
       await CajaMovimiento.deleteMany({ pago_mov_id: Number(id), origen: 'subrubro' });
     }
-    // Defensa adicional: por si el caja_mov_id quedó suelto, buscar cualquier
-    // CajaMovimiento que apunte a este pago y limpiarlo.
-    await CajaMovimiento.updateMany(
-      { pago_mov_id: Number(id) },
-      { $set: { confirmado: false, pago_mov_id: null } }
-    );
     // Si era una factura, eliminar el ítem de caja auto-sincronizado pendiente que
     // la representaba (apunta a ella por movimiento_id). Sin esto, el vencimiento
     // borrado seguiría arrastrándose en la Caja del Día día a día.
@@ -928,7 +995,11 @@ const db = {
     }
     await Movimiento.findByIdAndDelete(Number(id));
     await recalcularPagos(subrubroId);
+    for (const cajaId of itemsAReabrir) await reabrirItemCaja(cajaId);
   },
+
+  reabrirItemCaja,
+  saldoFactura,
 
   async clearMovimientos(subrubroId) {
     const iid = Number(subrubroId);
@@ -1058,6 +1129,8 @@ const db = {
       const subP = await Subrubro.findById(mov.subrubro_id).lean();
       await syncCajaPago(mov, subP, true);
     }
+    // Pago nacido en la Caja: su ítem toma la fecha, el monto y el método nuevos.
+    await syncItemDePagoCaja(mov);
     const actualizado = withId(mov.toObject());
     // Detalle de aplicación por factura (queda en Audit vía la respuesta).
     if (saldosAntes) {

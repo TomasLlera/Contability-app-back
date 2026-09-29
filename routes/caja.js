@@ -270,11 +270,14 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
 
   if (vencimientos.length === 0) return res.json({ creados: 0 });
 
-  // Dedupe global: si ya existe un caja item (en cualquier fecha) para ese
-  // movimiento_id, no crear otro. Sino, una factura vencida no pagada generaría
-  // un caja item nuevo cada día que el usuario abra la caja.
+  // Dedupe global contra el PENDIENTE: si la factura ya tiene un ítem sin confirmar
+  // (en cualquier fecha), no se crea otro; si no, una factura vencida no pagada
+  // generaría un ítem nuevo cada día que se abre la caja. Los ítems confirmados no
+  // cuentan: si la factura tuvo un pago parcial y le queda saldo, se crea el
+  // pendiente por el resto (antes el saldo quedaba sin aparecer nunca en la Caja).
   const yaCreados = await CajaMovimiento.find({
     movimiento_id: { $in: vencimientos.map(v => v._id) },
+    confirmado: false,
   }, { movimiento_id: 1 }).lean();
   const yaSet = new Set(yaCreados.map(c => c.movimiento_id));
 
@@ -306,7 +309,7 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
     const _id = startId != null ? startId + i : await Counter.next('caja');
     return {
       updateOne: {
-        filter: { movimiento_id: v._id },
+        filter: { movimiento_id: v._id, confirmado: false },
         update: {
           $setOnInsert: {
             _id,
@@ -572,6 +575,11 @@ router.post('/', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
         return res.json(withId(existente));
       }
     }
+    // La factura ya tiene su pendiente en la Caja (uno solo por factura): antes esto
+    // devolvía un 500 con el mensaje interno de Mongo.
+    if (err.code === 11000 && err.keyPattern?.movimiento_id) {
+      return res.status(409).json({ error: 'Esa factura ya tiene un pago pendiente en la Caja: confirmalo (o pagá una parte) desde ahí' });
+    }
     throw err;
   }
 }));
@@ -631,7 +639,29 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
     if (descuento < 0)         return res.status(400).json({ error: 'El descuento no puede ser negativo' });
     if (descuento >= bruto)    return res.status(400).json({ error: 'El descuento no puede ser mayor o igual al monto de la factura' });
   }
-  const neto = bruto - descuento;
+
+  // Pago parcial: `monto` = lo que se paga ahora, menor al saldo que muestra la Caja.
+  // El resto queda como un pendiente nuevo de la misma factura (ver más abajo). Antes
+  // esto se hacía editando el monto del ítem, y el saldo restante no volvía a
+  // aparecer nunca en la Caja.
+  const montoPedido = req.body.monto != null && req.body.monto !== '' ? Number(req.body.monto) : null;
+  let parcial = false;
+  if (montoPedido != null) {
+    if (!Number.isFinite(montoPedido) || montoPedido <= 0) {
+      return res.status(400).json({ error: 'El monto a pagar debe ser mayor a 0' });
+    }
+    if (montoPedido > bruto + 0.005) {
+      return res.status(400).json({ error: `El monto a pagar no puede superar el saldo pendiente ($${bruto.toFixed(2)})` });
+    }
+    parcial = montoPedido < bruto - 0.005;
+    if (parcial && item.movimiento_id == null) {
+      return res.status(400).json({ error: 'El pago parcial es solo para ítems vinculados a una factura' });
+    }
+    if (parcial && descuento) {
+      return res.status(400).json({ error: 'El descuento por pago se aplica pagando el total, no en un pago parcial' });
+    }
+  }
+  const neto = parcial ? Math.round(montoPedido * 100) / 100 : bruto - descuento;
 
   const esCobro = item.tipo === 'ingreso_extra';
   let pagoId = null;
@@ -679,11 +709,17 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
       pagoId = pago?.id ?? null;
     }
   } catch (err) {
+    // Si la NC llegó a crearse pero el pago no, se borra: una NC sin su pago dejaba
+    // la factura con menos saldo aunque la confirmación se hubiera caído.
+    if (ncId != null) {
+      try { await db.deleteMovimiento(ncId); }
+      catch (e) { logger.error({ err: e.message, nc_mov_id: ncId, caja_id: id }, 'No se pudo borrar la NC de una confirmación fallida'); }
+    }
     // Devolver el ítem a como estaba: si el pago no se registró, la Caja no puede
     // quedar diciendo que sí. Las idempotency_key liberadas permiten reintentar.
     await CajaMovimiento.updateOne(
       { _id: id },
-      { $set: { confirmado: item.confirmado ?? null, fecha: item.fecha } },
+      { $set: { confirmado: item.confirmado ?? null, fecha: item.fecha, nc_mov_id: null } },
     );
     throw err;
   }
@@ -699,9 +735,37 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
     },
   });
 
+  // Pago parcial: el resto de la factura queda como un pendiente nuevo, con los
+  // mismos datos del ítem y su fecha original (sigue arrastrándose hasta pagarse).
+  // Upsert contra el pendiente único de la factura por si el auto-sync ya lo creó.
+  let pendienteRestante = null;
+  if (parcial) {
+    const saldo = await db.saldoFactura(item.movimiento_id);
+    if (saldo != null && saldo > 0.005) {
+      const nuevoId = await Counter.next('caja');
+      try {
+        await CajaMovimiento.updateOne(
+          { movimiento_id: Number(item.movimiento_id), confirmado: false },
+          {
+            $set: { monto: saldo },
+            $setOnInsert: {
+              _id: nuevoId, fecha: item.fecha, tipo: item.tipo, concepto: item.concepto,
+              metodo: item.metodo, subrubro_id: item.subrubro_id, movimiento_id: Number(item.movimiento_id),
+              auto_sync: !!item.auto_sync, es_especial: false, created_at: now(),
+            },
+          },
+          { upsert: true },
+        );
+      } catch (err) {
+        if (err.code !== 11000) throw err;
+      }
+      pendienteRestante = saldo;
+    }
+  }
+
   // Enriquece el diff de auditoría: deja explícito el descuento aplicado y la NC
   // generada, que es información que no se deduce del body de la request.
-  res.json({ ok: true, id, monto: neto, monto_bruto: bruto, descuento, descuento_pct: pct, pago_mov_id: pagoId, nc_mov_id: ncId });
+  res.json({ ok: true, id, monto: neto, monto_bruto: bruto, descuento, descuento_pct: pct, pago_mov_id: pagoId, nc_mov_id: ncId, parcial, pendiente_restante: pendienteRestante });
 }));
 
 // POST /api/caja/:id/revertir
@@ -712,32 +776,113 @@ router.post('/:id/revertir', requireAdmin, audit('caja'), asyncHandler(async (re
   const item = await CajaMovimiento.findById(id).lean();
   if (!item) return res.status(404).json({ error: 'Movimiento de caja no encontrado' });
 
+  if (item.confirmado !== true) return res.status(409).json({ error: 'El movimiento no está confirmado' });
+
   // Borrar el pago y la NC es lo que libera sus idempotency_key, de modo que el
-  // ítem pueda volver a confirmarse después.
-  for (const movId of [item.pago_mov_id, item.nc_mov_id]) {
-    if (movId != null) {
-      try { await db.deleteMovimiento(movId); }
-      catch (e) { logger.warn({ err: e, movimiento_id: movId, caja_id: id }, 'No se pudo borrar el movimiento al revertir la confirmación'); }
-    }
+  // ítem pueda volver a confirmarse después. Borrar el pago ya borra su NC y reabre
+  // el ítem (db.deleteMovimiento → reabrirItemCaja). Si algo falla, el error sube:
+  // antes se tragaba y el ítem volvía a pendiente con el pago todavía vivo, y el
+  // siguiente "confirmar" creaba un segundo pago.
+  if (item.pago_mov_id != null) {
+    await db.deleteMovimiento(item.pago_mov_id);
+  } else {
+    if (item.nc_mov_id != null) await db.deleteMovimiento(item.nc_mov_id);
+  }
+  const reabierto = await db.reabrirItemCaja(id);
+  res.json({ ok: true, id, item: reabierto ? withId(reabierto) : null });
+}));
+
+// GET /api/caja/:id/boleta
+// Datos de la factura/remito detrás de un ítem pendiente, para editarla desde la
+// Caja sin ir al subrubro.
+router.get('/:id/boleta', asyncHandler(async (req, res) => {
+  const item = await CajaMovimiento.findById(Number(req.params.id)).lean();
+  if (!item?.movimiento_id) return res.status(404).json({ error: 'El ítem no está vinculado a una factura' });
+  const fac = await Movimiento.findById(Number(item.movimiento_id)).lean();
+  if (!fac || fac.tipo !== 'factura') return res.status(404).json({ error: 'Factura no encontrada' });
+  const saldo = await db.saldoFactura(fac._id);
+  res.json({
+    id: fac._id, monto: fac.monto, saldo, pagado: Math.round(((fac.monto || 0) - saldo) * 100) / 100,
+    percepcion_iva: fac.percepcion_iva || 0, ingresos_brutos: fac.ingresos_brutos || 0,
+    documento: fac.documento, fecha: fac.fecha, fecha_vencimiento: fac.fecha_vencimiento, concepto: fac.concepto || '',
+  });
+}));
+
+// PUT /api/caja/:id/boleta   body: { monto, percepcion_iva?, ingresos_brutos? }
+// Corrige la factura/remito de un ítem pendiente desde la Caja ("anoté 10 pero la
+// boleta era de 11"). Se guarda en la FACTURA (la fuente de verdad) y el ítem pasa a
+// valer el saldo nuevo: así la corrección nunca desincroniza Caja y subrubro.
+router.put('/:id/boleta', requireAdmin, audit('caja_boleta'), asyncHandler(async (req, res) => {
+  const item = await CajaMovimiento.findById(Number(req.params.id)).lean();
+  if (!item?.movimiento_id) return res.status(400).json({ error: 'El ítem no está vinculado a una factura' });
+  if (item.confirmado !== false) return res.status(400).json({ error: 'Solo se puede editar la boleta de un ítem pendiente' });
+  const fac = await Movimiento.findById(Number(item.movimiento_id)).lean();
+  if (!fac || fac.tipo !== 'factura') return res.status(404).json({ error: 'Factura no encontrada' });
+
+  const num = (v, def) => (v === undefined || v === null || v === '' ? def : Number(v));
+  const monto = num(req.body.monto, fac.monto);
+  const percepcion_iva = num(req.body.percepcion_iva, fac.percepcion_iva || 0);
+  const ingresos_brutos = num(req.body.ingresos_brutos, fac.ingresos_brutos || 0);
+  if (!Number.isFinite(monto) || monto <= 0) return res.status(400).json({ error: 'El monto de la boleta debe ser mayor a 0' });
+  if (![percepcion_iva, ingresos_brutos].every(n => Number.isFinite(n) && n >= 0)) {
+    return res.status(400).json({ error: 'Las percepciones no pueden ser negativas' });
   }
 
-  await CajaMovimiento.findByIdAndUpdate(id, {
-    $set: {
-      confirmado: false,
-      monto: Number(item.monto_bruto ?? item.monto) || 0,
-      descuento: 0,
-      descuento_pct: null,
-      monto_bruto: null,
-      pago_mov_id: null,
-      nc_mov_id: null,
-    },
+  // updateMovimiento pisa todos los campos que recibe: se le pasan los actuales de
+  // la factura y solo cambian monto y percepciones. Él mismo re-sincroniza el gasto
+  // de Caja si es un remito.
+  const factura = await db.updateMovimiento(fac._id, {
+    monto, pago: fac.pago || 0, fecha: fac.fecha, fecha_vencimiento: fac.fecha_vencimiento,
+    campos_extra: fac.campos_extra || {}, tipo: fac.tipo, concepto: fac.concepto || '',
+    metodo_pago: fac.metodo_pago ?? null, documento: fac.documento ?? undefined,
+    percepcion_iva, ingresos_brutos,
   });
-  res.json({ ok: true, id });
+
+  // El pendiente pasa a valer el saldo nuevo; si la corrección dejó la factura
+  // saldada (boleta menor a lo ya pagado), el pendiente sobra.
+  const saldo = await db.saldoFactura(fac._id);
+  if (saldo != null && saldo > 0.005) {
+    await CajaMovimiento.updateOne({ _id: item._id, confirmado: false }, { $set: { monto: saldo } });
+  } else {
+    await CajaMovimiento.deleteOne({ _id: item._id, confirmado: false });
+  }
+  const actualizado = await CajaMovimiento.findById(item._id).lean();
+  res.json({ ok: true, factura, saldo, item: actualizado ? withId(actualizado) : null });
 }));
 
 // PUT /api/caja/:id
 router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
   const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial, confirmado, pago_mov_id } = req.body;
+  const actual = await CajaMovimiento.findById(Number(req.params.id)).lean();
+  if (!actual) return res.status(404).json({ error: 'Movimiento de caja no encontrado' });
+
+  // Validación anti-desincronización. Un ítem vinculado a una factura o a un pago
+  // del subrubro representa un dato que vive en DOS lugares; cambiarlo acá sin tocar
+  // el otro lado es lo que dejó 14 pares distintos en producción. Solo se rechazan
+  // cambios reales (el formulario de edición manda todos los campos).
+  const cambiaMonto = monto !== undefined && Math.abs((Number(monto) || 0) - (actual.monto || 0)) > 0.005;
+  const cambiaFecha = fecha !== undefined && fecha !== actual.fecha;
+  const cambiaTipo = tipo !== undefined && tipo !== actual.tipo;
+  const conFactura = actual.movimiento_id != null;
+  const conPago = actual.pago_mov_id != null || actual.origen === 'subrubro';
+  if ((confirmado !== undefined && (confirmado ?? null) !== (actual.confirmado ?? null)) ||
+      (pago_mov_id !== undefined && (pago_mov_id ?? null) !== (actual.pago_mov_id ?? null))) {
+    return res.status(400).json({ error: 'Para confirmar o revertir un pago usá el botón ✓ (confirmar / revertir)' });
+  }
+  if (actual.origen === 'subrubro' && (cambiaMonto || cambiaFecha || cambiaTipo)) {
+    return res.status(400).json({ error: 'Este pago se cargó en el subrubro: editalo desde ahí' });
+  }
+  if (actual.confirmado === true && conPago && (cambiaMonto || cambiaFecha || cambiaTipo)) {
+    return res.status(400).json({ error: 'El pago ya está confirmado: revertí la confirmación para cambiar monto, fecha o tipo' });
+  }
+  if (actual.confirmado === false && conFactura && cambiaMonto) {
+    return res.status(400).json({ error: 'Para pagar una parte usá "Pago parcial"; para corregir el importe, "Editar boleta"' });
+  }
+  if (conFactura && cambiaTipo) {
+    return res.status(400).json({ error: 'No se puede cambiar el tipo de un ítem vinculado a una factura' });
+  }
+  if (fecha !== undefined && !esFechaValida(fecha)) return res.status(400).json({ error: 'Fecha inválida' });
+
   const upd = {};
   if (fecha !== undefined) upd.fecha = fecha;
   if (tipo !== undefined) upd.tipo = tipo;
@@ -746,8 +891,6 @@ router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) =>
   if (metodo !== undefined) upd.metodo = metodo;
   if (subrubro_id !== undefined) upd.subrubro_id = subrubro_id;
   if (es_especial !== undefined) upd.es_especial = !!es_especial;
-  if (confirmado !== undefined) upd.confirmado = confirmado;
-  if (pago_mov_id !== undefined) upd.pago_mov_id = pago_mov_id !== null ? Number(pago_mov_id) : null;
   await CajaMovimiento.findByIdAndUpdate(Number(req.params.id), upd);
   // Sync inverso del método (Caja → subrubro): si se cambió el método de un ítem
   // pendiente que representa una factura por vencer, se escribe también en la factura

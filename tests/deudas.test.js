@@ -162,14 +162,11 @@ describe('subrubro tipo DEUDA', () => {
     await auth(request(app).post(`/api/caja/auto-sync?fecha=${hoy()}`));
     const item = await CajaMovimiento.findOne({ movimiento_id: deuda.body.id }).lean();
 
-    // Mismo flujo que la confirmación de un gasto en CajaView:
-    await auth(request(app).put(`/api/caja/${item._id}`)).send({ confirmado: true, fecha: hoy(), metodo: 'efectivo' });
-    const abono = await auth(request(app).post(`/api/movimientos/${deudaSubId}`)).send({
-      tipo: 'pago', pago: item.monto, fecha: hoy(), metodo_pago: 'efectivo',
-      caja_mov_id: item._id, facturas_vinculadas_ids: [deuda.body.id],
-      idempotency_key: `caja-confirm-${item._id}`,
-    });
-    expect(abono.status).toBe(200);
+    // Mismo flujo que la confirmación de un cobro en CajaView: método y confirmar.
+    await auth(request(app).put(`/api/caja/${item._id}`)).send({ metodo: 'efectivo' });
+    const conf = await auth(request(app).post(`/api/caja/${item._id}/confirmar`)).send({ fecha: hoy() });
+    expect(conf.status).toBe(200);
+    const abono = { body: { id: conf.body.pago_mov_id } };
 
     // La deuda quedó saldada y NO se creó un espejo duplicado (vino de la Caja)
     const freshDeuda = await Movimiento.findById(deuda.body.id).lean();
