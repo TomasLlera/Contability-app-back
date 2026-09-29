@@ -25,7 +25,9 @@ router.get('/resumen', asyncHandler(async (req, res) => {
   const [mesData, deudaTotal] = await Promise.all([
     // Facturado y pagado del mes actual (todos los rubros)
     Movimiento.aggregate([
-      { $match: { fecha: { $regex: `^${mes}` } } },
+      // Rango de strings en vez de regex: usa el índice { fecha: 1 } (el regex
+      // recorría la colección entera).
+      { $match: { fecha: { $gte: `${mes}-01`, $lte: `${mes}-31` } } },
       {
         $group: {
           _id: null,

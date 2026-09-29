@@ -101,6 +101,8 @@ const movimientoSchema = new mongoose.Schema({
   created_at: String
 });
 movimientoSchema.index({ subrubro_id: 1, fecha: 1 });
+// Totales por mes / rango de fechas de todos los subrubros (dashboard, comparativas).
+movimientoSchema.index({ fecha: 1 });
 movimientoSchema.index({ subrubro_id: 1, tipo: 1, pagado: 1 });
 movimientoSchema.index({ fecha_vencimiento: 1, pagado: 1 });
 movimientoSchema.index({ _ajuste_pago_id: 1 });
@@ -169,6 +171,11 @@ const cajaSchema = new mongoose.Schema({
   created_at: String,
 });
 cajaSchema.index({ fecha: 1 });
+// Pendientes (arrastre de la Caja del día, reconciliador del auto-sync, próximos):
+// índice chico, solo con los ítems sin confirmar.
+cajaSchema.index({ fecha: 1 }, { name: 'pendientes_por_fecha', partialFilterExpression: { confirmado: false } });
+// Ancla del saldo de efectivo: último saldo_inicial hasta una fecha.
+cajaSchema.index({ tipo: 1, fecha: -1 });
 cajaSchema.index(
   { idempotency_key: 1 },
   { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }

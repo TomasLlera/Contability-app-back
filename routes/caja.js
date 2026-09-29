@@ -36,6 +36,14 @@ const diasVentana = (cfg) => Math.max(Number(cfg?.dias_anticipacion_caja ?? 3) |
 // saldo de caja de hoy.
 const ARRASTRE_MANUAL_DESDE = process.env.CAJA_ARRASTRE_MANUAL_DESDE || '2026-09-29';
 
+// Campos que necesitan el cálculo de saldos y el auto-sync. Las lecturas masivas de
+// movimientos traían además campos_extra, idempotency_key, percepciones, etc.:
+// ~960 KB por lectura con los datos actuales.
+const CAMPOS_SALDO = {
+  subrubro_id: 1, tipo: 1, fecha: 1, fecha_vencimiento: 1, monto: 1, pago: 1,
+  facturas_vinculadas_ids: 1, pagado: 1, concepto: 1, metodo_pago: 1, documento: 1,
+};
+
 // GET /api/caja/config
 router.get('/config', asyncHandler(async (req, res) => {
   const cfg = await CajaConfig.findById('main').lean();
@@ -76,7 +84,7 @@ router.get('/vencimientos-sync', asyncHandler(async (req, res) => {
 
   // Saldo por factura = monto − pagos − NC (FIFO). Requiere TODOS los movimientos del
   // subrubro (NC/pagos pueden estar en otro mes), no solo las facturas de la ventana.
-  const todos = await Movimiento.find({ subrubro_id: { $in: subrubroIds } }).lean();
+  const todos = await Movimiento.find({ subrubro_id: { $in: subrubroIds } }, CAMPOS_SALDO).lean();
   const porSub = new Map();
   for (const m of todos) {
     if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
@@ -142,7 +150,7 @@ async function reconciliarAutoSync() {
   // Saldo actual por factura: requiere todos los movimientos de los subrubros
   // referenciados (pagos/NC pueden estar en otro mes).
   const subIds = [...new Set(facturas.map(f => f.subrubro_id))];
-  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }, CAMPOS_SALDO).lean();
   const porSub = new Map();
   for (const m of todos) {
     if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
@@ -247,7 +255,7 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
 
   // Saldo por factura = monto − pagos − NC (FIFO). Requiere TODOS los movimientos del
   // subrubro (NC/pagos pueden estar en otro mes), no solo las facturas vencidas.
-  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }, CAMPOS_SALDO).lean();
   const porSub = new Map();
   for (const m of todos) {
     if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
@@ -430,6 +438,12 @@ router.get('/descuentos', asyncHandler(async (req, res) => {
 router.get('/', asyncHandler(async (req, res) => {
   const { fecha } = req.query;
   if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
+  res.json(await cajaDelDia(fecha));
+}));
+
+// Ítems que se ven en la Caja de `fecha`: los del día más los pendientes que se
+// arrastran desde días anteriores.
+async function cajaDelDia(fecha) {
   const movs = await CajaMovimiento.find({
     $or: [
       { fecha },
@@ -453,46 +467,29 @@ router.get('/', asyncHandler(async (req, res) => {
       },
     ],
   }).sort({ fecha: 1, _id: 1 }).lean();
-  res.json(await attachDocumento(withIds(movs)));
-}));
+  return attachDocumento(withIds(movs));
+}
 
-// GET /api/caja/proximos?fecha=YYYY-MM-DD
-// Pendientes (gastos por pagar y deudas por cobrar) que vencen DESPUÉS de `fecha`,
-// dentro de la ventana de próximos. Viven en su fecha de vencimiento, así que el
-// GET del día no los trae: la Caja de hoy los muestra en una sección aparte para
-// poder pagarlos por adelantado desde hoy.
-router.get('/proximos', asyncHandler(async (req, res) => {
-  const { fecha } = req.query;
-  if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
-  const cfg = await CajaConfig.findById('main').lean();
+// Pendientes que vencen después de `fecha`, dentro de la ventana de próximos.
+async function proximosDe(fecha, cfg) {
   const hasta = sumarDias(fecha, diasVentana(cfg));
   const movs = await CajaMovimiento.find({
     fecha: { $gt: fecha, $lte: hasta },
     tipo: { $in: ['gasto', 'ingreso_extra'] },
     confirmado: false,
   }).sort({ fecha: 1, _id: 1 }).lean();
-  res.json(await attachDocumento(withIds(movs)));
-}));
+  return attachDocumento(withIds(movs));
+}
 
-// GET /api/caja/saldo-anterior?fecha=YYYY-MM-DD
-// Saldo de efectivo con el que abre `fecha`: parte del último saldo_inicial cargado a
-// mano —en cualquier fecha anterior, SIN ventana— y le encadena los movimientos de
-// efectivo confirmados hasta el día previo.
-//
-// Vive en el backend a propósito. El front lo resolvía trayendo los últimos 30 días y
-// encadenándolos en el cliente; cuando el último ancla quedaba fuera de esa ventana la
-// cadena arrancaba de CERO y el saldo se desplomaba de un día para el otro sin aviso.
-router.get('/saldo-anterior', asyncHandler(async (req, res) => {
-  const { fecha } = req.query;
-  if (!fecha) return res.status(400).json({ error: 'fecha requerida' });
-
+// Saldo de efectivo con el que abre `fecha` (ver GET /saldo-anterior).
+async function saldoAnteriorDe(fecha) {
   const ancla = await CajaMovimiento
     .findOne({ tipo: 'saldo_inicial', fecha: { $lte: fecha } })
     .sort({ fecha: -1, _id: -1 })
     .lean();
   // Sin ningún ancla no se puede afirmar un saldo: se devuelve null y la Caja muestra
   // "Sin datos" en lugar de un cero que se leería como un saldo real.
-  if (!ancla) return res.json({ saldo: null, ancla_fecha: null, ancla_monto: null });
+  if (!ancla) return { saldo: null, ancla_fecha: null, ancla_monto: null };
 
   // Desde el día del ancla inclusive (el saldo_inicial es la apertura de ese día)
   // hasta el día anterior al pedido.
@@ -510,8 +507,58 @@ router.get('/saldo-anterior', asyncHandler(async (req, res) => {
     (s, m) => (m.confirmado === false ? s : s + (m.tipo === 'gasto' ? -1 : 1) * (m.monto || 0)),
     ancla.monto || 0,
   );
+  return { saldo, ancla_fecha: ancla.fecha, ancla_monto: ancla.monto ?? 0 };
+}
 
-  res.json({ saldo, ancla_fecha: ancla.fecha, ancla_monto: ancla.monto ?? 0 });
+// GET /api/caja/dia?fecha=YYYY-MM-DD
+// Todo lo que la Caja del Día necesita al abrir, en una sola request: los ítems
+// del día, el saldo en cuenta de ayer, el saldo de efectivo de apertura y (si es
+// hoy) los próximos vencimientos. Antes eran 4 requests en serie, y la de "ayer"
+// traía la caja completa de ayer solo para leer un número.
+router.get('/dia', asyncHandler(async (req, res) => {
+  const { fecha } = req.query;
+  if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
+  const esHoy = fecha === hoyLocal();
+  const cfg = esHoy ? await CajaConfig.findById('main').lean() : null;
+  const [movs, cuentaAyer, saldoAnterior, proximos] = await Promise.all([
+    cajaDelDia(fecha),
+    CajaMovimiento.findOne({ fecha: sumarDias(fecha, -1), tipo: 'saldo_cuenta' }, { monto: 1 }).lean(),
+    saldoAnteriorDe(fecha),
+    esHoy ? proximosDe(fecha, cfg) : Promise.resolve([]),
+  ]);
+  res.json({
+    fecha,
+    movs,
+    saldo_cuenta_ayer: cuentaAyer?.monto ?? null,
+    saldo_anterior: saldoAnterior,
+    proximos,
+  });
+}));
+
+// GET /api/caja/proximos?fecha=YYYY-MM-DD
+// Pendientes (gastos por pagar y deudas por cobrar) que vencen DESPUÉS de `fecha`,
+// dentro de la ventana de próximos. Viven en su fecha de vencimiento, así que el
+// GET del día no los trae: la Caja de hoy los muestra en una sección aparte para
+// poder pagarlos por adelantado desde hoy.
+router.get('/proximos', asyncHandler(async (req, res) => {
+  const { fecha } = req.query;
+  if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
+  const cfg = await CajaConfig.findById('main').lean();
+  res.json(await proximosDe(fecha, cfg));
+}));
+
+// GET /api/caja/saldo-anterior?fecha=YYYY-MM-DD
+// Saldo de efectivo con el que abre `fecha`: parte del último saldo_inicial cargado a
+// mano —en cualquier fecha anterior, SIN ventana— y le encadena los movimientos de
+// efectivo confirmados hasta el día previo.
+//
+// Vive en el backend a propósito. El front lo resolvía trayendo los últimos 30 días y
+// encadenándolos en el cliente; cuando el último ancla quedaba fuera de esa ventana la
+// cadena arrancaba de CERO y el saldo se desplomaba de un día para el otro sin aviso.
+router.get('/saldo-anterior', asyncHandler(async (req, res) => {
+  const { fecha } = req.query;
+  if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
+  res.json(await saldoAnteriorDe(fecha));
 }));
 
 // GET /api/caja/rango?desde=YYYY-MM-DD&hasta=YYYY-MM-DD&page=&limit=

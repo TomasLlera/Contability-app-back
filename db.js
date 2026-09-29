@@ -1216,7 +1216,11 @@ const db = {
     // Para cada subrubro necesitamos TODOS sus movimientos (facturas + pagos + NC),
     // no solo las facturas por vencer, porque el saldo real de una factura sale de
     // descontarle los pagos y notas de crédito (vinculados o aplicados FIFO).
-    const movsSub = await Movimiento.find({ subrubro_id: { $in: subIds } }).lean();
+    // Solo los campos del cálculo de saldo (sin campos_extra ni metadatos).
+    const movsSub = await Movimiento.find(
+      { subrubro_id: { $in: subIds } },
+      { subrubro_id: 1, tipo: 1, fecha: 1, monto: 1, pago: 1, facturas_vinculadas_ids: 1 },
+    ).lean();
     const porSub = new Map();
     for (const m of movsSub) {
       if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);

@@ -126,6 +126,30 @@ describe('Próximos vencimientos: se pagan desde hoy, sin navegar a su fecha', (
   });
 });
 
+describe('GET /caja/dia: todo lo de la Caja en una request', () => {
+  beforeEach(() => bootstrap({ diasAnticipacion: 0 }));
+
+  it('trae ítems del día, próximos, saldo en cuenta de ayer y saldo de apertura', async () => {
+    const { cajaId: vencido } = await facturaEnCaja(-3);
+    const { cajaId: proximo } = await facturaEnCaja(2);
+    await auth(request(app).post('/api/caja')).send({ fecha: dia(-1), tipo: 'saldo_cuenta', concepto: 'Saldo en cuenta', monto: 5000, metodo: 'transferencia' });
+    await auth(request(app).post('/api/caja')).send({ fecha: dia(-2), tipo: 'saldo_inicial', concepto: 'Saldo anterior', monto: 800, metodo: 'efectivo' });
+
+    const r = await auth(request(app).get('/api/caja/dia').query({ fecha: hoy() }));
+    expect(r.status).toBe(200);
+    expect(r.body.movs.map(m => m.id)).toContain(vencido);
+    expect(r.body.proximos.map(m => m.id)).toContain(proximo);
+    expect(r.body.saldo_cuenta_ayer).toBe(5000);
+    expect(r.body.saldo_anterior.saldo).toBe(800);
+  });
+
+  it('mirando otro día no trae próximos', async () => {
+    await facturaEnCaja(2);
+    const r = await auth(request(app).get('/api/caja/dia').query({ fecha: dia(-1) }));
+    expect(r.body.proximos).toEqual([]);
+  });
+});
+
 describe('Arrastre de gastos manuales sin confirmar', () => {
   beforeEach(() => bootstrap());
 
