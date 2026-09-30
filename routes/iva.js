@@ -427,8 +427,9 @@ router.delete('/creditos/:id', requireAdmin, audit('iva_credito'), async (req, r
 // =========================================================================
 
 // Una Nota de Crédito de compra resta (no suma) en los totales. Se detecta por el
-// texto del tipo ("Nota de Crédito ..." → "...credito...").
-const esNotaCredito = (tipo) => norm(tipo).includes('credito');
+// texto "Nota de Crédito" del tipo. Buscar solo "crédito" confundía la "Factura de
+// Crédito Electrónica MiPyME" (una factura) con una NC y la restaba.
+const esNotaCredito = (tipo) => norm(tipo).includes('notadecredito');
 
 // Agrega compras + ventas + créditos fiscales por mes y calcula el saldo. Reusado
 // por /resumen y por los exports (Excel/PDF).

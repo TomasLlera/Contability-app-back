@@ -1,4 +1,4 @@
-const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento } = require('./models');
+const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento, CajaDescarte, CajaConfig, Producto, Recordatorio } = require('./models');
 const logger = require('./logger');
 const { hoyLocal, esFechaValida } = require('./utils/tz');
 
@@ -391,6 +391,46 @@ async function syncCajaRemito(mov, sub, esRemito) {
   }
 }
 
+// Limpia lo que referencia a movimientos, subrubros y rubros que se van a borrar.
+// Antes los borrados en cascada dejaban ítems de Caja, productos, recordatorios y la
+// configuración apuntando a registros inexistentes.
+//   • Caja: los pendientes de esas facturas se borran. Los confirmados se conservan
+//     (son plata que realmente salió o entró y sostienen los saldos de cada día)
+//     pero se desvinculan: quedan como un gasto/ingreso más, con su concepto.
+//   • Productos, recordatorios, CajaConfig (proveedores y rubros sincronizados) y
+//     AppConfig (tablas del dashboard) dejan de referenciarlos.
+// Se llama ANTES de borrar los movimientos (necesita sus ids).
+// `soloMovimientos`: el subrubro sigue existiendo (se vacían sus movimientos), así
+// que solo se limpia lo que apunta a los movimientos.
+async function limpiarReferencias({ subIds = [], rubroIds = [], soloMovimientos = false }) {
+  const movIds = subIds.length
+    ? (await Movimiento.find({ subrubro_id: { $in: subIds } }, { _id: 1 }).lean()).map(m => m._id)
+    : [];
+  if (movIds.length) {
+    await CajaMovimiento.deleteMany({ movimiento_id: { $in: movIds }, confirmado: false });
+    await CajaMovimiento.updateMany(
+      { $or: [{ movimiento_id: { $in: movIds } }, { pago_mov_id: { $in: movIds } }, { nc_mov_id: { $in: movIds } }] },
+      { $set: { movimiento_id: null, pago_mov_id: null, nc_mov_id: null, subrubro_id: null } },
+    );
+    await CajaDescarte.deleteMany({ movimiento_id: { $in: movIds } });
+  }
+  if (subIds.length && !soloMovimientos) {
+    await CajaMovimiento.updateMany({ subrubro_id: { $in: subIds } }, { $set: { subrubro_id: null } });
+    await Producto.updateMany({ subrubro_id: { $in: subIds } }, { $set: { subrubro_id: null } });
+    await Recordatorio.updateMany({}, { $pull: { subrubros_ids: { $in: subIds }, subrubros_prioritarios_ids: { $in: subIds } } });
+    await CajaConfig.updateOne(
+      { _id: 'main' },
+      { $set: { 'proveedores.$[p].subrubro_id': null } },
+      { arrayFilters: [{ 'p.subrubro_id': { $in: subIds } }] },
+    );
+  }
+  if (rubroIds.length) {
+    await Recordatorio.updateMany({ rubro_id: { $in: rubroIds } }, { $set: { rubro_id: null } });
+    await CajaConfig.updateOne({ _id: 'main' }, { $pull: { rubros_sync: { $in: rubroIds } } });
+    await AppConfig.updateOne({ _id: 'main' }, { $pull: { dashboard_tablas: { $in: rubroIds } } });
+  }
+}
+
 // Saldo pendiente actual de una factura (monto − pagos − NC, con la misma imputación
 // que el resto de la app). null si no existe o no es una factura.
 async function saldoFactura(facturaId) {
@@ -518,6 +558,7 @@ const db = {
     const rubroIds = rubros.map(r => r._id);
     const subs = await Subrubro.find({ rubro_id: { $in: rubroIds } }, { _id: 1 }).lean();
     const subIds = subs.map(s => s._id);
+    await limpiarReferencias({ subIds, rubroIds });
     await Movimiento.deleteMany({ subrubro_id: { $in: subIds } });
     await Subrubro.deleteMany({ rubro_id: { $in: rubroIds } });
     await Campo.deleteMany({ rubro_id: { $in: rubroIds } });
@@ -548,6 +589,7 @@ const db = {
     const iid = Number(id);
     const subs = await Subrubro.find({ rubro_id: iid }, { _id: 1 }).lean();
     const subIds = subs.map(s => s._id);
+    await limpiarReferencias({ subIds, rubroIds: [iid] });
     await Movimiento.deleteMany({ subrubro_id: { $in: subIds } });
     await Subrubro.deleteMany({ rubro_id: iid });
     await Campo.deleteMany({ rubro_id: iid });
@@ -746,6 +788,7 @@ const db = {
   },
   async deleteSubrubro(id) {
     const iid = Number(id);
+    await limpiarReferencias({ subIds: [iid] });
     await Movimiento.deleteMany({ subrubro_id: iid });
     await Subrubro.findByIdAndDelete(iid);
   },
@@ -1047,6 +1090,7 @@ const db = {
     const iid = Number(subrubroId);
     const sub = await Subrubro.findById(iid);
     if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
+    await limpiarReferencias({ subIds: [iid], soloMovimientos: true });
     const { deletedCount } = await Movimiento.deleteMany({ subrubro_id: iid });
     return { deleted: deletedCount };
   },
@@ -1055,6 +1099,7 @@ const db = {
     const rid = Number(rubroId);
     const subs = await Subrubro.find({ rubro_id: rid }, { _id: 1 }).lean();
     const subIds = subs.map(s => s._id);
+    await limpiarReferencias({ subIds, soloMovimientos: true });
     const { deletedCount } = await Movimiento.deleteMany({ subrubro_id: { $in: subIds } });
     // Barrido de huérfanos: movimientos cuyo subrubro fue borrado y quedaron sueltos
     // (importaciones viejas que no cascadeaban). Evita que "Vaciar todo" deje datos.

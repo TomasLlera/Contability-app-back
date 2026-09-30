@@ -31,17 +31,16 @@ async function bootstrap() {
   });
 }
 
-function addDays(fechaStr, n) {
-  const d = new Date(fechaStr + 'T00:00:00');
-  d.setDate(d.getDate() + n);
-  return d.toISOString().split('T')[0];
-}
+const { hoyLocal, sumarDias } = require('../utils/tz');
+
+// Hoy en Argentina (como el backend): con UTC, después de las 21 era mañana.
+const addDays = sumarDias;
 
 describe('Flujo caja: crear factura → autoSync → confirmar pago', () => {
   beforeEach(bootstrap);
 
   it('confirmar gasto en caja crea pago Y mantiene la factura', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 21);
 
     // 1. Crear factura en subrubro con vencimiento a 21 días
@@ -122,7 +121,7 @@ describe('Reconciliación auto-sync: cambios en la factura se reflejan en caja',
   }
 
   it('editar el monto de la factura actualiza el ítem de caja pendiente', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 5);
     const facturaId = await crearFactura(1000, hoy, venc);
 
@@ -142,7 +141,7 @@ describe('Reconciliación auto-sync: cambios en la factura se reflejan en caja',
   });
 
   it('borrar la factura elimina el ítem de caja pendiente (no se arrastra)', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 5);
     const facturaId = await crearFactura(800, hoy, venc);
 
@@ -158,7 +157,7 @@ describe('Reconciliación auto-sync: cambios en la factura se reflejan en caja',
   });
 
   it('pagar la factura por fuera de caja elimina el pendiente al reconciliar', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 5);
     const facturaId = await crearFactura(500, hoy, venc);
 
@@ -190,7 +189,7 @@ describe('Método de pago: sincronización subrubro ↔ Caja del Día', () => {
   }
 
   it('el método cargado en la factura viaja al ítem de Caja al vencer', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 5);
     const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
@@ -203,7 +202,7 @@ describe('Método de pago: sincronización subrubro ↔ Caja del Día', () => {
   });
 
   it('factura sin método → ítem de Caja sin definir (null)', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 5);
     const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
@@ -216,7 +215,7 @@ describe('Método de pago: sincronización subrubro ↔ Caja del Día', () => {
   });
 
   it('cambiar el método en la factura se refleja en el ítem de Caja al reconciliar', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 5);
     const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
@@ -233,7 +232,7 @@ describe('Método de pago: sincronización subrubro ↔ Caja del Día', () => {
   });
 
   it('poner el método en la Caja lo escribe de vuelta en la factura (Caja → subrubro)', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 5);
     const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
@@ -261,7 +260,7 @@ describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en l
   }
 
   it('un pago suelto registrado en el subrubro crea un gasto confirmado en la Caja del mismo día', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ tipo: 'pago', pago: 700, fecha: hoy, metodo_pago: 'efectivo' });
@@ -279,7 +278,7 @@ describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en l
   });
 
   it('un pago vinculado a una factura también aparece en la Caja', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ monto: 500, fecha: hoy, tipo: 'factura' });
@@ -295,7 +294,7 @@ describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en l
   });
 
   it('el pago se registra en la fecha real, no en el vencimiento de la factura', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const vencPasado = addDays(hoy, -2); // factura vencida hace 2 días
     const fact = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
@@ -312,7 +311,7 @@ describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en l
   });
 
   it('borrar el pago en el subrubro elimina el espejo de la Caja', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ tipo: 'pago', pago: 300, fecha: hoy, metodo_pago: 'efectivo' });
@@ -326,7 +325,7 @@ describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en l
   });
 
   it('editar el pago (monto/fecha) actualiza el espejo de la Caja', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const pago = await request(app).post(`/api/movimientos/${subrubroId}`)
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ tipo: 'pago', pago: 400, fecha: hoy, metodo_pago: 'efectivo' });
@@ -341,7 +340,7 @@ describe('Sincronización Subrubro → Caja: un pago en el subrubro aparece en l
   });
 
   it('un pago originado en la Caja NO genera un espejo duplicado', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     // Simula el pago que crea la Caja al confirmar: trae caja_mov_id.
     const cajaItem = await request(app).post('/api/caja')
       .set('Authorization', `Bearer ${adminToken}`)
@@ -375,7 +374,7 @@ describe('Descarte de vencimiento: borrar hoy no reaparece hoy, sí al día sigu
   }
 
   it('borrar el ítem auto-sync pasando la fecha vista impide que reaparezca ese mismo día', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, -1); // vencida ayer, impaga → aparece hoy
     const facturaId = await crearFactura(1000, addDays(hoy, -5), venc);
 
@@ -395,7 +394,7 @@ describe('Descarte de vencimiento: borrar hoy no reaparece hoy, sí al día sigu
   });
 
   it('al día siguiente, si sigue impaga, el vencimiento vuelve a aparecer', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const manana = addDays(hoy, 1);
     const venc = addDays(hoy, -1); // vencida, impaga
     const facturaId = await crearFactura(1000, addDays(hoy, -5), venc);
@@ -416,7 +415,7 @@ describe('Descarte de vencimiento: borrar hoy no reaparece hoy, sí al día sigu
   });
 
   it('borrar sin fecha usa la del ítem y no rompe (fallback)', async () => {
-    const hoy = new Date().toISOString().split('T')[0];
+    const hoy = hoyLocal();
     const venc = addDays(hoy, 3);
     const facturaId = await crearFactura(500, hoy, venc);
 

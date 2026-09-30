@@ -9,12 +9,10 @@ setupTestDb();
 
 let adminToken, rubroId, subConDesc, subSinDesc;
 
-const hoy = () => new Date().toISOString().split('T')[0];
-const addDias = (n) => {
-  const d = new Date();
-  d.setDate(d.getDate() + n);
-  return d.toISOString().split('T')[0];
-};
+const { hoyLocal, sumarDias } = require('../utils/tz');
+// Hoy en Argentina (como el backend): con UTC, después de las 21 era mañana.
+const hoy = () => hoyLocal();
+const addDias = (n) => sumarDias(hoyLocal(), n);
 
 async function bootstrap() {
   const ah = await bcrypt.hash('admin123', 4);

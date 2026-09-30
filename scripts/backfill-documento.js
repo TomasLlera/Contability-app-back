@@ -1,3 +1,6 @@
+// Backfill one-shot (ESCRIBE en la base): pone documento='factura' a las facturas
+// que no lo tienen. Antes se llamaba check-doc.js, que sugería una verificación de
+// solo lectura. Uso: node scripts/backfill-documento.js
 require('dotenv').config();
 const mongoose = require('mongoose');
 const { Movimiento } = require('../models');

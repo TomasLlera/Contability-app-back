@@ -8,7 +8,9 @@ setupTestDb();
 
 let adminToken, subrubroId;
 
-const hoy = () => new Date().toISOString().split('T')[0];
+const { hoyLocal } = require('../utils/tz');
+// Hoy en Argentina (como el backend): con UTC, después de las 21 era mañana.
+const hoy = () => hoyLocal();
 
 async function bootstrap() {
   const ah = await bcrypt.hash('admin123', 4);
