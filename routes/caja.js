@@ -80,37 +80,21 @@ router.put('/config', requireAdmin, audit('caja_config'), asyncHandler(async (re
 //   • cambió el saldo, el vencimiento o el concepto → actualiza el ítem.
 // Sólo toca ítems auto-sync (auto_sync:true) o legacy con la firma del auto-sync
 // (metodo null + movimiento_id), nunca gastos cargados a mano por el usuario.
-async function reconciliarAutoSync() {
-  // Trae TODOS los pendientes enlazados a una factura; el loop decide cuáles tocar:
-  // los auto-sync (auto_sync:true o firma legacy metodo:null) y, además, cualquiera
-  // cuya factura viva en un subrubro DEUDA (p. ej. gastos de remito que quedaron de
-  // antes de convertir el subrubro: su signo ya no corresponde).
-  const autoItems = await CajaMovimiento.find({
-    confirmado: false,
-    movimiento_id: { $ne: null },
-  }).lean();
+//
+// `autoItems` son TODOS los pendientes enlazados a una factura; el loop decide cuáles
+// tocar: los auto-sync (auto_sync:true o firma legacy metodo:null) y, además,
+// cualquiera cuya factura viva en un subrubro DEUDA (p. ej. gastos de remito que
+// quedaron de antes de convertir el subrubro: su signo ya no corresponde).
+// `ctx` son los movimientos, saldos y subrubros ya leídos por el auto-sync (ver
+// cargarContextoSync): antes esta función hacía su propia lectura completa.
+async function reconciliarAutoSync(autoItems, { movMap, saldoDe, subMap }) {
   if (autoItems.length === 0) return { actualizados: 0, eliminados: 0 };
 
-  const facturas = await Movimiento.find({
-    _id: { $in: autoItems.map(c => c.movimiento_id) },
-  }).lean();
-  const facturaMap = new Map(facturas.map(f => [f._id, f]));
-
-  // Saldo actual por factura: requiere todos los movimientos de los subrubros
-  // referenciados (pagos/NC pueden estar en otro mes).
-  const subIds = [...new Set(facturas.map(f => f.subrubro_id))];
-  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }, CAMPOS_SALDO).lean();
-  const porSub = new Map();
-  for (const m of todos) {
-    if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
-    porSub.get(m.subrubro_id).push(m);
+  const facturaMap = new Map();
+  for (const c of autoItems) {
+    const f = movMap.get(c.movimiento_id);
+    if (f) facturaMap.set(f._id, f);
   }
-  const saldosPorSub = new Map();
-  for (const [sid, lista] of porSub) saldosPorSub.set(sid, computeSaldosFacturas(lista));
-  const saldoDe = (f) => saldosPorSub.get(f.subrubro_id)?.get(f._id) ?? f.monto;
-
-  const subs = await Subrubro.find({ _id: { $in: subIds } }).lean();
-  const subMap = Object.fromEntries(subs.map(s => [s._id, s]));
 
   const toDelete = [];
   const updateOps = [];
@@ -172,39 +156,27 @@ async function reconciliarAutoSync() {
   return { actualizados, eliminados };
 }
 
-// POST /api/caja/auto-sync?fecha=YYYY-MM-DD
-// Reconcilia los ítems existentes con su factura y crea los faltantes.
-// Idempotente: crea CajaMovimiento (tipo='gasto', confirmado=false, metodo=null)
-// por cada factura que vence dentro de la ventana en algún rubro sincronizado,
-// siempre que no exista ya un caja item para ese movimiento_id.
-router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
-  const { fecha } = req.query;
-  if (!fecha) return res.status(400).json({ error: 'fecha requerida' });
-
-  // Reconciliar primero: refleja borrados/pagos/cambios de monto y vencimiento.
-  const { actualizados, eliminados } = await reconciliarAutoSync();
-
-  const cfg = await CajaConfig.findById('main').lean();
-  const rubros_sync = cfg?.rubros_sync || [];
-  if (rubros_sync.length === 0) return res.json({ creados: 0, actualizados, eliminados });
-
-  // Crea también los que vencen dentro de la ventana de "próximos": viven en su
-  // fecha de vencimiento (no se arrastran hacia atrás) y la Caja de hoy los lista
-  // aparte para poder pagarlos por adelantado.
-  const hasta = sumarDias(fecha, diasVentana(cfg));
-
-  // Incluye también los subrubros DEUDA: sus vencimientos entran a la Caja como
-  // INGRESOS pendientes de cobro (tipo ingreso_extra, confirmado:false) en vez de
-  // gastos. Al confirmarlos se registra el abono en el subrubro y suman al día.
-  const subrubros = await Subrubro.find({ rubro_id: { $in: rubros_sync } }).lean();
-  if (subrubros.length === 0) return res.json({ creados: 0, actualizados, eliminados });
-
-  const subIds = subrubros.map(s => s._id);
-  const subMap = Object.fromEntries(subrubros.map(s => [s._id, s]));
+// Lectura única que comparten la reconciliación y la creación de pendientes: todos
+// los movimientos (solo CAMPOS_SALDO) de los subrubros sincronizados más los de las
+// facturas que ya tienen un pendiente en Caja, sus saldos y sus subrubros. Antes cada
+// paso leía por su cuenta el historial completo de casi los mismos subrubros, y esa
+// doble lectura era lo más caro de abrir la Caja.
+async function cargarContextoSync(autoItems, rubros_sync) {
+  const [facturasRef, subrubrosSync] = await Promise.all([
+    autoItems.length
+      ? Movimiento.find({ _id: { $in: autoItems.map(c => c.movimiento_id) } }, { subrubro_id: 1 }).lean()
+      : [],
+    rubros_sync.length ? Subrubro.find({ rubro_id: { $in: rubros_sync } }).lean() : [],
+  ]);
+  const subIdsSync = subrubrosSync.map(s => s._id);
+  const subIds = [...new Set([...subIdsSync, ...facturasRef.map(f => f.subrubro_id)])];
 
   // Saldo por factura = monto − pagos − NC (FIFO). Requiere TODOS los movimientos del
   // subrubro (NC/pagos pueden estar en otro mes), no solo las facturas vencidas.
-  const todos = await Movimiento.find({ subrubro_id: { $in: subIds } }, CAMPOS_SALDO).lean();
+  const [todos, subsExtra] = await Promise.all([
+    subIds.length ? Movimiento.find({ subrubro_id: { $in: subIds } }, CAMPOS_SALDO).lean() : [],
+    Subrubro.find({ _id: { $in: subIds.filter(id => !subIdsSync.includes(id)) } }).lean(),
+  ]);
   const porSub = new Map();
   for (const m of todos) {
     if (!porSub.has(m.subrubro_id)) porSub.set(m.subrubro_id, []);
@@ -214,18 +186,60 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   for (const [sid, lista] of porSub) saldosPorSub.set(sid, computeSaldosFacturas(lista));
   const saldoDe = (m) => saldosPorSub.get(m.subrubro_id)?.get(m._id) ?? m.monto;
 
+  return {
+    todos,
+    movMap: new Map(todos.map(m => [m._id, m])),
+    saldoDe,
+    subMap: Object.fromEntries([...subrubrosSync, ...subsExtra].map(s => [s._id, s])),
+    subIdsSync: new Set(subIdsSync),
+  };
+}
+
+// POST /api/caja/auto-sync?fecha=YYYY-MM-DD
+// Reconcilia los ítems existentes con su factura y crea los faltantes.
+// Idempotente: crea CajaMovimiento (tipo='gasto', confirmado=false, metodo=null)
+// por cada factura que vence dentro de la ventana en algún rubro sincronizado,
+// siempre que no exista ya un caja item para ese movimiento_id.
+router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
+  const { fecha } = req.query;
+  if (!fecha) return res.status(400).json({ error: 'fecha requerida' });
+
+  const [autoItems, cfg] = await Promise.all([
+    CajaMovimiento.find({ confirmado: false, movimiento_id: { $ne: null } }).lean(),
+    CajaConfig.findById('main').lean(),
+  ]);
+  const rubros_sync = cfg?.rubros_sync || [];
+  const ctx = await cargarContextoSync(autoItems, rubros_sync);
+  const { saldoDe, subMap } = ctx;
+
+  // Reconciliar primero: refleja borrados/pagos/cambios de monto y vencimiento.
+  // Corre SIEMPRE (incluso sin rubros sincronizados) para limpiar restos.
+  const { actualizados, eliminados } = await reconciliarAutoSync(autoItems, ctx);
+  const sinCreados = { creados: 0, actualizados, eliminados };
+
+  if (rubros_sync.length === 0 || ctx.subIdsSync.size === 0) return res.json(sinCreados);
+
+  // Crea también los que vencen dentro de la ventana de "próximos": viven en su
+  // fecha de vencimiento (no se arrastran hacia atrás) y la Caja de hoy los lista
+  // aparte para poder pagarlos por adelantado.
+  // Incluye también los subrubros DEUDA: sus vencimientos entran a la Caja como
+  // INGRESOS pendientes de cobro (tipo ingreso_extra, confirmado:false) en vez de
+  // gastos. Al confirmarlos se registra el abono en el subrubro y suman al día.
+  const hasta = sumarDias(fecha, diasVentana(cfg));
+
   // Incluye también vencidas (fecha_vencimiento <= hasta): si una factura venció
   // hace 5 días y no se pagó, queremos verla hoy en caja, no perderla. Se descartan
   // las que ya están saldadas por pagos/NC aunque conserven pagado === false.
-  const vencimientos = todos
+  const vencimientos = ctx.todos
     .filter(m =>
+      ctx.subIdsSync.has(m.subrubro_id) &&
       m.tipo === 'factura' && !m.pagado &&
       m.fecha_vencimiento != null && m.fecha_vencimiento <= hasta &&
       saldoDe(m) > 0.005
     )
     .sort((a, b) => (a.fecha_vencimiento || '').localeCompare(b.fecha_vencimiento || ''));
 
-  if (vencimientos.length === 0) return res.json({ creados: 0 });
+  if (vencimientos.length === 0) return res.json(sinCreados);
 
   // Dedupe global contra el PENDIENTE: si la factura ya tiene un ítem sin confirmar
   // (en cualquier fecha), no se crea otro; si no, una factura vencida no pagada
@@ -247,7 +261,7 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
   const descartadoSet = new Set(descartados.map(d => d.movimiento_id));
 
   const pendientes = vencimientos.filter(v => !yaSet.has(v._id) && !descartadoSet.has(v._id));
-  if (pendientes.length === 0) return res.json({ creados: 0 });
+  if (pendientes.length === 0) return res.json(sinCreados);
 
   // Reservar IDs en bloque (solo se consumen si el upsert inserta).
   const startId = Counter.nextBatch
@@ -615,6 +629,22 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
   // El bruto es el monto que la Caja muestra hoy; si por un reintento el ítem ya
   // tuviera monto_bruto, ese manda (no se descuenta dos veces sobre el neto).
   const bruto = Number(item.monto_bruto ?? item.monto) || 0;
+
+  // Un pendiente auto-sync puede estar desactualizado: la Caja se muestra antes de
+  // que termine el auto-sync, y la factura pudo pagarse, borrarse o cambiar de saldo
+  // desde el Subrubro u otra pestaña. Confirmarlo así registraría un pago de más.
+  if (item.auto_sync && item.movimiento_id != null) {
+    const saldo = await db.saldoFactura(item.movimiento_id);
+    if (saldo == null) {
+      return res.status(409).json({ error: 'La factura de este vencimiento ya no existe. Refrescá la Caja.' });
+    }
+    if (saldo <= 0.005) {
+      return res.status(409).json({ error: 'La factura de este vencimiento ya está saldada. Refrescá la Caja.' });
+    }
+    if (bruto > saldo + 0.005) {
+      return res.status(409).json({ error: `El saldo de la factura cambió a $${saldo.toFixed(2)}. Refrescá la Caja.` });
+    }
+  }
 
   const sub = item.subrubro_id ? await Subrubro.findById(Number(item.subrubro_id)).lean() : null;
 
