@@ -10,6 +10,7 @@ describe('GET /api/health', () => {
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('ok');
     expect(res.body.db).toBe('connected');
+    expect(res.body.version).toBe(require('../package.json').version);
   });
 
   it('no requiere autenticación', async () => {
