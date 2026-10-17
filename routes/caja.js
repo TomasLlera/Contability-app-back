@@ -347,12 +347,22 @@ router.get('/facturas-pendientes', asyncHandler(async (req, res) => {
 // ítem de caja enlazado a un movimiento. Es un campo DERIVADO de solo lectura: el
 // dato vive en Movimiento.documento y la Caja lo muestra como badge. Los ítems
 // manuales (movimiento_id null) quedan con documento null.
+//
+// Del mismo modo, los espejos de una carga de Sumatoria (origen 'sumatoria') viajan
+// con `sumatoria` = { id, concepto_id, concepto_nombre, color, descripcion } para el
+// badge del concepto y para editarlos desde la Caja.
 async function attachDocumento(movs) {
   const ids = [...new Set(movs.map(m => m.movimiento_id).filter(id => id != null))];
-  if (ids.length === 0) return movs.map(m => ({ ...m, documento: null }));
-  const facturas = await Movimiento.find({ _id: { $in: ids } }, { documento: 1 }).lean();
+  const [facturas, sumatorias] = await Promise.all([
+    ids.length ? Movimiento.find({ _id: { $in: ids } }, { documento: 1 }).lean() : [],
+    db.datosSumatoriaDeCaja(movs),
+  ]);
   const docMap = new Map(facturas.map(f => [f._id, f.documento || null]));
-  return movs.map(m => ({ ...m, documento: docMap.get(m.movimiento_id) ?? null }));
+  return movs.map(m => ({
+    ...m,
+    documento: docMap.get(m.movimiento_id) ?? null,
+    ...(m.sumatoria_mov_id != null ? { sumatoria: sumatorias.get(m.sumatoria_mov_id) || null } : {}),
+  }));
 }
 
 // GET /api/caja/descuentos?desde=&hasta=&subrubro_id=
@@ -551,6 +561,14 @@ router.post('/', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
   if (!fecha || !tipo || !concepto || !monto) return res.status(400).json({ error: 'Faltan campos' });
   const errorCampos = validarCamposCaja({ fecha, tipo, monto, metodo });
   if (errorCampos) return res.status(400).json({ error: errorCampos });
+  // Un subrubro Sumatoria no tiene facturas: un gasto vinculado acá crearía un "pago"
+  // al confirmarlo. Sus cargas desde la Caja van por POST /api/sumatorias/:id/movimientos.
+  if (subrubro_id) {
+    const subV = await Subrubro.findById(Number(subrubro_id), { tipo_subrubro: 1 }).lean();
+    if (subV?.tipo_subrubro === 'sumatoria') {
+      return res.status(400).json({ error: 'Ese subrubro es de tipo Sumatoria: cargalo eligiendo su concepto' });
+    }
+  }
   // Guarda de idempotencia: una misma alta reintentada (doble clic / reenvío)
   // devuelve la entrada ya creada en lugar de duplicarla.
   if (idempotency_key) {
@@ -612,6 +630,7 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
   const id = Number(req.params.id);
   const item = await CajaMovimiento.findById(id).lean();
   if (!item) return res.status(404).json({ error: 'Movimiento de caja no encontrado' });
+  if (item.origen === 'sumatoria') return res.status(400).json({ error: 'Las cargas de sumatoria no se confirman: ya descuentan del día' });
   if (item.confirmado === true) return res.status(409).json({ error: 'El movimiento ya está confirmado' });
   if (!item.metodo) return res.status(400).json({ error: 'Definí el método de pago antes de confirmar' });
 
@@ -803,6 +822,7 @@ router.post('/:id/revertir', requireAdmin, audit('caja'), asyncHandler(async (re
   const id = Number(req.params.id);
   const item = await CajaMovimiento.findById(id).lean();
   if (!item) return res.status(404).json({ error: 'Movimiento de caja no encontrado' });
+  if (item.origen === 'sumatoria') return res.status(400).json({ error: 'Las cargas de sumatoria no tienen confirmación para revertir' });
 
   if (item.confirmado !== true) return res.status(409).json({ error: 'El movimiento no está confirmado' });
 
@@ -884,6 +904,21 @@ router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) =>
   const actual = await CajaMovimiento.findById(Number(req.params.id)).lean();
   if (!actual) return res.status(404).json({ error: 'Movimiento de caja no encontrado' });
 
+  // Espejo de una carga de Sumatoria: la fuente de verdad es la carga. Se edita ella
+  // (fecha, monto, método y, si vienen, concepto/descripción) y el espejo se reescribe
+  // desde ahí; nunca se toca el ítem de Caja por su cuenta.
+  if (actual.origen === 'sumatoria' && actual.sumatoria_mov_id != null) {
+    const { concepto_id, descripcion } = req.body;
+    const cambios = {};
+    if (fecha !== undefined) cambios.fecha = fecha;
+    if (monto !== undefined) cambios.monto = monto;
+    if (metodo !== undefined) cambios.metodo = metodo;
+    if (concepto_id !== undefined) cambios.concepto_id = concepto_id;
+    if (descripcion !== undefined) cambios.descripcion = descripcion;
+    const carga = await db.updateMovimientoSumatoria(actual.sumatoria_mov_id, cambios, req.user?.usuario || null);
+    return res.json({ ok: true, sumatoria: carga });
+  }
+
   // Validación anti-desincronización. Un ítem vinculado a una factura o a un pago
   // del subrubro representa un dato que vive en DOS lugares; cambiarlo acá sin tocar
   // el otro lado es lo que dejó 14 pares distintos en producción. Solo se rechazan
@@ -941,6 +976,12 @@ router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) =>
 // DELETE /api/caja/:id?fecha=YYYY-MM-DD
 router.delete('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
   const item = await CajaMovimiento.findById(Number(req.params.id)).lean();
+  // Espejo de una carga de Sumatoria: borrar desde la Caja borra la carga (y con ella
+  // el espejo). Si no, el subrubro seguiría sumando algo que ya no salió de la Caja.
+  if (item?.origen === 'sumatoria' && item.sumatoria_mov_id != null) {
+    await db.deleteMovimientoSumatoria(item.sumatoria_mov_id);
+    return res.json({ ok: true, sumatoria_mov_id: item.sumatoria_mov_id });
+  }
   // Sólo los pendientes auto-generados (movimiento_id + no confirmados) dejan
   // "memoria" de descarte: si el usuario borra el vencimiento hoy, no debe volver a
   // recrearse hoy vía auto-sync. Se registra contra la fecha VISTA en la Caja (no la

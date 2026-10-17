@@ -35,7 +35,10 @@ const subrubroSchema = new mongoose.Schema({
   //               movimientos reusan los tipos internos 'factura' (= deuda) y
   //               'pago' (= abono), pero se presentan como Deuda/Abono y en la
   //               Caja del Día los abonos entran como INGRESOS (no gastos).
-  tipo_subrubro: { type: String, enum: ['factura', 'deuda'], default: 'factura' },
+  //   'sumatoria' → acumulador por conceptos (ej. retiros de un socio). No usa la
+  //               colección Movimiento: sus cargas viven en MovimientoSumatoria y sus
+  //               conceptos en ConceptoSumatoria. Sin estados, vencimientos ni saldos.
+  tipo_subrubro: { type: String, enum: ['factura', 'deuda', 'sumatoria'], default: 'factura' },
   // Metadata fiscal/bancaria
   cuit: { type: String, default: '' },
   cbu: { type: String, default: '' },
@@ -146,9 +149,12 @@ const cajaSchema = new mongoose.Schema({
   confirmado: { type: Boolean, default: null }, // null = registro viejo (se trata como confirmado); false = pendiente; true = confirmado
   pago_mov_id: { type: Number, default: null }, // ID del movimiento de pago creado en el subrubro al confirmar
   // Origen del ítem: 'subrubro' = espejo auto-generado de un pago registrado desde un
-  // Subrubro (sincronización Subrubro → Caja). null = ítem normal de Caja (manual,
+  // Subrubro (sincronización Subrubro → Caja). 'sumatoria' = espejo de una carga de
+  // un subrubro Sumatoria hecha desde la Caja (la fuente de verdad es la
+  // MovimientoSumatoria `sumatoria_mov_id`). null = ítem normal de Caja (manual,
   // vencimiento auto-sync, saldos, etc.). Distingue qué ítems borrar al borrar el pago.
-  origen: { type: String, enum: ['subrubro', null], default: null },
+  origen: { type: String, enum: ['subrubro', 'sumatoria', null], default: null },
+  sumatoria_mov_id: { type: Number, default: null },
   // --- Descuento por pago (subrubros con aplica_descuento) ---
   // Al confirmar, `monto` pasa a ser el NETO efectivamente pagado (lo que sale de la
   // caja) y estos campos guardan el detalle para poder mostrarlo y revertirlo:
@@ -199,7 +205,66 @@ cajaSchema.index({ movimiento_id: 1, confirmado: 1 });
 // Espejo de un pago del subrubro / pago generado al confirmar: se busca por
 // pago_mov_id en cada alta, edición y borrado de pagos (antes era un COLLSCAN).
 cajaSchema.index({ pago_mov_id: 1 }, { partialFilterExpression: { pago_mov_id: { $type: 'number' } } });
+// Una carga de Sumatoria tiene a lo sumo UN espejo en la Caja.
+cajaSchema.index(
+  { sumatoria_mov_id: 1 },
+  { name: 'sumatoria_mov_id_unico', unique: true, partialFilterExpression: { sumatoria_mov_id: { $type: 'number' } } }
+);
 const CajaMovimiento = mongoose.model('CajaMovimiento', cajaSchema);
+
+// --- Sumatoria: conceptos ---
+// Conceptos propios de un subrubro de tipo 'sumatoria' (ej. "Retiro efectivo").
+//   mostrar_en_caja → si se ofrece al cargar desde la Caja del Día. Desde el propio
+//                     subrubro siempre están todos los activos.
+//   nombre_normalizado → minúsculas, sin acentos y con los espacios colapsados: agrupa
+//                     conceptos homónimos de distintos subrubros en el resumen general.
+// Un concepto con cargas no se borra: se desactiva (activo:false).
+const conceptoSumatoriaSchema = new mongoose.Schema({
+  _id: Number,
+  subrubro_id: { type: Number, required: true },
+  nombre: { type: String, required: true },
+  nombre_normalizado: { type: String, required: true },
+  mostrar_en_caja: { type: Boolean, default: true },
+  color: { type: String, default: null },
+  activo: { type: Boolean, default: true },
+  orden: { type: Number, default: 0 },
+  created_at: String,
+});
+conceptoSumatoriaSchema.index({ subrubro_id: 1, orden: 1 });
+conceptoSumatoriaSchema.index({ subrubro_id: 1, nombre_normalizado: 1 }, { unique: true });
+const ConceptoSumatoria = mongoose.model('ConceptoSumatoria', conceptoSumatoriaSchema);
+
+// --- Sumatoria: cargas ---
+// Cada carga simplemente suma en su subrubro. `origen` se fija al crear y no cambia:
+//   'caja'     → se cargó desde la Caja del Día: tiene `metodo` y un espejo en
+//                CajaMovimiento (caja_mov_id) que descuenta del día como un gasto.
+//   'subrubro' → se cargó desde el subrubro: SOLO suma acá, nunca existe en la Caja
+//                (metodo null, caja_mov_id null). Por construcción ninguna consulta de
+//                Caja (día, historial, gráficas, cierres) puede incluirla.
+const movimientoSumatoriaSchema = new mongoose.Schema({
+  _id: Number,
+  subrubro_id: { type: Number, required: true },
+  concepto_id: { type: Number, required: true },
+  fecha: { type: String, required: true },
+  monto: { type: Number, required: true },
+  descripcion: { type: String, default: '' },
+  origen: { type: String, enum: ['caja', 'subrubro'], required: true },
+  metodo: { type: String, enum: ['efectivo', 'transferencia', null], default: null },
+  caja_mov_id: { type: Number, default: null },
+  idempotency_key: { type: String, default: null },
+  created_by: { type: String, default: null },
+  updated_by: { type: String, default: null },
+  created_at: String,
+  updated_at: String,
+});
+movimientoSumatoriaSchema.index({ subrubro_id: 1, fecha: 1 });
+movimientoSumatoriaSchema.index({ concepto_id: 1, fecha: 1 });
+movimientoSumatoriaSchema.index({ origen: 1, fecha: 1 });
+movimientoSumatoriaSchema.index(
+  { idempotency_key: 1 },
+  { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }
+);
+const MovimientoSumatoria = mongoose.model('MovimientoSumatoria', movimientoSumatoriaSchema);
 
 // Migración idempotente: borra el índice único viejo sobre movimiento_id (uno por
 // factura) para que se pueda crear el nuevo (uno PENDIENTE por factura). Sin esto,
@@ -549,4 +614,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { migrarIndicesCaja, Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Recordatorio, RecordatorioEvento, Audit };
+module.exports = { migrarIndicesCaja, Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Recordatorio, RecordatorioEvento, Audit, ConceptoSumatoria, MovimientoSumatoria };

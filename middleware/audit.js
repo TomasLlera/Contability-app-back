@@ -9,6 +9,8 @@ const SENSITIVE_KEYS = new Set(['password', 'password_hash', 'token', 'jwt_secre
 // no tienen un único doc previo y quedan fuera (se registran sin `before`).
 const MODEL_MAP = {
   movimiento: models.Movimiento,
+  sumatoria_movimiento: models.MovimientoSumatoria,
+  sumatoria_concepto: models.ConceptoSumatoria,
   caja: models.CajaMovimiento,
   campo: models.Campo,
   categoria: models.Categoria,

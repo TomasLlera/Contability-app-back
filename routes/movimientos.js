@@ -220,6 +220,13 @@ router.post('/import/:rubroId', requireAdmin, upload.single('file'), audit('movi
 
       const subrubro = await db.findOrCreateSubrubroForImport(rubroId, sheetName);
 
+      // Una hoja que coincide con un subrubro Sumatoria no se importa: no tiene
+      // facturas ni pagos, y el modo "reemplazar" vaciaría sus cargas.
+      if (subrubro.tipo_subrubro === 'sumatoria') {
+        results.sheets.push({ name: sheetName, created: 0, skipped: rows.length, duplicates: 0, aviso: 'Subrubro de tipo Sumatoria: no admite importación' });
+        continue;
+      }
+
       if (mode === 'replace') {
         await db.clearMovimientos(subrubro._id);
       }

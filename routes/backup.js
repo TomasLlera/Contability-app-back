@@ -15,6 +15,8 @@ const SECTORES = [
   { model: 'Rubro', file: 'rubros' },
   { model: 'Subrubro', file: 'subrubros' },
   { model: 'Movimiento', file: 'movimientos' },
+  { model: 'ConceptoSumatoria', file: 'sumatoria_conceptos' },
+  { model: 'MovimientoSumatoria', file: 'sumatoria_movimientos' },
   { model: 'Campo', file: 'campos' },
   { model: 'Categoria', file: 'categorias' },
   { model: 'CajaMovimiento', file: 'caja_movimientos' },
@@ -47,6 +49,7 @@ const CONTADORES = {
   productos: 'Producto', movimientos_stock: 'MovimientoStock', iva_compras: 'IvaCompra',
   iva_ventas: 'IvaVenta', iva_creditos: 'IvaCredito', ventas_sistema: 'VentaSistema',
   tarjetas: 'TarjetaTransaccion', recordatorios: 'Recordatorio', users: 'User', audit: 'Audit',
+  sumatoria_conceptos: 'ConceptoSumatoria', sumatoria_movimientos: 'MovimientoSumatoria',
 };
 
 // Deja cada contador en max(_id) de su colección (y nunca por debajo de lo que ya

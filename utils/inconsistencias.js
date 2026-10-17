@@ -4,7 +4,7 @@
 // corrigen nada: listan los casos para revisarlos y enlazarlos con su traza de
 // auditoría. La decisión fue dejar el histórico como está y evitar que vuelva a
 // pasar; esto sirve para detectar si algo se escapa.
-const { Movimiento, CajaMovimiento, CajaConfig, Subrubro, Audit } = require('../models');
+const { Movimiento, CajaMovimiento, CajaConfig, Subrubro, Audit, MovimientoSumatoria } = require('../models');
 const { computeSaldosFacturas } = require('../db');
 const { hoyLocal } = require('./tz');
 
@@ -111,6 +111,28 @@ async function buscarInconsistencias() {
       caja_id: Number(a.recurso_id), audit_id: a._id, usuario: a.usuario,
       detalle: `Confirmado el ${diaAR(a.fecha)}, registrado el ${a.diff.payload.fecha}`,
     }))));
+
+  // 9. Sumatoria: cada carga de Caja tiene exactamente un espejo con su fecha, monto y
+  // método; ninguna carga del subrubro tiene espejo; ningún espejo apunta a la nada.
+  const cargas = await MovimientoSumatoria.find({}, { subrubro_id: 1, fecha: 1, monto: 1, metodo: 1, origen: 1 }).lean();
+  const cargaById = new Map(cargas.map(c => [c._id, c]));
+  const espejoDe = new Map(caja.filter(c => c.sumatoria_mov_id != null).map(c => [c.sumatoria_mov_id, c]));
+  const sumatoriaMal = [];
+  for (const c of cargas) {
+    const e = espejoDe.get(c._id);
+    if (c.origen === 'subrubro' && e) {
+      sumatoriaMal.push({ caja_id: e._id, subrubro: nombreSub(c.subrubro_id), detalle: `Carga ${c._id} del subrubro figura en la Caja (${e.fecha})` });
+    } else if (c.origen === 'caja' && !e) {
+      sumatoriaMal.push({ subrubro: nombreSub(c.subrubro_id), detalle: `Carga ${c._id} de Caja sin su ítem en la Caja (${c.fecha} · $${r2(c.monto)})` });
+    } else if (c.origen === 'caja' && (e.fecha !== c.fecha || Math.abs((e.monto || 0) - (c.monto || 0)) > 0.005 || e.metodo !== c.metodo)) {
+      sumatoriaMal.push({ caja_id: e._id, subrubro: nombreSub(c.subrubro_id), detalle: `Caja ${e.fecha} $${r2(e.monto)} ${e.metodo} · carga ${c.fecha} $${r2(c.monto)} ${c.metodo}` });
+    }
+  }
+  for (const e of espejoDe.values()) {
+    if (!cargaById.has(e.sumatoria_mov_id)) sumatoriaMal.push({ caja_id: e._id, concepto: e.concepto, detalle: `Caja → carga de sumatoria ${e.sumatoria_mov_id} inexistente (${e.fecha})` });
+  }
+  checks.push(check('sumatoria_desincronizada', 'Cargas de sumatoria desincronizadas con la Caja',
+    'Editar la carga desde el subrubro reescribe su ítem de Caja y lo corrige.', 'error', sumatoriaMal));
 
   return {
     generado: new Date().toISOString(),

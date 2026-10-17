@@ -1,4 +1,4 @@
-const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento, CajaDescarte, CajaConfig, Producto, Recordatorio } = require('./models');
+const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento, CajaDescarte, CajaConfig, Producto, Recordatorio, ConceptoSumatoria, MovimientoSumatoria } = require('./models');
 const logger = require('./logger');
 const { hoyLocal, esFechaValida } = require('./utils/tz');
 
@@ -537,6 +537,194 @@ async function syncCajaPago(pago, sub, activo) {
   }
 }
 
+// --- SUMATORIA ---------------------------------------------------------------
+// Subrubros de tipo 'sumatoria': cada carga simplemente suma, por concepto. Viven
+// en sus propias colecciones (ConceptoSumatoria / MovimientoSumatoria) para que no
+// entren en ningún cálculo de facturas, saldos, deuda, IVA ni dashboard.
+//
+// El ORIGEN de la carga decide si toca la Caja:
+//   • 'caja'     → además de la carga, existe UN espejo en CajaMovimiento (gasto ya
+//                  contado, sin ciclo de confirmación) que descuenta del día según el
+//                  método. La fuente de verdad es la carga: el espejo se reescribe
+//                  desde acá (syncCajaSumatoria) en cada alta/edición y se borra con ella.
+//   • 'subrubro' → solo la carga. No existe nada en CajaMovimiento, así que ninguna
+//                  consulta de Caja (día, saldo de apertura, historial, gráficas,
+//                  reportes, cierres) puede incluirla: el filtro es estructural.
+
+const ORIGENES_SUMATORIA = ['caja', 'subrubro'];
+const TIPOS_SUBRUBRO = ['factura', 'deuda', 'sumatoria'];
+const MSG_TIPO_SUBRUBRO = "tipo_subrubro debe ser 'factura', 'deuda' o 'sumatoria'";
+
+// Un subrubro sumatoria no tiene facturas, pagos ni notas de crédito.
+function errorSubrubroSumatoria(sub) {
+  return errorValidacion(`"${sub?.nombre || 'El subrubro'}" es de tipo Sumatoria: cargá sus movimientos por concepto`);
+}
+const CONCEPTO_MAX = 60;
+const DESCRIPCION_MAX = 300;
+
+// Clave de agrupación de conceptos entre subrubros: sin mayúsculas, sin acentos y
+// con los espacios colapsados ("Retiro  Mercaderia " === "retiro mercadería").
+function normalizarNombreConcepto(nombre) {
+  return String(nombre || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+async function getSubrubroSumatoria(subrubroId) {
+  const sub = await Subrubro.findById(Number(subrubroId)).lean();
+  if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
+  if (sub.tipo_subrubro !== 'sumatoria') throw errorValidacion('El subrubro no es de tipo Sumatoria');
+  return sub;
+}
+
+function errorConflicto(mensaje) {
+  const e = new Error(mensaje);
+  e.statusCode = 409;
+  return e;
+}
+
+// Filtro Mongo de cargas de sumatoria a partir de los filtros de la API. `mes`
+// (YYYY-MM) tiene prioridad sobre desde/hasta. Las fechas son 'YYYY-MM-DD', así que
+// la comparación de strings es la cronológica (usa los índices *_fecha).
+function filtroSumatoria({ subrubroIds, mes, desde, hasta, conceptoIds, origen } = {}) {
+  const f = {};
+  if (subrubroIds) f.subrubro_id = { $in: subrubroIds.map(Number) };
+  if (mes) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mes)) throw errorValidacion(`Mes inválido: ${mes}`);
+    f.fecha = { $gte: `${mes}-01`, $lte: `${mes}-31` };
+  } else if (desde || hasta) {
+    if (desde && !esFechaValida(desde)) throw errorValidacion(`Fecha "desde" inválida: ${desde}`);
+    if (hasta && !esFechaValida(hasta)) throw errorValidacion(`Fecha "hasta" inválida: ${hasta}`);
+    f.fecha = {};
+    if (desde) f.fecha.$gte = desde;
+    if (hasta) f.fecha.$lte = hasta;
+  }
+  if (conceptoIds && conceptoIds.length) f.concepto_id = { $in: conceptoIds.map(Number) };
+  if (origen) {
+    if (!ORIGENES_SUMATORIA.includes(origen)) throw errorValidacion(`Origen inválido: ${origen}`);
+    f.origen = origen;
+  }
+  return f;
+}
+
+// Grupo estándar de totales ($sum en Mongo, redondeado al devolver).
+const GRUPO_TOTAL = { total: { $sum: '$monto' }, cantidad: { $sum: 1 } };
+const totalR2 = (g) => ({ total: r2(g?.total), cantidad: g?.cantidad || 0 });
+
+// Crea / actualiza el espejo en la Caja de una carga con origen 'caja'. Es un gasto
+// del día con confirmado:null (sin botón "Pagar" ni "Sin confirmar": ya descontó),
+// enlazado por sumatoria_mov_id (único). Devuelve el _id del ítem de Caja.
+async function syncCajaSumatoria(mov, sub, concepto) {
+  if (mov.origen !== 'caja') return null;
+  const set = {
+    fecha: mov.fecha,
+    tipo: 'gasto',
+    concepto: `${sub?.nombre || 'Sumatoria'} — ${concepto?.nombre || 'Concepto'}`,
+    monto: Number(mov.monto) || 0,
+    metodo: mov.metodo,
+    subrubro_id: Number(mov.subrubro_id),
+    movimiento_id: null,
+    confirmado: null,
+    origen: 'sumatoria',
+    auto_sync: false,
+    // Los retiros (efectivo/transferencia) que salen de la Caja cuentan siempre como
+    // pago especial (reporte de caja y Gráficas los separan).
+    es_especial: true,
+  };
+  const existente = await CajaMovimiento.findOne({ sumatoria_mov_id: Number(mov._id) }, { _id: 1 }).lean();
+  if (existente) {
+    await CajaMovimiento.updateOne({ _id: existente._id }, { $set: set });
+    return existente._id;
+  }
+  const cajaId = await Counter.next('caja');
+  try {
+    await CajaMovimiento.create({ _id: cajaId, sumatoria_mov_id: Number(mov._id), created_at: now(), ...set });
+    return cajaId;
+  } catch (err) {
+    // Carrera contra el único parcial de sumatoria_mov_id: el espejo ya existe.
+    if (err.code !== 11000) throw err;
+    const ganador = await CajaMovimiento.findOne({ sumatoria_mov_id: Number(mov._id) }, { _id: 1 }).lean();
+    if (!ganador) throw err;
+    await CajaMovimiento.updateOne({ _id: ganador._id }, { $set: set });
+    return ganador._id;
+  }
+}
+
+// Re-escribe los espejos de Caja de las cargas que matchean `filtro` (p. ej. al
+// renombrar un concepto o el subrubro: el concepto del ítem de Caja lleva ambos).
+async function resyncEspejosSumatoria(filtro) {
+  const movs = await MovimientoSumatoria.find({ ...filtro, origen: 'caja' }).lean();
+  if (movs.length === 0) return;
+  const [subs, conceptos] = await Promise.all([
+    Subrubro.find({ _id: { $in: [...new Set(movs.map(m => m.subrubro_id))] } }).lean(),
+    ConceptoSumatoria.find({ _id: { $in: [...new Set(movs.map(m => m.concepto_id))] } }).lean(),
+  ]);
+  const subMap = new Map(subs.map(s => [s._id, s]));
+  const conMap = new Map(conceptos.map(c => [c._id, c]));
+  for (const m of movs) await syncCajaSumatoria(m, subMap.get(m.subrubro_id), conMap.get(m.concepto_id));
+}
+
+// Borrado / vaciado de subrubros sumatoria. Mismo criterio que limpiarReferencias
+// para los pagos confirmados: el espejo de Caja es plata que realmente salió y
+// sostiene el saldo de ese día, así que NO se borra: se desvincula y queda como un
+// gasto más, con su concepto. Las cargas (y opcionalmente los conceptos) se borran.
+async function limpiarSumatorias(subIds, { borrarConceptos = false } = {}) {
+  if (!subIds.length) return 0;
+  const movIds = (await MovimientoSumatoria.find({ subrubro_id: { $in: subIds } }, { _id: 1 }).lean()).map(m => m._id);
+  if (movIds.length) {
+    await CajaMovimiento.updateMany(
+      { sumatoria_mov_id: { $in: movIds } },
+      { $set: { sumatoria_mov_id: null, origen: null, subrubro_id: null } },
+    );
+  }
+  const { deletedCount } = await MovimientoSumatoria.deleteMany({ subrubro_id: { $in: subIds } });
+  if (borrarConceptos) await ConceptoSumatoria.deleteMany({ subrubro_id: { $in: subIds } });
+  return deletedCount || 0;
+}
+
+// Valida un concepto para una carga. `cambia` = el concepto es nuevo para la carga
+// (alta, o edición que lo cambia): recién ahí se exige que esté activo y, si la
+// carga es de Caja, que se ofrezca en la Caja. Mantener el concepto actual de una
+// carga vieja siempre se permite aunque después se haya desactivado.
+async function validarConceptoCarga(conceptoId, sub, origen, cambia) {
+  const concepto = await ConceptoSumatoria.findById(Number(conceptoId)).lean();
+  if (!concepto || concepto.subrubro_id !== sub._id) throw errorValidacion('Elegí un concepto válido del subrubro');
+  if (cambia && !concepto.activo) throw errorValidacion(`El concepto "${concepto.nombre}" está desactivado`);
+  if (cambia && origen === 'caja' && !concepto.mostrar_en_caja) {
+    throw errorValidacion(`El concepto "${concepto.nombre}" no se carga desde la Caja del Día`);
+  }
+  return concepto;
+}
+
+function validarMontoSumatoria(monto) {
+  const n = Number(monto);
+  if (monto === '' || monto == null || !Number.isFinite(n) || n <= 0) throw errorValidacion('El monto debe ser mayor a 0');
+  return r2(n);
+}
+
+function validarFechaSumatoria(fecha) {
+  if (!esFechaValida(fecha)) throw errorValidacion(`Fecha inválida: ${fecha ?? '(vacía)'}`);
+  validarFecha(fecha);
+  return fecha;
+}
+
+function validarDescripcion(d) {
+  const s = String(d ?? '').trim();
+  if (s.length > DESCRIPCION_MAX) throw errorValidacion(`La descripción no puede superar ${DESCRIPCION_MAX} caracteres`);
+  return s;
+}
+
+// Carga lista para la respuesta: con nombres legibles (quedan en la auditoría).
+async function cargaConNombres(movId) {
+  const m = await MovimientoSumatoria.findById(Number(movId)).lean();
+  if (!m) return null;
+  const [sub, concepto] = await Promise.all([
+    Subrubro.findById(m.subrubro_id, { nombre: 1 }).lean(),
+    ConceptoSumatoria.findById(m.concepto_id, { nombre: 1 }).lean(),
+  ]);
+  return { ...withId(m), subrubro_nombre: sub?.nombre || null, concepto_nombre: concepto?.nombre || null };
+}
+
 const db = {
   // --- LOCALES ---
   async getLocales() {
@@ -559,6 +747,7 @@ const db = {
     const subs = await Subrubro.find({ rubro_id: { $in: rubroIds } }, { _id: 1 }).lean();
     const subIds = subs.map(s => s._id);
     await limpiarReferencias({ subIds, rubroIds });
+    await limpiarSumatorias(subIds, { borrarConceptos: true });
     await Movimiento.deleteMany({ subrubro_id: { $in: subIds } });
     await Subrubro.deleteMany({ rubro_id: { $in: rubroIds } });
     await Campo.deleteMany({ rubro_id: { $in: rubroIds } });
@@ -590,6 +779,7 @@ const db = {
     const subs = await Subrubro.find({ rubro_id: iid }, { _id: 1 }).lean();
     const subIds = subs.map(s => s._id);
     await limpiarReferencias({ subIds, rubroIds: [iid] });
+    await limpiarSumatorias(subIds, { borrarConceptos: true });
     await Movimiento.deleteMany({ subrubro_id: { $in: subIds } });
     await Subrubro.deleteMany({ rubro_id: iid });
     await Campo.deleteMany({ rubro_id: iid });
@@ -682,14 +872,31 @@ const db = {
       doc.metodo_pago_default = extra.metodo_pago_default;
     }
     if (extra.tipo_subrubro !== undefined && extra.tipo_subrubro !== null && extra.tipo_subrubro !== '') {
-      if (!['factura', 'deuda'].includes(extra.tipo_subrubro)) throw errorValidacion("tipo_subrubro debe ser 'factura' o 'deuda'");
+      if (!TIPOS_SUBRUBRO.includes(extra.tipo_subrubro)) throw errorValidacion(MSG_TIPO_SUBRUBRO);
       doc.tipo_subrubro = extra.tipo_subrubro;
     }
-    // El descuento por pago no aplica a las deudas a cobrar: se fuerza false.
+    // El descuento por pago no aplica a las deudas a cobrar ni a las sumatorias: se fuerza false.
     if (extra.aplica_descuento !== undefined) {
-      doc.aplica_descuento = doc.tipo_subrubro === 'deuda' ? false : Boolean(extra.aplica_descuento);
+      doc.aplica_descuento = !doc.tipo_subrubro || doc.tipo_subrubro === 'factura' ? Boolean(extra.aplica_descuento) : false;
     }
-    return withId((await Subrubro.create(doc)).toObject());
+    // Conceptos iniciales de una sumatoria (el formulario ofrece los sugeridos,
+    // editables): se validan antes de crear el subrubro para no dejarlo a medias.
+    const conceptosIniciales = [];
+    if (doc.tipo_subrubro === 'sumatoria' && Array.isArray(extra.conceptos)) {
+      const vistos = new Set();
+      for (const c of extra.conceptos) {
+        const nombreC = String(c?.nombre || '').replace(/\s+/g, ' ').trim();
+        if (!nombreC) continue;
+        if (nombreC.length > CONCEPTO_MAX) throw errorValidacion(`El concepto "${nombreC}" supera ${CONCEPTO_MAX} caracteres`);
+        const norm = normalizarNombreConcepto(nombreC);
+        if (vistos.has(norm)) throw errorValidacion(`El concepto "${nombreC}" está repetido`);
+        vistos.add(norm);
+        conceptosIniciales.push({ nombre: nombreC, mostrar_en_caja: c?.mostrar_en_caja !== false, color: c?.color || null });
+      }
+    }
+    const creado = withId((await Subrubro.create(doc)).toObject());
+    for (const c of conceptosIniciales) await this.createConceptoSumatoria(id, c);
+    return creado;
   },
   async updateSubrubro(id, fields = {}) {
     const upd = {};
@@ -740,14 +947,36 @@ const db = {
     }
     if (fields.tipo_subrubro !== undefined) {
       const ts = fields.tipo_subrubro || 'factura';
-      if (!['factura', 'deuda'].includes(ts)) throw errorValidacion("tipo_subrubro debe ser 'factura' o 'deuda'");
+      if (!TIPOS_SUBRUBRO.includes(ts)) throw errorValidacion(MSG_TIPO_SUBRUBRO);
       upd.tipo_subrubro = ts;
     }
+    const previo = await Subrubro.findById(Number(id)).lean();
+    if (!previo) throw errorNoEncontrado('Subrubro no encontrado');
+    const tipoPrevio = previo.tipo_subrubro || 'factura';
+    // Sumatoria ↔ factura/deuda guardan sus datos en colecciones distintas: convertir
+    // un subrubro con datos dejaría sus cargas o sus facturas invisibles. Solo se
+    // permite mientras está vacío.
+    if (upd.tipo_subrubro !== undefined && upd.tipo_subrubro !== tipoPrevio &&
+        (upd.tipo_subrubro === 'sumatoria' || tipoPrevio === 'sumatoria')) {
+      const conDatos = tipoPrevio === 'sumatoria'
+        ? await MovimientoSumatoria.exists({ subrubro_id: previo._id })
+        : await Movimiento.exists({ subrubro_id: previo._id });
+      if (conDatos) {
+        throw errorValidacion(tipoPrevio === 'sumatoria'
+          ? 'El subrubro tiene cargas de sumatoria: no se puede cambiar de tipo'
+          : 'El subrubro tiene movimientos: no se puede convertir en Sumatoria');
+      }
+    }
     if (fields.aplica_descuento !== undefined) upd.aplica_descuento = Boolean(fields.aplica_descuento);
-    // Una deuda a cobrar nunca lleva descuento por pago: si el subrubro pasa a 'deuda'
-    // (ahora o ya lo era y no se está cambiando), el flag se apaga.
-    if (upd.tipo_subrubro === 'deuda') upd.aplica_descuento = false;
+    // Una deuda a cobrar o una sumatoria nunca llevan descuento por pago: si el
+    // subrubro pasa a ese tipo (ahora o ya lo era y no se está cambiando), el flag se apaga.
+    const tipoFinal = upd.tipo_subrubro ?? tipoPrevio;
+    if (tipoFinal === 'deuda' || tipoFinal === 'sumatoria') upd.aplica_descuento = false;
     await Subrubro.findByIdAndUpdate(Number(id), upd);
+    // El concepto de los espejos de Caja de una sumatoria lleva el nombre del subrubro.
+    if (tipoFinal === 'sumatoria' && upd.nombre !== undefined && upd.nombre !== previo.nombre) {
+      await resyncEspejosSumatoria({ subrubro_id: previo._id });
+    }
     // Si se fijó un método de pago ('efectivo'/'transferencia'), aplicarlo a TODOS los
     // pagos existentes del subrubro (el método del subrubro manda). Con 'ambas' no se toca nada.
     if (upd.metodo_pago_default === 'efectivo' || upd.metodo_pago_default === 'transferencia') {
@@ -789,6 +1018,7 @@ const db = {
   async deleteSubrubro(id) {
     const iid = Number(id);
     await limpiarReferencias({ subIds: [iid] });
+    await limpiarSumatorias([iid], { borrarConceptos: true });
     await Movimiento.deleteMany({ subrubro_id: iid });
     await Subrubro.findByIdAndDelete(iid);
   },
@@ -849,6 +1079,7 @@ const db = {
   async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [], percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
+    if (sub.tipo_subrubro === 'sumatoria') throw errorSubrubroSumatoria(sub);
     // Guarda de idempotencia: si ya existe un movimiento con esta clave, es un
     // reintento de la misma alta → devolver el existente sin crear un duplicado.
     if (idempotency_key) {
@@ -1091,8 +1322,10 @@ const db = {
     const sub = await Subrubro.findById(iid);
     if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
     await limpiarReferencias({ subIds: [iid], soloMovimientos: true });
+    // Vaciar una sumatoria borra sus cargas pero conserva sus conceptos.
+    const sumatorias = await limpiarSumatorias([iid]);
     const { deletedCount } = await Movimiento.deleteMany({ subrubro_id: iid });
-    return { deleted: deletedCount };
+    return { deleted: deletedCount + sumatorias };
   },
 
   async clearAllMovimientos(rubroId) {
@@ -1100,17 +1333,19 @@ const db = {
     const subs = await Subrubro.find({ rubro_id: rid }, { _id: 1 }).lean();
     const subIds = subs.map(s => s._id);
     await limpiarReferencias({ subIds, soloMovimientos: true });
+    const sumatorias = await limpiarSumatorias(subIds);
     const { deletedCount } = await Movimiento.deleteMany({ subrubro_id: { $in: subIds } });
     // Barrido de huérfanos: movimientos cuyo subrubro fue borrado y quedaron sueltos
     // (importaciones viejas que no cascadeaban). Evita que "Vaciar todo" deje datos.
     const allSubIds = (await Subrubro.find({}, { _id: 1 }).lean()).map(s => s._id);
     const { deletedCount: huerfanos } = await Movimiento.deleteMany({ subrubro_id: { $nin: allSubIds } });
-    return { deleted: deletedCount + huerfanos };
+    return { deleted: deletedCount + huerfanos + sumatorias };
   },
 
   async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null, percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
+    if (sub.tipo_subrubro === 'sumatoria') throw errorSubrubroSumatoria(sub);
     // Guarda de idempotencia (mismo criterio que createMovimiento).
     if (idempotency_key) {
       const existente = await findMovByIdemKey(idempotency_key);
@@ -1520,7 +1755,26 @@ const db = {
 
     const hoyStr = hoy();
 
+    // Subrubros sumatoria: no tienen saldo; la tarjeta muestra el total del mes.
+    const sumIds = subs.filter(s => s.tipo_subrubro === 'sumatoria').map(s => s._id);
+    const mesHoy = hoyStr.slice(0, 7);
+    const totalesSum = sumIds.length
+      ? new Map((await MovimientoSumatoria.aggregate([
+          { $match: { subrubro_id: { $in: sumIds }, fecha: { $gte: `${mesHoy}-01`, $lte: `${mesHoy}-31` } } },
+          { $group: { _id: '$subrubro_id', ...GRUPO_TOTAL } },
+        ])).map(g => [g._id, totalR2(g)]))
+      : new Map();
+
     return subs.map(s => {
+      if (s.tipo_subrubro === 'sumatoria') {
+        const t = totalesSum.get(s._id) || { total: 0, cantidad: 0 };
+        return {
+          id: s._id, nombre: s.nombre, icon: s.icon || null, tipo_subrubro: 'sumatoria',
+          facturado: 0, pagado: 0, pendiente: 0, saldo: 0, diferencia: 0,
+          proximo_vencimiento: null, importe_proximo_vencimiento: null, vencido: false, metodo_habitual: null,
+          total_mes: t.total, cantidad_mes: t.cantidad,
+        };
+      }
       const lista = porSub.get(s._id) || [];
       const facturado = lista.reduce((a, m) => a + (m.tipo === 'factura' ? (m.monto || 0) : 0), 0);
       const pagado = lista.reduce((a, m) => a + (m.pago || 0), 0);
@@ -1565,6 +1819,7 @@ const db = {
         importe_proximo_vencimiento: prox?.importe ?? null,
         vencido: prox ? prox.fecha < hoyStr : false,
         metodo_habitual,
+        tipo_subrubro: s.tipo_subrubro || 'factura',
       };
     }).sort((a, b) => b.saldo - a.saldo);
   },
@@ -1574,7 +1829,7 @@ const db = {
   // mes anterior y del mes actual, facturado/pagado del mes, diferencia, % de cambio
   // y tendencia. `subrubroId` opcional restringe a un solo subrubro.
   async getSubrubrosMensual(rubroId, mes, subrubroId = null) {
-    const filtro = { rubro_id: Number(rubroId) };
+    const filtro = { rubro_id: Number(rubroId), tipo_subrubro: { $ne: 'sumatoria' } };
     if (subrubroId) filtro._id = Number(subrubroId);
     const subs = await Subrubro.find(filtro).lean();
     if (subs.length === 0) return { mes, mesAnterior: prevMes(mes), subrubros: [] };
@@ -1621,6 +1876,329 @@ const db = {
     }).sort((a, b) => b.saldoActual - a.saldoActual);
 
     return { mes, mesAnterior, subrubros };
+  },
+
+  // --- SUMATORIA: subrubros ---
+  async getSubrubrosSumatoria() {
+    const subs = await Subrubro.find({ tipo_subrubro: 'sumatoria' }, { nombre: 1, rubro_id: 1, icon: 1 }).sort({ nombre: 1 }).lean();
+    return withIds(subs);
+  },
+
+  // --- SUMATORIA: conceptos ---
+  async getConceptosSumatoria(subrubroId) {
+    const sub = await getSubrubroSumatoria(subrubroId);
+    const [conceptos, usos] = await Promise.all([
+      ConceptoSumatoria.find({ subrubro_id: sub._id }).sort({ orden: 1, _id: 1 }).lean(),
+      MovimientoSumatoria.aggregate([
+        { $match: { subrubro_id: sub._id } },
+        { $group: { _id: '$concepto_id', cantidad: { $sum: 1 } } },
+      ]),
+    ]);
+    const usosMap = new Map(usos.map(u => [u._id, u.cantidad]));
+    return conceptos.map(c => ({ ...withId(c), cantidad_movimientos: usosMap.get(c._id) || 0 }));
+  },
+
+  async createConceptoSumatoria(subrubroId, { nombre, mostrar_en_caja = true, color = null } = {}) {
+    const sub = await getSubrubroSumatoria(subrubroId);
+    const limpio = String(nombre || '').replace(/\s+/g, ' ').trim();
+    if (!limpio) throw errorValidacion('Ingresá el nombre del concepto');
+    if (limpio.length > CONCEPTO_MAX) throw errorValidacion(`El nombre no puede superar ${CONCEPTO_MAX} caracteres`);
+    const norm = normalizarNombreConcepto(limpio);
+    const dup = await ConceptoSumatoria.findOne({ subrubro_id: sub._id, nombre_normalizado: norm }).lean();
+    if (dup) {
+      throw errorConflicto(dup.activo
+        ? `Ya existe el concepto "${dup.nombre}"`
+        : `Ya existe el concepto "${dup.nombre}" (desactivado): reactivalo en vez de crearlo de nuevo`);
+    }
+    const ultimo = await ConceptoSumatoria.findOne({ subrubro_id: sub._id }).sort({ orden: -1 }).lean();
+    const id = await Counter.next('sumatoria_conceptos');
+    try {
+      await ConceptoSumatoria.create({
+        _id: id, subrubro_id: sub._id, nombre: limpio, nombre_normalizado: norm,
+        mostrar_en_caja: mostrar_en_caja !== false, color: color || null,
+        activo: true, orden: (ultimo?.orden ?? -1) + 1, created_at: now(),
+      });
+    } catch (err) {
+      if (err.code === 11000) throw errorConflicto(`Ya existe el concepto "${limpio}"`);
+      throw err;
+    }
+    return { ...withId(await ConceptoSumatoria.findById(id).lean()), cantidad_movimientos: 0 };
+  },
+
+  async updateConceptoSumatoria(id, fields = {}) {
+    const c = await ConceptoSumatoria.findById(Number(id)).lean();
+    if (!c) throw errorNoEncontrado('Concepto no encontrado');
+    const upd = {};
+    if (fields.nombre !== undefined) {
+      const limpio = String(fields.nombre || '').replace(/\s+/g, ' ').trim();
+      if (!limpio) throw errorValidacion('Ingresá el nombre del concepto');
+      if (limpio.length > CONCEPTO_MAX) throw errorValidacion(`El nombre no puede superar ${CONCEPTO_MAX} caracteres`);
+      const norm = normalizarNombreConcepto(limpio);
+      const dup = await ConceptoSumatoria.findOne({ subrubro_id: c.subrubro_id, nombre_normalizado: norm, _id: { $ne: c._id } }).lean();
+      if (dup) throw errorConflicto(`Ya existe el concepto "${dup.nombre}"`);
+      upd.nombre = limpio;
+      upd.nombre_normalizado = norm;
+    }
+    if (fields.mostrar_en_caja !== undefined) upd.mostrar_en_caja = Boolean(fields.mostrar_en_caja);
+    if (fields.color !== undefined) upd.color = fields.color || null;
+    if (fields.activo !== undefined) upd.activo = Boolean(fields.activo);
+    if (fields.orden !== undefined) {
+      const o = Number(fields.orden);
+      if (!Number.isInteger(o) || o < 0) throw errorValidacion('Orden inválido');
+      upd.orden = o;
+    }
+    await ConceptoSumatoria.updateOne({ _id: c._id }, { $set: upd });
+    // El concepto del ítem de Caja lleva el nombre: renombrar re-escribe los espejos.
+    if (upd.nombre && upd.nombre !== c.nombre) await resyncEspejosSumatoria({ concepto_id: c._id });
+    const usos = await MovimientoSumatoria.countDocuments({ concepto_id: c._id });
+    return { ...withId(await ConceptoSumatoria.findById(c._id).lean()), cantidad_movimientos: usos };
+  },
+
+  async reordenarConceptosSumatoria(subrubroId, ids = []) {
+    const sub = await getSubrubroSumatoria(subrubroId);
+    if (!Array.isArray(ids)) throw errorValidacion('ids debe ser una lista');
+    const propios = new Set((await ConceptoSumatoria.find({ subrubro_id: sub._id }, { _id: 1 }).lean()).map(c => c._id));
+    const ops = ids.map(Number).filter(i => propios.has(i))
+      .map((cid, i) => ({ updateOne: { filter: { _id: cid }, update: { $set: { orden: i } } } }));
+    if (ops.length) await ConceptoSumatoria.bulkWrite(ops, { ordered: false });
+    return this.getConceptosSumatoria(sub._id);
+  },
+
+  // Un concepto con cargas NO se elimina (perdería el detalle de esas cargas): se
+  // desactiva. Sin cargas, se borra.
+  async deleteConceptoSumatoria(id) {
+    const c = await ConceptoSumatoria.findById(Number(id)).lean();
+    if (!c) throw errorNoEncontrado('Concepto no encontrado');
+    const usos = await MovimientoSumatoria.countDocuments({ concepto_id: c._id });
+    if (usos > 0) {
+      await ConceptoSumatoria.updateOne({ _id: c._id }, { $set: { activo: false } });
+      return { ok: true, eliminado: false, desactivado: true, id: c._id, nombre: c.nombre, cantidad_movimientos: usos };
+    }
+    await ConceptoSumatoria.deleteOne({ _id: c._id });
+    return { ok: true, eliminado: true, desactivado: false, id: c._id, nombre: c.nombre };
+  },
+
+  // --- SUMATORIA: cargas ---
+  async getMovimientosSumatoria(subrubroId, filtros = {}) {
+    const sub = await getSubrubroSumatoria(subrubroId);
+    const filtro = filtroSumatoria({ ...filtros, subrubroIds: [sub._id] });
+    return withIds(await MovimientoSumatoria.find(filtro).sort({ fecha: -1, _id: -1 }).limit(5000).lean());
+  },
+
+  async getMovimientoSumatoria(id) {
+    const m = await cargaConNombres(id);
+    if (!m) throw errorNoEncontrado('Carga no encontrada');
+    return m;
+  },
+
+  async createMovimientoSumatoria(subrubroId, data = {}, usuario = null) {
+    const sub = await getSubrubroSumatoria(subrubroId);
+    const { concepto_id, fecha, monto, descripcion, origen, metodo, idempotency_key } = data;
+    // Guarda de idempotencia (doble clic / reenvío): devuelve la carga ya creada.
+    if (idempotency_key) {
+      const existente = await MovimientoSumatoria.findOne({ idempotency_key: String(idempotency_key) }, { _id: 1 }).lean();
+      if (existente) {
+        logger.warn({ idempotency_key, sumatoria_mov_id: existente._id }, 'Alta de sumatoria duplicada evitada (idempotency_key)');
+        return cargaConNombres(existente._id);
+      }
+    }
+    if (!ORIGENES_SUMATORIA.includes(origen)) throw errorValidacion("origen debe ser 'caja' o 'subrubro'");
+    const concepto = await validarConceptoCarga(concepto_id, sub, origen, true);
+    const doc = {
+      subrubro_id: sub._id,
+      concepto_id: concepto._id,
+      fecha: validarFechaSumatoria(fecha),
+      monto: validarMontoSumatoria(monto),
+      descripcion: validarDescripcion(descripcion),
+      origen,
+      // Solo una carga de Caja tiene método: una del subrubro no mueve plata del día.
+      metodo: null,
+    };
+    if (origen === 'caja') {
+      doc.metodo = normalizarMetodoPago(metodo);
+      if (!doc.metodo) throw errorValidacion('Elegí el método: efectivo o transferencia');
+    }
+    const id = await Counter.next('sumatoria_movimientos');
+    try {
+      await MovimientoSumatoria.create({
+        _id: id, ...doc, caja_mov_id: null,
+        idempotency_key: idempotency_key ? String(idempotency_key) : null,
+        created_by: usuario, created_at: now(),
+      });
+    } catch (err) {
+      if (err.code === 11000 && idempotency_key) {
+        const ganador = await MovimientoSumatoria.findOne({ idempotency_key: String(idempotency_key) }, { _id: 1 }).lean();
+        if (ganador) return cargaConNombres(ganador._id);
+      }
+      throw err;
+    }
+    if (origen === 'caja') {
+      try {
+        const cajaId = await syncCajaSumatoria({ _id: id, ...doc }, sub, concepto);
+        await MovimientoSumatoria.updateOne({ _id: id }, { $set: { caja_mov_id: cajaId } });
+      } catch (err) {
+        // Sin su espejo, una carga "de Caja" no descontaría del día: se deshace.
+        await MovimientoSumatoria.deleteOne({ _id: id });
+        throw err;
+      }
+    }
+    return cargaConNombres(id);
+  },
+
+  async updateMovimientoSumatoria(id, data = {}, usuario = null) {
+    const mov = await MovimientoSumatoria.findById(Number(id)).lean();
+    if (!mov) throw errorNoEncontrado('Carga no encontrada');
+    if (data.origen !== undefined && data.origen !== mov.origen) {
+      throw errorValidacion('El origen de una carga no se puede cambiar');
+    }
+    const sub = await Subrubro.findById(mov.subrubro_id).lean();
+    if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
+    const cambiaConcepto = data.concepto_id !== undefined && data.concepto_id !== null && Number(data.concepto_id) !== mov.concepto_id;
+    const concepto = await validarConceptoCarga(cambiaConcepto ? data.concepto_id : mov.concepto_id, sub, mov.origen, cambiaConcepto);
+    const set = { concepto_id: concepto._id, updated_by: usuario, updated_at: now() };
+    if (data.fecha !== undefined) set.fecha = validarFechaSumatoria(data.fecha);
+    if (data.monto !== undefined) set.monto = validarMontoSumatoria(data.monto);
+    if (data.descripcion !== undefined) set.descripcion = validarDescripcion(data.descripcion);
+    if (data.metodo !== undefined) {
+      const m = normalizarMetodoPago(data.metodo);
+      if (mov.origen === 'caja' && !m) throw errorValidacion('Elegí el método: efectivo o transferencia');
+      if (mov.origen === 'subrubro' && m) throw errorValidacion('Una carga del subrubro no lleva método: no impacta en la Caja');
+      set.metodo = m;
+    }
+    await MovimientoSumatoria.updateOne({ _id: mov._id }, { $set: set });
+    if (mov.origen === 'caja') {
+      // La Caja acompaña: monto, método y fecha (cambiar la fecha la muda a la Caja
+      // del nuevo día). Si el espejo se hubiera perdido, se recrea.
+      const cajaId = await syncCajaSumatoria({ ...mov, ...set }, sub, concepto);
+      if (cajaId !== mov.caja_mov_id) await MovimientoSumatoria.updateOne({ _id: mov._id }, { $set: { caja_mov_id: cajaId } });
+    }
+    return cargaConNombres(mov._id);
+  },
+
+  async deleteMovimientoSumatoria(id) {
+    const mov = await MovimientoSumatoria.findById(Number(id)).lean();
+    if (!mov) throw errorNoEncontrado('Carga no encontrada');
+    // Primero el espejo: si fallara, la carga sigue y la Caja no queda con un gasto huérfano.
+    await CajaMovimiento.deleteMany({ sumatoria_mov_id: mov._id });
+    await MovimientoSumatoria.deleteOne({ _id: mov._id });
+    return { ok: true, id: mov._id, origen: mov.origen, caja_mov_id: mov.caja_mov_id };
+  },
+
+  // Resumen de un subrubro sumatoria, todo calculado en Mongo:
+  //   • total / por_mes / celdas (mes × concepto) / por_origen → con TODOS los filtros.
+  //   • tarjetas (por concepto) → con período + origen pero SIN el filtro de concepto,
+  //     para que las tarjetas sigan mostrando todos los conceptos y sirvan para filtrar.
+  async getResumenSumatoria(subrubroId, filtros = {}) {
+    const sub = await getSubrubroSumatoria(subrubroId);
+    const filtro = filtroSumatoria({ ...filtros, subrubroIds: [sub._id] });
+    const base = filtroSumatoria({ ...filtros, conceptoIds: null, subrubroIds: [sub._id] });
+    const mes = { $substrBytes: ['$fecha', 0, 7] };
+    const [[f], tarjetas] = await Promise.all([
+      MovimientoSumatoria.aggregate([
+        { $match: filtro },
+        { $facet: {
+          total: [{ $group: { _id: null, ...GRUPO_TOTAL } }],
+          por_mes: [{ $group: { _id: mes, ...GRUPO_TOTAL } }, { $sort: { _id: -1 } }],
+          por_concepto: [{ $group: { _id: '$concepto_id', ...GRUPO_TOTAL } }],
+          por_origen: [{ $group: { _id: '$origen', ...GRUPO_TOTAL } }],
+          celdas: [{ $group: { _id: { mes, concepto_id: '$concepto_id' }, ...GRUPO_TOTAL } }],
+        } },
+      ]),
+      MovimientoSumatoria.aggregate([
+        { $match: base },
+        { $group: { _id: '$concepto_id', ...GRUPO_TOTAL } },
+      ]),
+    ]);
+    return {
+      ...totalR2(f.total[0]),
+      por_mes: f.por_mes.map(g => ({ mes: g._id, ...totalR2(g) })),
+      por_concepto: f.por_concepto.map(g => ({ concepto_id: g._id, ...totalR2(g) })),
+      por_origen: Object.fromEntries(f.por_origen.map(g => [g._id, totalR2(g)])),
+      celdas: f.celdas.map(g => ({ mes: g._id.mes, concepto_id: g._id.concepto_id, ...totalR2(g) })),
+      tarjetas: tarjetas.map(g => ({ concepto_id: g._id, ...totalR2(g) })),
+    };
+  },
+
+  // Resumen general de TODOS los subrubros sumatoria: subrubros × conceptos, con los
+  // conceptos agrupados por nombre normalizado para poder comparar entre subrubros.
+  // `conceptos` = claves normalizadas (las que devuelve `conceptos_disponibles`).
+  async getResumenGeneralSumatorias({ mes, desde, hasta, subrubroIds, conceptos, origen } = {}) {
+    const subFiltro = { tipo_subrubro: 'sumatoria' };
+    if (subrubroIds && subrubroIds.length) subFiltro._id = { $in: subrubroIds.map(Number) };
+    const [subs, todosSubs] = await Promise.all([
+      Subrubro.find(subFiltro).lean(),
+      Subrubro.find({ tipo_subrubro: 'sumatoria' }, { nombre: 1, rubro_id: 1 }).lean(),
+    ]);
+    const rubros = await Rubro.find({ _id: { $in: [...new Set(todosSubs.map(s => s.rubro_id))] } }, { nombre: 1, local_id: 1 }).lean();
+    const locales = await Local.find({ _id: { $in: [...new Set(rubros.map(r => r.local_id))] } }, { nombre: 1 }).lean();
+    const rubroMap = new Map(rubros.map(r => [r._id, r]));
+    const localMap = new Map(locales.map(l => [l._id, l]));
+    const etiqueta = (s) => {
+      const r = rubroMap.get(s.rubro_id);
+      return { id: s._id, nombre: s.nombre, rubro_id: s.rubro_id, rubro: r?.nombre || null, local: r ? localMap.get(r.local_id)?.nombre || null : null };
+    };
+
+    // Columnas posibles (para el filtro): un nombre visible por clave normalizada.
+    const disponibles = await ConceptoSumatoria.aggregate([
+      { $match: { subrubro_id: { $in: todosSubs.map(s => s._id) } } },
+      { $sort: { orden: 1, _id: 1 } },
+      { $group: { _id: '$nombre_normalizado', nombre: { $first: '$nombre' } } },
+      { $sort: { _id: 1 } },
+    ]);
+    const nombreClave = new Map(disponibles.map(d => [d._id, d.nombre]));
+
+    const vacio = { total: 0, cantidad: 0, filas: [], columnas: [], celdas: [] };
+    const base = {
+      subrubros_disponibles: todosSubs.map(etiqueta).sort((a, b) => a.nombre.localeCompare(b.nombre, 'es')),
+      conceptos_disponibles: disponibles.map(d => ({ clave: d._id, nombre: d.nombre })),
+    };
+    if (subs.length === 0) return { ...vacio, ...base };
+
+    const pipeline = [
+      { $match: filtroSumatoria({ mes, desde, hasta, origen, subrubroIds: subs.map(s => s._id) }) },
+      { $lookup: { from: ConceptoSumatoria.collection.name, localField: 'concepto_id', foreignField: '_id', as: 'c' } },
+      { $unwind: '$c' },
+    ];
+    if (conceptos && conceptos.length) {
+      pipeline.push({ $match: { 'c.nombre_normalizado': { $in: conceptos.map(normalizarNombreConcepto) } } });
+    }
+    pipeline.push({ $facet: {
+      total: [{ $group: { _id: null, ...GRUPO_TOTAL } }],
+      por_subrubro: [{ $group: { _id: '$subrubro_id', ...GRUPO_TOTAL } }],
+      por_concepto: [{ $group: { _id: '$c.nombre_normalizado', ...GRUPO_TOTAL } }],
+      celdas: [{ $group: { _id: { s: '$subrubro_id', k: '$c.nombre_normalizado' }, ...GRUPO_TOTAL } }],
+    } });
+    const [f] = await MovimientoSumatoria.aggregate(pipeline);
+    const subMap = new Map(subs.map(s => [s._id, s]));
+    return {
+      ...base,
+      ...totalR2(f.total[0]),
+      filas: f.por_subrubro
+        .filter(g => subMap.has(g._id))
+        .map(g => ({ ...etiqueta(subMap.get(g._id)), ...totalR2(g) }))
+        .sort((a, b) => b.total - a.total),
+      columnas: f.por_concepto
+        .map(g => ({ clave: g._id, nombre: nombreClave.get(g._id) || g._id, ...totalR2(g) }))
+        .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es')),
+      celdas: f.celdas.map(g => ({ subrubro_id: g._id.s, clave: g._id.k, ...totalR2(g) })),
+    };
+  },
+
+  // Datos de sumatoria de los ítems de Caja espejo (concepto, color, descripción):
+  // campo derivado de solo lectura para el badge de la Caja del Día.
+  async datosSumatoriaDeCaja(items) {
+    const ids = [...new Set(items.map(i => i.sumatoria_mov_id).filter(v => v != null))];
+    if (ids.length === 0) return new Map();
+    const movs = await MovimientoSumatoria.find({ _id: { $in: ids } }, { concepto_id: 1, descripcion: 1, origen: 1 }).lean();
+    const conceptos = await ConceptoSumatoria.find({ _id: { $in: [...new Set(movs.map(m => m.concepto_id))] } }, { nombre: 1, color: 1 }).lean();
+    const cMap = new Map(conceptos.map(c => [c._id, c]));
+    return new Map(movs.map(m => [m._id, {
+      id: m._id,
+      concepto_id: m.concepto_id,
+      concepto_nombre: cMap.get(m.concepto_id)?.nombre || null,
+      color: cMap.get(m.concepto_id)?.color || null,
+      descripcion: m.descripcion || '',
+    }]));
   },
 
   async getConfig() {

@@ -1,5 +1,27 @@
 # Changelog — Kontia backend
 
+## Sin publicar
+
+### Subrubro tipo Sumatoria
+- Nuevo `tipo_subrubro: 'sumatoria'`: acumula cargas por concepto (ej. retiros
+  de un socio), sin estados, vencimientos ni saldos. Facturas/Gastos y Deuda no
+  cambian y no requieren migración.
+- Colecciones nuevas `ConceptoSumatoria` y `MovimientoSumatoria` (no usan
+  `Movimiento`, así no entran en saldos, deuda, dashboard, IVA ni reportes).
+- El `origen` de la carga (fijo desde el alta) decide si toca la Caja:
+  `caja` crea un único espejo en `CajaMovimiento` (`origen: 'sumatoria'`,
+  `sumatoria_mov_id`, gasto sin ciclo de confirmación) que descuenta según el
+  método; `subrubro` no crea nada en la Caja, así que ninguna consulta de Caja
+  puede incluirlo. Editar/borrar desde la Caja edita/borra la carga.
+- API `/api/sumatorias`: conceptos (crear, renombrar, reordenar, `mostrar_en_caja`,
+  color, desactivar — con cargas no se borran), cargas, resumen por subrubro y
+  resumen general (`$group` en Mongo; conceptos agrupados por nombre normalizado).
+- Un subrubro no puede pasar de/a Sumatoria si tiene datos. Facturas, pagos,
+  importación de Excel y gastos de Caja vinculados se rechazan en una sumatoria.
+- Backup/restore incluye las dos colecciones; auditoría con recursos
+  `sumatoria_movimiento` / `sumatoria_concepto`; nueva verificación
+  `sumatoria_desincronizada` en `/audit/inconsistencias`.
+
 ## 1.1.0 — 2026-09-30
 
 Versión que sale de la auditoría del 29/09/2026. Al arrancar, el servidor migra

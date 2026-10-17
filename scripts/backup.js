@@ -9,7 +9,7 @@ const mongoose = require('mongoose');
 const COLLECTIONS = [
   'Counter', 'Local', 'Rubro', 'Subrubro', 'Movimiento', 'Campo', 'Categoria',
   'ImportConfig', 'CajaMovimiento', 'CajaConfig', 'AppConfig', 'User',
-  'Producto', 'MovimientoStock', 'Audit',
+  'Producto', 'MovimientoStock', 'Audit', 'ConceptoSumatoria', 'MovimientoSumatoria',
 ];
 
 async function main() {
