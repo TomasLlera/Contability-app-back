@@ -17,6 +17,8 @@ const SECTORES = [
   { model: 'Movimiento', file: 'movimientos' },
   { model: 'ConceptoSumatoria', file: 'sumatoria_conceptos' },
   { model: 'MovimientoSumatoria', file: 'sumatoria_movimientos' },
+  { model: 'Banco', file: 'bancos' },
+  { model: 'MovimientoBanco', file: 'movimientos_banco' },
   { model: 'Campo', file: 'campos' },
   { model: 'Categoria', file: 'categorias' },
   { model: 'CajaMovimiento', file: 'caja_movimientos' },
@@ -50,6 +52,7 @@ const CONTADORES = {
   iva_ventas: 'IvaVenta', iva_creditos: 'IvaCredito', ventas_sistema: 'VentaSistema',
   tarjetas: 'TarjetaTransaccion', recordatorios: 'Recordatorio', users: 'User', audit: 'Audit',
   sumatoria_conceptos: 'ConceptoSumatoria', sumatoria_movimientos: 'MovimientoSumatoria',
+  bancos: 'Banco', movimientos_banco: 'MovimientoBanco',
 };
 
 // Deja cada contador en max(_id) de su colección (y nunca por debajo de lo que ya

@@ -61,6 +61,9 @@ const subrubroSchema = new mongoose.Schema({
   //   'efectivo' / 'transferencia' → se asigna automáticamente y bloquea el selector al crear un pago.
   //   'ambas' → el usuario elige el método manualmente (comportamiento por defecto).
   metodo_pago_default: { type: String, enum: ['efectivo', 'transferencia', 'ambas'], default: 'ambas' },
+  // Banco con el que se paga por defecto a este subrubro (multi-banco). Al pagar por
+  // transferencia se usa si no se eligió otro; null = el banco predeterminado general.
+  banco_default_id: { type: Number, default: null },
   // true = el proveedor otorga descuentos por pago, variables factura por factura y
   // conocidos recién al pagar. Al confirmar el pago en la Caja del Día se habilita el
   // acordeón de descuento; el monto descontado genera una NC automática vinculada a
@@ -91,6 +94,9 @@ const movimientoSchema = new mongoose.Schema({
   concepto: { type: String, default: '' },
   // Método de pago: efectivo, transferencia o null (sin definir)
   metodo_pago: { type: String, enum: ['efectivo', 'transferencia', null], default: null },
+  // Banco de un pago por transferencia (ver Banco). Lo hereda el ítem de Caja espejo.
+  // null en efectivo, sin método, y en facturas.
+  banco_id: { type: Number, default: null },
   // Tipo de documento de respaldo (solo aplica si tipo='factura'): factura o remito.
   documento: { type: String, enum: ['factura', 'remito', null], default: null },
   // Link inverso a la entrada de caja que originó este pago (si vino de caja)
@@ -155,6 +161,11 @@ const cajaSchema = new mongoose.Schema({
   // vencimiento auto-sync, saldos, etc.). Distingue qué ítems borrar al borrar el pago.
   origen: { type: String, enum: ['subrubro', 'sumatoria', null], default: null },
   sumatoria_mov_id: { type: Number, default: null },
+  // Banco (ver Banco). En un ítem con método transferencia (gasto, ingreso, empleado)
+  // es el banco por el que salió/entró la plata; en un 'saldo_cuenta' es el banco de
+  // ese saldo (un documento por día y por banco). null en efectivo y en los pendientes
+  // por transferencia todavía sin banco (se asigna al confirmar).
+  banco_id: { type: Number, default: null },
   // --- Descuento por pago (subrubros con aplica_descuento) ---
   // Al confirmar, `monto` pasa a ser el NETO efectivamente pagado (lo que sale de la
   // caja) y estos campos guardan el detalle para poder mostrarlo y revertirlo:
@@ -182,6 +193,8 @@ cajaSchema.index({ fecha: 1 });
 cajaSchema.index({ fecha: 1 }, { name: 'pendientes_por_fecha', partialFilterExpression: { confirmado: false } });
 // Ancla del saldo de efectivo: último saldo_inicial hasta una fecha.
 cajaSchema.index({ tipo: 1, fecha: -1 });
+// Saldo en cuenta por banco del día y gastos por banco en un rango (Gráficas).
+cajaSchema.index({ fecha: 1, banco_id: 1 });
 cajaSchema.index(
   { idempotency_key: 1 },
   { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }
@@ -250,6 +263,8 @@ const movimientoSumatoriaSchema = new mongoose.Schema({
   descripcion: { type: String, default: '' },
   origen: { type: String, enum: ['caja', 'subrubro'], required: true },
   metodo: { type: String, enum: ['efectivo', 'transferencia', null], default: null },
+  // Banco de una carga de Caja por transferencia (lo hereda su espejo).
+  banco_id: { type: Number, default: null },
   caja_mov_id: { type: Number, default: null },
   idempotency_key: { type: String, default: null },
   created_by: { type: String, default: null },
@@ -265,6 +280,49 @@ movimientoSumatoriaSchema.index(
   { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }
 );
 const MovimientoSumatoria = mongoose.model('MovimientoSumatoria', movimientoSumatoriaSchema);
+
+// --- Bancos ---
+// Cuentas bancarias de la Caja del Día. Solo uno es el predeterminado (el que se
+// preselecciona al elegir transferencia). Un banco con movimientos no se borra: se
+// desactiva (deja de ofrecerse para cargas nuevas, su historial sigue visible).
+const bancoSchema = new mongoose.Schema({
+  _id: Number,
+  nombre: { type: String, required: true },
+  alias: { type: String, default: '' },
+  color: { type: String, default: '#2563eb' },
+  es_predeterminado: { type: Boolean, default: false },
+  activo: { type: Boolean, default: true },
+  orden: { type: Number, default: 0 },
+  created_at: String,
+});
+bancoSchema.index({ orden: 1 });
+const Banco = mongoose.model('Banco', bancoSchema);
+
+// --- Movimientos entre bancos ---
+// Pasar plata entre cuentas propias. NO es gasto ni ingreso: resta del origen y suma
+// al destino. Vive fuera de CajaMovimiento a propósito: así ninguna suma de gastos o
+// ingresos (Caja, Gráficas, reportes, dashboard) puede contarlo por error.
+const movimientoBancoSchema = new mongoose.Schema({
+  _id: Number,
+  fecha: { type: String, required: true },
+  banco_origen_id: { type: Number, required: true },
+  banco_destino_id: { type: Number, required: true },
+  monto: { type: Number, required: true },
+  descripcion: { type: String, default: '' },
+  idempotency_key: { type: String, default: null },
+  created_by: { type: String, default: null },
+  updated_by: { type: String, default: null },
+  created_at: String,
+  updated_at: String,
+});
+movimientoBancoSchema.index({ fecha: 1 });
+movimientoBancoSchema.index({ banco_origen_id: 1, fecha: 1 });
+movimientoBancoSchema.index({ banco_destino_id: 1, fecha: 1 });
+movimientoBancoSchema.index(
+  { idempotency_key: 1 },
+  { unique: true, partialFilterExpression: { idempotency_key: { $type: 'string' } } }
+);
+const MovimientoBanco = mongoose.model('MovimientoBanco', movimientoBancoSchema);
 
 // Migración idempotente: borra el índice único viejo sobre movimiento_id (uno por
 // factura) para que se pueda crear el nuevo (uno PENDIENTE por factura). Sin esto,
@@ -481,11 +539,11 @@ ventaSistemaSchema.index({ mes: 1, tipo: 1 });
 ventaSistemaSchema.index({ fecha: 1 });
 const VentaSistema = mongoose.model('VentaSistema', ventaSistemaSchema);
 
-// --- Registro: Tarjetas (QR / débito / crédito / prepaga) ---
+// --- Registro: Tarjetas (QR / débito / crédito / prepaga / Mercado Pago) ---
 // Cada documento es un ingreso del día por un tipo de pago, atribuido a un empleado.
 const tarjetaSchema = new mongoose.Schema({
   _id: Number,
-  tipo: { type: String, enum: ['qr', 'debito', 'credito', 'prepaga'], required: true },
+  tipo: { type: String, enum: ['qr', 'debito', 'credito', 'prepaga', 'mercado_pago'], required: true },
   fecha: String,                              // YYYY-MM-DD
   mes: String,                                // YYYY-MM (denormalizado)
   monto: { type: Number, default: 0 },
@@ -614,4 +672,4 @@ auditSchema.index({ recurso: 1, recurso_id: 1 });
 auditSchema.index({ usuario: 1, fecha: -1 });
 const Audit = mongoose.model('Audit', auditSchema);
 
-module.exports = { migrarIndicesCaja, Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Recordatorio, RecordatorioEvento, Audit, ConceptoSumatoria, MovimientoSumatoria };
+module.exports = { migrarIndicesCaja, Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, CajaMovimiento, CajaDescarte, CajaConfig, AppConfig, User, Producto, MovimientoStock, IvaCompra, IvaVenta, IvaConfig, IvaCredito, IvaAjuste, VentaSistema, TarjetaTransaccion, Recordatorio, RecordatorioEvento, Audit, ConceptoSumatoria, MovimientoSumatoria, Banco, MovimientoBanco };

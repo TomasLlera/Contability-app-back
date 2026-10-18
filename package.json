@@ -9,7 +9,8 @@
     "test:watch": "jest --watch",
     "backup": "node scripts/backup.js",
     "restore": "node scripts/restore.js",
-    "new-tenant": "node scripts/new-tenant.js"
+    "new-tenant": "node scripts/new-tenant.js",
+    "migrar-bancos": "node scripts/migrar-bancos.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.18",

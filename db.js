@@ -1,6 +1,6 @@
-const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento, CajaDescarte, CajaConfig, Producto, Recordatorio, ConceptoSumatoria, MovimientoSumatoria } = require('./models');
+const { Counter, Local, Rubro, Subrubro, Movimiento, Campo, Categoria, ImportConfig, AppConfig, CajaMovimiento, CajaDescarte, CajaConfig, Producto, Recordatorio, ConceptoSumatoria, MovimientoSumatoria, Banco, MovimientoBanco } = require('./models');
 const logger = require('./logger');
-const { hoyLocal, esFechaValida } = require('./utils/tz');
+const { hoyLocal, esFechaValida, sumarDias: sumarDiasISO } = require('./utils/tz');
 
 // Error de datos de entrada: el errorHandler lo responde como 400 con el mensaje.
 // Antes estas validaciones tiraban un Error común y salían como 500.
@@ -478,7 +478,10 @@ async function reabrirItemCaja(cajaId) {
 async function syncItemDePagoCaja(pago) {
   if (pago.tipo !== 'pago' || pago.caja_mov_id == null) return;
   const set = { fecha: pago.fecha, monto: Number(pago.pago) || 0 };
-  if (pago.metodo_pago) set.metodo = pago.metodo_pago;
+  if (pago.metodo_pago) {
+    set.metodo = pago.metodo_pago;
+    set.banco_id = pago.metodo_pago === 'transferencia' ? (pago.banco_id ?? null) : null;
+  }
   await CajaMovimiento.updateOne(
     { _id: Number(pago.caja_mov_id), pago_mov_id: Number(pago._id), confirmado: true },
     { $set: set },
@@ -512,6 +515,8 @@ async function syncCajaPago(pago, sub, activo) {
     monto: Number(pago.pago) || 0,
     // Un pago sin método definido cae a 'efectivo' (misma convención que la Caja).
     metodo: pago.metodo_pago || 'efectivo',
+    // Transferencia: el banco del pago, o el predeterminado si el pago no lo trae.
+    banco_id: pago.metodo_pago === 'transferencia' ? (pago.banco_id ?? await resolverBanco('transferencia', null, { subrubroId: pago.subrubro_id })) : null,
     subrubro_id: Number(pago.subrubro_id),
     // Un pago concretado entra confirmado y descuenta; un ingreso no lleva confirmación.
     confirmado: esDeuda ? null : true,
@@ -535,6 +540,115 @@ async function syncCajaPago(pago, sub, activo) {
       if (err.code !== 11000) throw err;
     }
   }
+}
+
+// --- BANCOS ------------------------------------------------------------------
+// Multi-banco de la Caja del Día. Todo lo que es transferencia (gastos, ingresos,
+// empleados, pagos de subrubros, cargas de sumatoria) lleva `banco_id`; el saldo en
+// cuenta es un 'saldo_cuenta' por día y por banco. Los movimientos entre bancos
+// viven en MovimientoBanco: nunca son gasto ni ingreso.
+
+// Banco que se preselecciona al elegir transferencia: el predeterminado activo o,
+// si no hay, el primer activo. null si todavía no hay ningún banco (pre-migración):
+// en ese caso las transferencias quedan sin banco, como antes.
+async function bancoPredeterminadoId() {
+  const b = await Banco.findOne({ es_predeterminado: true, activo: true }, { _id: 1 }).lean()
+    || await Banco.findOne({ activo: true }, { _id: 1 }).sort({ orden: 1, _id: 1 }).lean();
+  return b?._id ?? null;
+}
+
+// Banco de un ítem según su método: efectivo / sin método → null; transferencia →
+// el pedido (tiene que existir y, si es nuevo para el ítem, estar activo) o el
+// predeterminado.
+// Sin banco pedido: el banco por defecto del subrubro (si se pasa `subrubroId` y está
+// activo) y, si no, el predeterminado general.
+async function resolverBanco(metodo, bancoId, { exigirActivo = true, subrubroId = null } = {}) {
+  if (metodo !== 'transferencia') return null;
+  if (bancoId !== undefined && bancoId !== null && bancoId !== '') {
+    const b = await Banco.findById(Number(bancoId), { nombre: 1, activo: 1 }).lean();
+    if (!b) throw errorValidacion('El banco elegido no existe');
+    if (exigirActivo && !b.activo) throw errorValidacion(`El banco "${b.nombre}" está desactivado`);
+    return b._id;
+  }
+  return (await bancoDeSubrubro(subrubroId)) ?? bancoPredeterminadoId();
+}
+
+// Banco por defecto de un subrubro, solo si sigue activo (null si no tiene / no aplica).
+async function bancoDeSubrubro(subrubroId) {
+  if (subrubroId == null || subrubroId === '') return null;
+  const sub = await Subrubro.findById(Number(subrubroId), { banco_default_id: 1 }).lean();
+  if (sub?.banco_default_id == null) return null;
+  const b = await Banco.findById(sub.banco_default_id, { activo: 1 }).lean();
+  return b?.activo ? b._id : null;
+}
+
+// Valida el banco por defecto de un subrubro: null/'' = ninguno; si no, un banco activo.
+async function validarBancoDefault(v) {
+  if (v === null || v === '' || v === undefined) return null;
+  const b = await Banco.findById(Number(v), { nombre: 1, activo: 1 }).lean();
+  if (!b) throw errorValidacion('El banco elegido no existe');
+  if (!b.activo) throw errorValidacion(`El banco "${b.nombre}" está desactivado`);
+  return b._id;
+}
+
+// Cuántas veces se usa un banco (decide si se puede borrar o solo desactivar).
+async function usosBanco(id) {
+  const [caja, movs, sumas, mb] = await Promise.all([
+    CajaMovimiento.countDocuments({ banco_id: id }),
+    Movimiento.countDocuments({ banco_id: id }),
+    MovimientoSumatoria.countDocuments({ banco_id: id }),
+    MovimientoBanco.countDocuments({ $or: [{ banco_origen_id: id }, { banco_destino_id: id }] }),
+  ]);
+  return caja + movs + sumas + mb;
+}
+
+// Neto de movimientos entre bancos por banco: { banco_id: +entrada −salida }.
+function netoMovimientosBanco(movs) {
+  const neto = {};
+  for (const m of movs) {
+    neto[m.banco_origen_id] = r2((neto[m.banco_origen_id] || 0) - m.monto);
+    neto[m.banco_destino_id] = r2((neto[m.banco_destino_id] || 0) + m.monto);
+  }
+  return neto;
+}
+
+// Cierre por banco de un día: saldo cargado − transferencias confirmadas que
+// salieron + neto de movimientos entre bancos. null = ese día no se cargó el saldo
+// de ese banco. Mismo criterio que la "Resta" de la Caja (el saldo se carga al abrir).
+async function cierrePorBanco(fecha) {
+  const [saldos, gastos, movsBanco] = await Promise.all([
+    CajaMovimiento.aggregate([
+      { $match: { fecha, tipo: 'saldo_cuenta', banco_id: { $ne: null } } },
+      { $group: { _id: '$banco_id', saldo: { $sum: '$monto' } } },
+    ]),
+    CajaMovimiento.aggregate([
+      { $match: { fecha, tipo: 'gasto', metodo: 'transferencia', confirmado: { $ne: false }, banco_id: { $ne: null } } },
+      { $group: { _id: '$banco_id', gastos: { $sum: '$monto' } } },
+    ]),
+    MovimientoBanco.find({ fecha }, { banco_origen_id: 1, banco_destino_id: 1, monto: 1 }).lean(),
+  ]);
+  const gastosDe = new Map(gastos.map(g => [g._id, g.gastos]));
+  const neto = netoMovimientosBanco(movsBanco);
+  const out = {};
+  for (const s of saldos) out[s._id] = r2(s.saldo - (gastosDe.get(s._id) || 0) + (neto[s._id] || 0));
+  return out;
+}
+
+async function validarMovimientoBanco({ fecha, banco_origen_id, banco_destino_id, monto }, actual = null) {
+  if (!esFechaValida(fecha)) throw errorValidacion(`Fecha inválida: ${fecha ?? '(vacía)'}`);
+  const n = Number(monto);
+  if (monto === '' || monto == null || !Number.isFinite(n) || n <= 0) throw errorValidacion('El monto debe ser mayor a 0');
+  const o = Number(banco_origen_id), d = Number(banco_destino_id);
+  if (!Number.isInteger(o) || !Number.isInteger(d)) throw errorValidacion('Elegí el banco de origen y el de destino');
+  if (o === d) throw errorValidacion('El banco de origen y el de destino tienen que ser distintos');
+  const bancos = await Banco.find({ _id: { $in: [o, d] } }, { nombre: 1, activo: 1 }).lean();
+  if (bancos.length !== 2) throw errorValidacion('El banco elegido no existe');
+  // Activos al crearlo; al editar, solo se exige si el banco cambia.
+  for (const b of bancos) {
+    const yaEstaba = actual && (b._id === actual.banco_origen_id || b._id === actual.banco_destino_id);
+    if (!b.activo && !yaEstaba) throw errorValidacion(`El banco "${b.nombre}" está desactivado`);
+  }
+  return { fecha, banco_origen_id: o, banco_destino_id: d, monto: r2(n) };
 }
 
 // --- SUMATORIA ---------------------------------------------------------------
@@ -622,6 +736,7 @@ async function syncCajaSumatoria(mov, sub, concepto) {
     concepto: `${sub?.nombre || 'Sumatoria'} — ${concepto?.nombre || 'Concepto'}`,
     monto: Number(mov.monto) || 0,
     metodo: mov.metodo,
+    banco_id: mov.metodo === 'transferencia' ? (mov.banco_id ?? null) : null,
     subrubro_id: Number(mov.subrubro_id),
     movimiento_id: null,
     confirmado: null,
@@ -876,6 +991,7 @@ const db = {
       doc.tipo_subrubro = extra.tipo_subrubro;
     }
     // El descuento por pago no aplica a las deudas a cobrar ni a las sumatorias: se fuerza false.
+    if (extra.banco_default_id !== undefined) doc.banco_default_id = await validarBancoDefault(extra.banco_default_id);
     if (extra.aplica_descuento !== undefined) {
       doc.aplica_descuento = !doc.tipo_subrubro || doc.tipo_subrubro === 'factura' ? Boolean(extra.aplica_descuento) : false;
     }
@@ -968,6 +1084,11 @@ const db = {
       }
     }
     if (fields.aplica_descuento !== undefined) upd.aplica_descuento = Boolean(fields.aplica_descuento);
+    // Banco por defecto (multi-banco). No cambia pagos ya cargados.
+    if (fields.banco_default_id !== undefined) {
+      const mismo = (fields.banco_default_id ?? null) !== null && fields.banco_default_id !== '' && Number(fields.banco_default_id) === previo.banco_default_id;
+      upd.banco_default_id = mismo ? previo.banco_default_id : await validarBancoDefault(fields.banco_default_id);
+    }
     // Una deuda a cobrar o una sumatoria nunca llevan descuento por pago: si el
     // subrubro pasa a ese tipo (ahora o ya lo era y no se está cambiando), el flag se apaga.
     const tipoFinal = upd.tipo_subrubro ?? tipoPrevio;
@@ -1076,7 +1197,7 @@ const db = {
     }));
   },
 
-  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [], percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
+  async createMovimiento(subrubroId, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago = null, banco_id = null, caja_mov_id = null, documento = null, facturas_vinculadas_ids = [], percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
     if (sub.tipo_subrubro === 'sumatoria') throw errorSubrubroSumatoria(sub);
@@ -1122,6 +1243,9 @@ const db = {
       : null;
     // Remito: se paga en efectivo en el acto y el método no es editable.
     if (docFinal === 'remito') metodo = 'efectivo';
+    // Banco: solo un PAGO por transferencia lo lleva (una factura con método
+    // transferencia todavía no salió de ningún banco: se elige al pagarla).
+    const bancoFinal = tipoFinal === 'pago' ? await resolverBanco(metodo, banco_id, { subrubroId }) : null;
     // Vinculación explícita de facturas: solo aplica a pagos / notas de crédito.
     // Si el pago se vincula a una factura puntual, `recalcularPagos` marca esa
     // factura como pagada respetando la elección del usuario (sin tocar las
@@ -1148,6 +1272,7 @@ const db = {
         percepcion_iva: docFinal === 'remito' ? 0 : (Number(percepcion_iva) || 0),
         ingresos_brutos: docFinal === 'remito' ? 0 : (Number(ingresos_brutos) || 0),
         metodo_pago: metodo,
+        banco_id: bancoFinal,
         documento: docFinal,
         caja_mov_id: caja_mov_id != null ? Number(caja_mov_id) : null,
         idempotency_key: idempotency_key ? String(idempotency_key) : null,
@@ -1174,7 +1299,7 @@ const db = {
     // Caja del Día (sincronización Subrubro → Caja). Solo si NO vino de la Caja
     // (caja_mov_id null): un pago originado en la Caja ya tiene allí su ítem.
     if (tipoFinal === 'pago' && caja_mov_id == null) {
-      await syncCajaPago({ _id: id, fecha, pago: Number(pago) || 0, metodo_pago: metodo, subrubro_id: subrubroId }, sub, true);
+      await syncCajaPago({ _id: id, fecha, pago: Number(pago) || 0, metodo_pago: metodo, banco_id: bancoFinal, subrubro_id: subrubroId }, sub, true);
     }
     const creado = withId(await Movimiento.findById(id).lean());
     // Detalle de aplicación por factura (queda en Audit vía la respuesta).
@@ -1185,7 +1310,7 @@ const db = {
     return creado;
   },
 
-  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, documento, percepcion_iva, ingresos_brutos }) {
+  async updateMovimiento(id, { monto = 0, pago = 0, fecha, fecha_vencimiento = null, campos_extra = {}, tipo, concepto = '', metodo_pago, banco_id, documento, percepcion_iva, ingresos_brutos }) {
     const mov = await Movimiento.findById(Number(id));
     if (!mov) throw errorNoEncontrado('Movimiento no encontrado');
     // Estado previo: para saber si hay que limpiar el gasto de caja de un remito
@@ -1226,6 +1351,14 @@ const db = {
       mov.percepcion_iva = 0;
       mov.ingresos_brutos = 0;
       mov.metodo_pago = 'efectivo';
+    }
+    // Banco: solo en un pago por transferencia. Sin banco pedido se conserva el que
+    // tenía (o el predeterminado si no tenía); mantener uno ya desactivado se permite.
+    if (mov.tipo === 'pago' && mov.metodo_pago === 'transferencia') {
+      const pedido = banco_id !== undefined && banco_id !== null && banco_id !== '' ? Number(banco_id) : (mov.banco_id ?? null);
+      mov.banco_id = await resolverBanco('transferencia', pedido, { exigirActivo: pedido !== mov.banco_id, subrubroId: mov.subrubro_id });
+    } else {
+      mov.banco_id = null;
     }
     await mov.save();
     await recalcularPagos(mov.subrubro_id);
@@ -1342,7 +1475,7 @@ const db = {
     return { deleted: deletedCount + huerfanos + sumatorias };
   },
 
-  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, caja_mov_id = null, percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
+  async crearPagoVinculado(subrubroId, { fecha, monto_pago, tipo = 'pago', facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago = null, banco_id = null, caja_mov_id = null, percepcion_iva = 0, ingresos_brutos = 0, idempotency_key = null }) {
     const sub = await Subrubro.findById(Number(subrubroId));
     if (!sub) throw errorNoEncontrado('Subrubro no encontrado');
     if (sub.tipo_subrubro === 'sumatoria') throw errorSubrubroSumatoria(sub);
@@ -1359,6 +1492,7 @@ const db = {
     if (!(Number(monto_pago) > 0)) throw errorValidacion('El monto debe ser mayor a 0');
     const idsNum = facturas_vinculadas_ids.map(Number);
     const metodo = tipo === 'pago' ? normalizarMetodoPago(metodo_pago) : null;
+    const bancoFinal = tipo === 'pago' ? await resolverBanco(metodo, banco_id, { subrubroId }) : null;
 
     // Saldos ANTES de aplicar este pago/NC: validan el monto de la NC (nunca mayor
     // al saldo pendiente de la factura vinculada) y alimentan el detalle de
@@ -1380,7 +1514,7 @@ const db = {
         monto: 0, pago: Number(monto_pago), tipo,
         facturas_vinculadas_ids: idsNum, pagado: false,
         fecha_vencimiento: null, campos_extra: campos_extra || {},
-        concepto: '', metodo_pago: metodo,
+        concepto: '', metodo_pago: metodo, banco_id: bancoFinal,
         // Percepciones: solo la NC las lleva (el pago no). No suman al monto.
         percepcion_iva: tipo === 'nota_credito' ? (Number(percepcion_iva) || 0) : 0,
         ingresos_brutos: tipo === 'nota_credito' ? (Number(ingresos_brutos) || 0) : 0,
@@ -1403,7 +1537,7 @@ const db = {
     // Pago vinculado registrado desde el Subrubro → espejo en la Caja del Día
     // (Subrubro → Caja). Solo si no vino de la Caja (caja_mov_id null).
     if (tipo === 'pago' && caja_mov_id == null) {
-      await syncCajaPago({ _id: id, fecha, pago: Number(monto_pago) || 0, metodo_pago: metodo, subrubro_id: subrubroId }, sub, true);
+      await syncCajaPago({ _id: id, fecha, pago: Number(monto_pago) || 0, metodo_pago: metodo, banco_id: bancoFinal, subrubro_id: subrubroId }, sub, true);
     }
     const creado = withId(await Movimiento.findById(id).lean());
     // Detalle de aplicación por factura (queda en Audit vía la respuesta).
@@ -1414,7 +1548,7 @@ const db = {
     return creado;
   },
 
-  async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago, percepcion_iva, ingresos_brutos }) {
+  async actualizarPagoVinculado(movId, { fecha, monto_pago, facturas_vinculadas_ids = [], concepto_diferencia = 'Diferencia', campos_extra = {}, metodo_pago, banco_id, percepcion_iva, ingresos_brutos }) {
     const mov = await Movimiento.findById(Number(movId));
     if (!mov) throw errorNoEncontrado('Movimiento no encontrado');
     validarMovimiento({ fecha, pago: monto_pago });
@@ -1441,6 +1575,12 @@ const db = {
     mov.campos_extra = campos_extra || {};
     if (metodo_pago !== undefined && mov.tipo === 'pago') {
       mov.metodo_pago = normalizarMetodoPago(metodo_pago);
+    }
+    if (mov.tipo === 'pago' && mov.metodo_pago === 'transferencia') {
+      const pedido = banco_id !== undefined && banco_id !== null && banco_id !== '' ? Number(banco_id) : (mov.banco_id ?? null);
+      mov.banco_id = await resolverBanco('transferencia', pedido, { exigirActivo: pedido !== mov.banco_id, subrubroId: mov.subrubro_id });
+    } else {
+      mov.banco_id = null;
     }
     // Percepciones: solo se tocan si vienen en el payload (y solo tienen sentido en NC).
     if (percepcion_iva !== undefined) mov.percepcion_iva = mov.tipo === 'nota_credito' ? (Number(percepcion_iva) || 0) : 0;
@@ -1878,6 +2018,316 @@ const db = {
     return { mes, mesAnterior, subrubros };
   },
 
+  // --- BANCOS ---
+  async getBancos() {
+    const bancos = await Banco.find().sort({ orden: 1, _id: 1 }).lean();
+    const usos = await Promise.all(bancos.map(b => usosBanco(b._id)));
+    return bancos.map((b, i) => ({ ...withId(b), cantidad_usos: usos[i] }));
+  },
+
+  async createBanco({ nombre, alias = '', color, es_predeterminado = false } = {}) {
+    const limpio = String(nombre || '').replace(/\s+/g, ' ').trim();
+    if (!limpio) throw errorValidacion('Ingresá el nombre del banco');
+    if (limpio.length > 60) throw errorValidacion('El nombre no puede superar 60 caracteres');
+    const dup = await Banco.findOne({ nombre: { $regex: new RegExp(`^${escaparRegex(limpio)}$`, 'i') } }).lean();
+    if (dup) throw errorConflicto(`Ya existe el banco "${dup.nombre}"`);
+    // El primero (o el primero activo) queda como predeterminado.
+    const hayPred = await Banco.exists({ es_predeterminado: true, activo: true });
+    const pred = Boolean(es_predeterminado) || !hayPred;
+    if (pred) await Banco.updateMany({}, { $set: { es_predeterminado: false } });
+    const ultimo = await Banco.findOne().sort({ orden: -1 }).lean();
+    const id = await Counter.next('bancos');
+    await Banco.create({
+      _id: id, nombre: limpio, alias: String(alias || '').trim().slice(0, 20),
+      color: color || '#2563eb', es_predeterminado: pred, activo: true,
+      orden: (ultimo?.orden ?? -1) + 1, created_at: now(),
+    });
+    return { ...withId(await Banco.findById(id).lean()), cantidad_usos: 0 };
+  },
+
+  async updateBanco(id, fields = {}) {
+    const b = await Banco.findById(Number(id)).lean();
+    if (!b) throw errorNoEncontrado('Banco no encontrado');
+    const upd = {};
+    if (fields.nombre !== undefined) {
+      const limpio = String(fields.nombre || '').replace(/\s+/g, ' ').trim();
+      if (!limpio) throw errorValidacion('Ingresá el nombre del banco');
+      const dup = await Banco.findOne({ _id: { $ne: b._id }, nombre: { $regex: new RegExp(`^${escaparRegex(limpio)}$`, 'i') } }).lean();
+      if (dup) throw errorConflicto(`Ya existe el banco "${dup.nombre}"`);
+      upd.nombre = limpio;
+    }
+    if (fields.alias !== undefined) upd.alias = String(fields.alias || '').trim().slice(0, 20);
+    if (fields.color !== undefined) upd.color = fields.color || '#2563eb';
+    if (fields.orden !== undefined) upd.orden = Number(fields.orden) || 0;
+    if (fields.activo !== undefined) upd.activo = Boolean(fields.activo);
+    const activoFinal = upd.activo ?? b.activo;
+    if (fields.es_predeterminado === true) {
+      if (!activoFinal) throw errorValidacion('Un banco desactivado no puede ser el predeterminado');
+      await Banco.updateMany({ _id: { $ne: b._id } }, { $set: { es_predeterminado: false } });
+      upd.es_predeterminado = true;
+    }
+    // Desactivar el predeterminado: el rol pasa al primer activo que quede. Cambiar el
+    // predeterminado nunca toca pagos ya cargados (guardan su banco_id).
+    if (!activoFinal && b.es_predeterminado) upd.es_predeterminado = false;
+    await Banco.updateOne({ _id: b._id }, { $set: upd });
+    if (!(await Banco.exists({ es_predeterminado: true, activo: true }))) {
+      const sig = await Banco.findOne({ activo: true }).sort({ orden: 1, _id: 1 }).lean();
+      if (sig) await Banco.updateOne({ _id: sig._id }, { $set: { es_predeterminado: true } });
+    }
+    return { ...withId(await Banco.findById(b._id).lean()), cantidad_usos: await usosBanco(b._id) };
+  },
+
+  async reordenarBancos(ids = []) {
+    if (!Array.isArray(ids)) throw errorValidacion('ids debe ser una lista');
+    const ops = ids.map(Number).filter(Number.isInteger)
+      .map((bid, i) => ({ updateOne: { filter: { _id: bid }, update: { $set: { orden: i } } } }));
+    if (ops.length) await Banco.bulkWrite(ops, { ordered: false });
+    return this.getBancos();
+  },
+
+  // Con movimientos no se borra (perdería el historial): solo desactivar.
+  async deleteBanco(id) {
+    const b = await Banco.findById(Number(id)).lean();
+    if (!b) throw errorNoEncontrado('Banco no encontrado');
+    const usos = await usosBanco(b._id);
+    if (usos > 0) throw errorConflicto(`"${b.nombre}" tiene ${usos} movimiento${usos !== 1 ? 's' : ''}: no se puede eliminar, desactivalo`);
+    await Banco.deleteOne({ _id: b._id });
+    if (b.es_predeterminado) {
+      const sig = await Banco.findOne({ activo: true }).sort({ orden: 1, _id: 1 }).lean();
+      if (sig) await Banco.updateOne({ _id: sig._id }, { $set: { es_predeterminado: true } });
+    }
+    return { ok: true, id: b._id, nombre: b.nombre };
+  },
+
+  // --- SALDO EN CUENTA POR BANCO ---
+  // Guarda los saldos de `fecha`: [{ banco_id, monto }]. Monto vacío/null = borrar el
+  // saldo de ese banco ese día. Un saldo viejo sin banco (anterior a la migración) del
+  // mismo día se reemplaza por los nuevos.
+  async setSaldosCuenta(fecha, saldos = []) {
+    if (!esFechaValida(fecha)) throw errorValidacion('Fecha inválida');
+    if (!Array.isArray(saldos) || saldos.length === 0) throw errorValidacion('Indicá al menos un saldo');
+    const ids = saldos.map(s => Number(s.banco_id));
+    const bancos = await Banco.find({ _id: { $in: ids } }).lean();
+    const bMap = new Map(bancos.map(b => [b._id, b]));
+    const existentes = await CajaMovimiento.find({ fecha, tipo: 'saldo_cuenta' }).lean();
+    const cambios = [];
+    for (const s of saldos) {
+      const bid = Number(s.banco_id);
+      const b = bMap.get(bid);
+      if (!b) throw errorValidacion('El banco elegido no existe');
+      const actual = existentes.find(e => e.banco_id === bid);
+      const vacio = s.monto === '' || s.monto === null || s.monto === undefined;
+      if (vacio) {
+        if (actual) { await CajaMovimiento.deleteOne({ _id: actual._id }); cambios.push({ banco_id: bid, antes: actual.monto, despues: null }); }
+        continue;
+      }
+      const n = Number(s.monto);
+      if (!Number.isFinite(n)) throw errorValidacion(`Saldo inválido para "${b.nombre}"`);
+      if (!b.activo && !actual) throw errorValidacion(`El banco "${b.nombre}" está desactivado`);
+      if (actual) {
+        if (Math.abs((actual.monto || 0) - n) > 0.005) {
+          await CajaMovimiento.updateOne({ _id: actual._id }, { $set: { monto: r2(n) } });
+          cambios.push({ banco_id: bid, antes: actual.monto, despues: r2(n) });
+        }
+      } else {
+        await CajaMovimiento.create({
+          _id: await Counter.next('caja'), fecha, tipo: 'saldo_cuenta', concepto: `Saldo en cuenta — ${b.nombre}`,
+          monto: r2(n), metodo: 'transferencia', banco_id: bid, confirmado: null, es_especial: false, created_at: now(),
+        });
+        cambios.push({ banco_id: bid, antes: null, despues: r2(n) });
+      }
+    }
+    const legacy = existentes.filter(e => e.banco_id == null);
+    if (legacy.length) {
+      await CajaMovimiento.deleteMany({ _id: { $in: legacy.map(e => e._id) } });
+      cambios.push({ banco_id: null, antes: legacy.reduce((a, e) => a + (e.monto || 0), 0), despues: null });
+    }
+    const saldosDia = await CajaMovimiento.find({ fecha, tipo: 'saldo_cuenta' }).lean();
+    return { ok: true, fecha, cambios, saldos: withIds(saldosDia), total: r2(saldosDia.reduce((a, e) => a + (e.monto || 0), 0)) };
+  },
+
+  // Lo que la Caja del Día necesita de los bancos para `fecha`: saldos de ayer por
+  // banco (variación), cierre de ayer por banco (precarga del modal de saldos) y los
+  // movimientos entre bancos del día.
+  async bancosDelDia(fecha) {
+    const ayer = sumarDiasISO(fecha, -1);
+    const [saldosAyer, cierreAyer, movimientos] = await Promise.all([
+      CajaMovimiento.aggregate([
+        { $match: { fecha: ayer, tipo: 'saldo_cuenta' } },
+        { $group: { _id: '$banco_id', saldo: { $sum: '$monto' } } },
+      ]),
+      cierrePorBanco(ayer),
+      MovimientoBanco.find({ fecha }).sort({ _id: 1 }).lean(),
+    ]);
+    return {
+      saldos_ayer: Object.fromEntries(saldosAyer.map(s => [s._id ?? 'sin_banco', r2(s.saldo)])),
+      cierre_ayer: cierreAyer,
+      movimientos: withIds(movimientos),
+    };
+  },
+
+  // --- MOVIMIENTOS ENTRE BANCOS ---
+  async getMovimientosBanco({ desde, hasta } = {}) {
+    const f = {};
+    if (desde || hasta) {
+      f.fecha = {};
+      if (desde) f.fecha.$gte = desde;
+      if (hasta) f.fecha.$lte = hasta;
+    }
+    return withIds(await MovimientoBanco.find(f).sort({ fecha: -1, _id: -1 }).limit(2000).lean());
+  },
+
+  async createMovimientoBanco(data = {}, usuario = null) {
+    if (data.idempotency_key) {
+      const ex = await MovimientoBanco.findOne({ idempotency_key: String(data.idempotency_key) }).lean();
+      if (ex) return withId(ex);
+    }
+    const v = await validarMovimientoBanco(data);
+    const id = await Counter.next('movimientos_banco');
+    try {
+      await MovimientoBanco.create({
+        _id: id, ...v, descripcion: validarDescripcion(data.descripcion),
+        idempotency_key: data.idempotency_key ? String(data.idempotency_key) : null,
+        created_by: usuario, created_at: now(),
+      });
+    } catch (err) {
+      if (err.code === 11000 && data.idempotency_key) {
+        const ex = await MovimientoBanco.findOne({ idempotency_key: String(data.idempotency_key) }).lean();
+        if (ex) return withId(ex);
+      }
+      throw err;
+    }
+    return withId(await MovimientoBanco.findById(id).lean());
+  },
+
+  async updateMovimientoBanco(id, data = {}, usuario = null) {
+    const actual = await MovimientoBanco.findById(Number(id)).lean();
+    if (!actual) throw errorNoEncontrado('Movimiento entre bancos no encontrado');
+    const v = await validarMovimientoBanco({
+      fecha: data.fecha ?? actual.fecha,
+      banco_origen_id: data.banco_origen_id ?? actual.banco_origen_id,
+      banco_destino_id: data.banco_destino_id ?? actual.banco_destino_id,
+      monto: data.monto ?? actual.monto,
+    }, actual);
+    const set = { ...v, updated_by: usuario, updated_at: now() };
+    if (data.descripcion !== undefined) set.descripcion = validarDescripcion(data.descripcion);
+    await MovimientoBanco.updateOne({ _id: actual._id }, { $set: set });
+    return withId(await MovimientoBanco.findById(actual._id).lean());
+  },
+
+  async deleteMovimientoBanco(id) {
+    const actual = await MovimientoBanco.findById(Number(id)).lean();
+    if (!actual) throw errorNoEncontrado('Movimiento entre bancos no encontrado');
+    await MovimientoBanco.deleteOne({ _id: actual._id });
+    return { ok: true, id: actual._id };
+  },
+
+  // --- GRÁFICAS DE CAJA (agregado en Mongo, por período y banco) ---
+  // vista: 'dia' | 'mes' | 'anio'. `bancos` (ids) filtra lo que es transferencia:
+  // gastos por transferencia, saldos y su variación. Efectivo y especiales no cambian.
+  // Con todos los bancos los totales son los de antes (mismo criterio que la vieja
+  // agregación del front: los gastos incluyen pendientes y "sin método" cuenta como
+  // transferencia). Los movimientos entre bancos solo entran en la evolución de saldo.
+  async getCajaGraficas({ desde, hasta, vista = 'dia', bancos } = {}) {
+    if (!esFechaValida(desde) || !esFechaValida(hasta)) throw errorValidacion('Rango de fechas inválido');
+    const largo = vista === 'mes' ? 7 : vista === 'anio' ? 4 : 10;
+    const k = { $substrBytes: ['$fecha', 0, largo] };
+    const filtroBancos = bancos && bancos.length ? new Set(bancos.map(Number)) : null;
+    const pasaBanco = (bid) => !filtroBancos || filtroBancos.has(bid);
+    const rango = { fecha: { $gte: desde, $lte: hasta } };
+
+    const [[f], movsBanco] = await Promise.all([
+      CajaMovimiento.aggregate([
+        { $match: rango },
+        { $facet: {
+          periodos: [{ $group: { _id: k } }],
+          flujos: [
+            { $match: { tipo: { $in: ['gasto', 'empleado', 'ingreso_extra'] } } },
+            { $group: {
+              _id: { k, tipo: '$tipo', metodo: '$metodo', banco: '$banco_id', especial: '$es_especial' },
+              total: { $sum: '$monto' },
+            } },
+          ],
+          saldos: [
+            { $match: { tipo: 'saldo_cuenta' } },
+            { $group: { _id: { fecha: '$fecha', banco: '$banco_id' }, saldo: { $sum: '$monto' } } },
+          ],
+        } },
+      ]),
+      MovimientoBanco.aggregate([
+        { $match: rango },
+        { $group: { _id: { fecha: '$fecha', o: '$banco_origen_id', d: '$banco_destino_id' }, monto: { $sum: '$monto' } } },
+      ]),
+    ]);
+
+    const nuevo = () => ({ ingresosEfvo: 0, gastosEfvo: 0, gastosTrans: 0, gastosEspeciales: 0, gastosTransPorBanco: {}, ingresosTransPorBanco: {}, saldoPorBanco: {} });
+    const map = new Map(f.periodos.map(p => [p._id, nuevo()]));
+    const de = (key) => { if (!map.has(key)) map.set(key, nuevo()); return map.get(key); };
+
+    for (const g of f.flujos) {
+      const b = de(g._id.k);
+      const { tipo, metodo, banco, especial } = g._id;
+      const clave = banco ?? 'sin_banco';
+      if (tipo === 'gasto') {
+        if (especial) b.gastosEspeciales += g.total;
+        if (metodo === 'efectivo') b.gastosEfvo += g.total;
+        else if (pasaBanco(banco)) {
+          b.gastosTrans += g.total;
+          b.gastosTransPorBanco[clave] = (b.gastosTransPorBanco[clave] || 0) + g.total;
+        }
+      } else if (metodo === 'efectivo') {
+        b.ingresosEfvo += g.total;
+      } else if (metodo === 'transferencia' && pasaBanco(banco)) {
+        b.ingresosTransPorBanco[clave] = (b.ingresosTransPorBanco[clave] || 0) + g.total;
+      }
+    }
+
+    // Saldo por banco: el último cargado de cada banco dentro del período, más los
+    // movimientos entre bancos de ese día en adelante (dentro del período).
+    const netoPorFecha = new Map(); // fecha → { banco: neto }
+    for (const m of movsBanco) {
+      const n = netoPorFecha.get(m._id.fecha) || {};
+      n[m._id.o] = (n[m._id.o] || 0) - m.monto;
+      n[m._id.d] = (n[m._id.d] || 0) + m.monto;
+      netoPorFecha.set(m._id.fecha, n);
+    }
+    const ultimo = new Map(); // `${key}|${banco}` → { fecha, saldo }
+    for (const s of f.saldos) {
+      if (!pasaBanco(s._id.banco)) continue;
+      const key = s._id.fecha.slice(0, largo);
+      const id = `${key}|${s._id.banco ?? 'sin_banco'}`;
+      const prev = ultimo.get(id);
+      if (!prev || s._id.fecha > prev.fecha) ultimo.set(id, { fecha: s._id.fecha, saldo: s.saldo, banco: s._id.banco ?? 'sin_banco', key });
+    }
+    for (const u of ultimo.values()) {
+      let saldo = u.saldo;
+      for (const [fecha, n] of netoPorFecha) {
+        if (fecha >= u.fecha && fecha.slice(0, largo) === u.key && n[u.banco]) saldo += n[u.banco];
+      }
+      de(u.key).saldoPorBanco[u.banco] = r2(saldo);
+      de(u.key).saldoCuentaLastRaw = (de(u.key).saldoCuentaLastRaw ?? 0) + u.saldo;
+    }
+
+    const orden = [...map.keys()].sort();
+    const r2obj = (o) => Object.fromEntries(Object.entries(o).map(([kk, v]) => [kk, r2(v)]));
+    let prevSaldo = null;
+    const periodos = orden.map(key => {
+      const b = map.get(key);
+      const saldoCuentaLast = b.saldoCuentaLastRaw ?? null;
+      const transDelta = saldoCuentaLast !== null && prevSaldo !== null ? Math.max(saldoCuentaLast - prevSaldo, 0) : 0;
+      prevSaldo = saldoCuentaLast;
+      return {
+        key,
+        ingresosEfvo: r2(b.ingresosEfvo), gastosEfvo: r2(b.gastosEfvo), gastosTrans: r2(b.gastosTrans),
+        gastosEspeciales: r2(b.gastosEspeciales), totalGastos: r2(b.gastosEfvo + b.gastosTrans),
+        saldoCuentaLast: saldoCuentaLast === null ? null : r2(saldoCuentaLast), transDelta: r2(transDelta),
+        gastosTransPorBanco: r2obj(b.gastosTransPorBanco), ingresosTransPorBanco: r2obj(b.ingresosTransPorBanco),
+        saldoPorBanco: b.saldoPorBanco,
+      };
+    });
+    return { vista, desde, hasta, periodos };
+  },
+
   // --- SUMATORIA: subrubros ---
   async getSubrubrosSumatoria() {
     const subs = await Subrubro.find({ tipo_subrubro: 'sumatoria' }, { nombre: 1, rubro_id: 1, icon: 1 }).sort({ nombre: 1 }).lean();
@@ -2014,9 +2464,11 @@ const db = {
       // Solo una carga de Caja tiene método: una del subrubro no mueve plata del día.
       metodo: null,
     };
+    doc.banco_id = null;
     if (origen === 'caja') {
       doc.metodo = normalizarMetodoPago(metodo);
       if (!doc.metodo) throw errorValidacion('Elegí el método: efectivo o transferencia');
+      doc.banco_id = await resolverBanco(doc.metodo, data.banco_id, { subrubroId: sub._id });
     }
     const id = await Counter.next('sumatoria_movimientos');
     try {
@@ -2064,6 +2516,11 @@ const db = {
       if (mov.origen === 'caja' && !m) throw errorValidacion('Elegí el método: efectivo o transferencia');
       if (mov.origen === 'subrubro' && m) throw errorValidacion('Una carga del subrubro no lleva método: no impacta en la Caja');
       set.metodo = m;
+    }
+    if (mov.origen === 'caja') {
+      const metodoFinal = set.metodo ?? mov.metodo;
+      const pedido = data.banco_id !== undefined && data.banco_id !== null && data.banco_id !== '' ? Number(data.banco_id) : (mov.banco_id ?? null);
+      set.banco_id = await resolverBanco(metodoFinal, pedido, { exigirActivo: pedido !== mov.banco_id, subrubroId: mov.subrubro_id });
     }
     await MovimientoSumatoria.updateOne({ _id: mov._id }, { $set: set });
     if (mov.origen === 'caja') {
@@ -2221,3 +2678,4 @@ module.exports.calcularVencimientoSub = calcularVencimientoSub;
 module.exports.recomputarVencimientosSubrubro = recomputarVencimientosSubrubro;
 module.exports.computeSaldosFacturas = computeSaldosFacturas;
 module.exports.computeAplicaciones = computeAplicaciones;
+module.exports.resolverBanco = resolverBanco;

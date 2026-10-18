@@ -2,6 +2,26 @@
 
 ## Sin publicar
 
+### Multi-banco en Caja del Día y Gráficas
+- Colecciones nuevas `Banco` (nombre, alias, color, predeterminado, activo,
+  orden) y `MovimientoBanco` (movimientos entre bancos propios: no son gasto ni
+  ingreso y viven fuera de `CajaMovimiento`).
+- `banco_id` en `CajaMovimiento`, `Movimiento` (pagos) y `MovimientoSumatoria`.
+  Obligatorio en transferencias (sin banco → el predeterminado), null en efectivo.
+- Saldo en cuenta: un `saldo_cuenta` por día y por banco (`PUT /caja/saldos-cuenta`);
+  el total es la suma. `GET /caja/dia` devuelve `bancos` (saldos y cierre de ayer
+  por banco, movimientos entre bancos del día).
+- `POST /caja/:id/confirmar` acepta `banco_id` (pago en lote / parcial). Cambiar el
+  banco de un pago confirmado desde la Caja lo cambia también en el subrubro.
+- API `/api/bancos` (ABM; con movimientos no se borra, se desactiva) y
+  `/api/bancos/movimientos`.
+- `GET /caja/graficas`: series de caja agregadas en Mongo por período y banco
+  (con todos los bancos, mismos totales que antes).
+- Excel mensual de caja: columna Banco, gastos por transferencia por banco y hoja
+  "Entre bancos". Backup y auditoría incluyen bancos y movimientos entre bancos.
+- **Migración:** `npm run migrar-bancos -- --dry-run` y luego `npm run migrar-bancos`
+  (idempotente; verifica que los totales diarios no cambien).
+
 ### Subrubro tipo Sumatoria
 - Nuevo `tipo_subrubro: 'sumatoria'`: acumula cargas por concepto (ej. retiros
   de un socio), sin estados, vencimientos ni saldos. Facturas/Gastos y Deuda no

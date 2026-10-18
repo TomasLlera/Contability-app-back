@@ -130,6 +130,14 @@ async function reconciliarAutoSync(autoItems, { movMap, saldoDe, subMap }) {
     // que el usuario haya puesto en la Caja (no se pisa).
     const metFactura = f.metodo_pago || null;
     if (metFactura && (item.metodo || null) !== metFactura) set.metodo = metFactura;
+    // Pendiente por transferencia sin banco: toma el del subrubro (o el predeterminado).
+    const metFinal = set.metodo ?? item.metodo;
+    if (metFinal === 'transferencia' && item.banco_id == null) {
+      const bid = await db.resolverBanco('transferencia', null, { subrubroId: f.subrubro_id });
+      if (bid != null) set.banco_id = bid;
+    } else if (metFinal !== 'transferencia' && item.banco_id != null) {
+      set.banco_id = null;
+    }
     if (!item.auto_sync) set.auto_sync = true; // backfill de la firma legacy
     if (Object.keys(set).length) {
       // Misma guarda que en el borrado: si el ítem se confirmó mientras corría el
@@ -293,6 +301,9 @@ router.post('/auto-sync', requireAdmin, asyncHandler(async (req, res) => {
             // Método heredado de la factura: si se cargó con efectivo/transferencia en
             // el subrubro, el ítem de Caja aparece ya con ese método (si no, sin definir).
             metodo: v.metodo_pago || null,
+            // Transferencia: nace con el banco del subrubro (o el predeterminado), así ya
+            // se ve con qué banco se va a pagar; se puede cambiar antes de confirmar.
+            banco_id: v.metodo_pago === 'transferencia' ? await db.resolverBanco('transferencia', null, { subrubroId: v.subrubro_id }) : null,
             subrubro_id: v.subrubro_id,
             movimiento_id: v._id,
             confirmado: false,
@@ -493,18 +504,25 @@ router.get('/dia', asyncHandler(async (req, res) => {
   if (!esFechaValida(fecha)) return res.status(400).json({ error: 'fecha requerida (YYYY-MM-DD)' });
   const esHoy = fecha === hoyLocal();
   const cfg = esHoy ? await CajaConfig.findById('main').lean() : null;
-  const [movs, cuentaAyer, saldoAnterior, proximos] = await Promise.all([
+  const [movs, cuentaAyer, saldoAnterior, proximos, bancos] = await Promise.all([
     cajaDelDia(fecha),
-    CajaMovimiento.findOne({ fecha: sumarDias(fecha, -1), tipo: 'saldo_cuenta' }, { monto: 1 }).lean(),
+    // Multi-banco: el saldo en cuenta de ayer es la suma de los saldos de cada banco.
+    CajaMovimiento.aggregate([
+      { $match: { fecha: sumarDias(fecha, -1), tipo: 'saldo_cuenta' } },
+      { $group: { _id: null, monto: { $sum: '$monto' } } },
+    ]),
     saldoAnteriorDe(fecha),
     esHoy ? proximosDe(fecha, cfg) : Promise.resolve([]),
+    db.bancosDelDia(fecha),
   ]);
   res.json({
     fecha,
     movs,
-    saldo_cuenta_ayer: cuentaAyer?.monto ?? null,
+    saldo_cuenta_ayer: cuentaAyer[0]?.monto ?? null,
     saldo_anterior: saldoAnterior,
     proximos,
+    // { saldos_ayer: { banco_id: saldo }, cierre_ayer: { banco_id: cierre }, movimientos: [...] }
+    bancos,
   });
 }));
 
@@ -555,6 +573,19 @@ router.get('/rango', asyncHandler(async (req, res) => {
   res.json(withIds(movs));
 }));
 
+// PUT /api/caja/saldos-cuenta   body: { fecha, saldos: [{ banco_id, monto }] }
+// Saldo en cuenta del día, uno por banco (monto vacío = borrar el de ese banco).
+router.put('/saldos-cuenta', requireAdmin, audit('caja_saldo_cuenta'), asyncHandler(async (req, res) => {
+  res.json(await db.setSaldosCuenta(req.body?.fecha, req.body?.saldos));
+}));
+
+// GET /api/caja/graficas?desde=&hasta=&vista=dia|mes|anio&bancos=1,2
+router.get('/graficas', asyncHandler(async (req, res) => {
+  const bancos = req.query.bancos ? String(req.query.bancos).split(',').map(Number).filter(Number.isFinite) : null;
+  const vista = ['dia', 'mes', 'anio'].includes(req.query.vista) ? req.query.vista : 'dia';
+  res.json(await db.getCajaGraficas({ desde: req.query.desde, hasta: req.query.hasta, vista, bancos }));
+}));
+
 // POST /api/caja
 router.post('/', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
   const { fecha, tipo, concepto, monto, metodo, subrubro_id, es_especial, movimiento_id, confirmado, idempotency_key } = req.body;
@@ -582,12 +613,17 @@ router.post('/', requireAdmin, audit('caja'), asyncHandler(async (req, res) => {
   const confirmar = tipo === 'gasto'
     ? (confirmado !== undefined ? confirmado : false)
     : null;
+  // Sólo aplica default si el cliente no mandó el campo; null explícito significa "sin definir".
+  const metodoFinal = metodo === undefined ? 'efectivo' : metodo;
+  // Transferencia (gasto, ingreso, empleado o saldo en cuenta): el banco elegido o el
+  // predeterminado. El saldo en cuenta por banco se carga por PUT /saldos-cuenta.
+  const bancoFinal = await db.resolverBanco(metodoFinal, req.body.banco_id, { subrubroId: subrubro_id });
   try {
     const mov = await CajaMovimiento.create({
       _id: id, fecha, tipo, concepto,
       monto: Number(monto),
-      // Sólo aplica default si el cliente no mandó el campo; null explícito significa "sin definir".
-      metodo: metodo === undefined ? 'efectivo' : metodo,
+      metodo: metodoFinal,
+      banco_id: bancoFinal,
       subrubro_id: subrubro_id || null,
       movimiento_id: movimiento_id || null,
       confirmado: confirmar,
@@ -711,6 +747,11 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
   const neto = parcial ? Math.round(montoPedido * 100) / 100 : bruto - descuento;
 
   const esCobro = item.tipo === 'ingreso_extra';
+  // Banco del pago por transferencia: el elegido al confirmar (pago en lote, pago
+  // parcial), el que ya tenía el ítem, o el predeterminado.
+  const bancoPago = await db.resolverBanco(item.metodo, req.body.banco_id ?? item.banco_id, { subrubroId: item.subrubro_id,
+    exigirActivo: req.body.banco_id != null && Number(req.body.banco_id) !== item.banco_id,
+  });
   let pagoId = null;
   let ncId = null;
 
@@ -722,7 +763,7 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
   // El filtro `$ne: true` cubre también los registros legacy con confirmado null.
   const claim = await CajaMovimiento.findOneAndUpdate(
     { _id: id, confirmado: { $ne: true } },
-    { $set: { confirmado: true, fecha } },
+    { $set: { confirmado: true, fecha, banco_id: bancoPago } },
   );
   if (!claim) return res.status(409).json({ error: 'El movimiento ya está confirmado' });
 
@@ -749,6 +790,7 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
         fecha,
         concepto: `${esCobro ? 'Abono caja' : 'Pago caja'}: ${item.concepto}`,
         metodo_pago: item.metodo,
+        banco_id: bancoPago,
         caja_mov_id: id,
         facturas_vinculadas_ids: item.movimiento_id ? [Number(item.movimiento_id)] : [],
         idempotency_key: `caja-confirm-${id}`,
@@ -797,7 +839,7 @@ router.post('/:id/confirmar', requireAdmin, audit('caja'), asyncHandler(async (r
             $set: { monto: saldo },
             $setOnInsert: {
               _id: nuevoId, fecha: item.fecha, tipo: item.tipo, concepto: item.concepto,
-              metodo: item.metodo, subrubro_id: item.subrubro_id, movimiento_id: Number(item.movimiento_id),
+              metodo: item.metodo, banco_id: bancoPago, subrubro_id: item.subrubro_id, movimiento_id: Number(item.movimiento_id),
               auto_sync: !!item.auto_sync, es_especial: false, created_at: now(),
             },
           },
@@ -953,9 +995,26 @@ router.put('/:id', requireAdmin, audit('caja'), asyncHandler(async (req, res) =>
   if (concepto !== undefined) upd.concepto = concepto;
   if (monto !== undefined) upd.monto = Number(monto);
   if (metodo !== undefined) upd.metodo = metodo;
+  // Banco: se recalcula si cambia el método o el banco. Mantener uno ya desactivado
+  // se permite; elegir otro, no.
+  const cambiaBanco = req.body.banco_id !== undefined && (req.body.banco_id ?? null) !== (actual.banco_id ?? null);
+  if (metodo !== undefined || cambiaBanco) {
+    const metodoFinal = metodo !== undefined ? metodo : actual.metodo;
+    const pedido = req.body.banco_id !== undefined ? req.body.banco_id : actual.banco_id;
+    // Sin banco pedido: el del subrubro o el predeterminado.
+    upd.banco_id = await db.resolverBanco(metodoFinal, pedido, { exigirActivo: cambiaBanco, subrubroId: actual.subrubro_id });
+  }
   if (subrubro_id !== undefined) upd.subrubro_id = subrubro_id;
   if (es_especial !== undefined) upd.es_especial = !!es_especial;
   await CajaMovimiento.findByIdAndUpdate(Number(req.params.id), upd);
+  // Pago confirmado (o espejo de un pago del subrubro): el método y el banco viven
+  // también en el pago del subrubro. Se mantienen iguales en los dos lados.
+  if (upd.banco_id !== undefined && actual.pago_mov_id != null) {
+    await Movimiento.updateOne(
+      { _id: Number(actual.pago_mov_id), tipo: 'pago' },
+      { $set: { banco_id: upd.banco_id, ...(upd.metodo !== undefined ? { metodo_pago: upd.metodo } : {}) } },
+    );
+  }
   // Sync inverso del método (Caja → subrubro): si se cambió el método de un ítem
   // pendiente que representa una factura por vencer, se escribe también en la factura
   // para que ambos lados queden consistentes. No toca remitos (siempre efectivo) ni

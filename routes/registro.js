@@ -7,8 +7,8 @@ const { audit } = require('../middleware/audit');
 const nowTs = () => new Date().toISOString();
 const withId = doc => doc ? { ...doc, id: doc._id } : doc;
 
-// Tipos de pago con tarjeta. El orden es el que usa el front para las 4 columnas.
-const TIPOS = ['qr', 'debito', 'credito', 'prepaga'];
+// Tipos de pago con tarjeta. El orden es el que usa el front para las 5 columnas.
+const TIPOS = ['qr', 'debito', 'credito', 'prepaga', 'mercado_pago'];
 
 // Tipos de venta del sistema. El orden es el que usa el front para las 2 columnas.
 const TIPOS_VENTA = ['ticket', 'facturado'];
@@ -358,8 +358,8 @@ router.delete('/ventas-sistema/:id', requireAdmin, audit('venta_sistema'), async
 // TARJETAS
 // =========================================================================
 
-// Totales por tipo a partir de una lista de transacciones. Siempre devuelve las 4
-// claves (aunque estén en 0) para que el front pueda renderizar las 4 columnas fijas.
+// Totales por tipo a partir de una lista de transacciones. Siempre devuelve las 5
+// claves (aunque estén en 0) para que el front pueda renderizar las 5 columnas fijas.
 function agruparPorTipo(txs) {
   const base = Object.fromEntries(TIPOS.map(t => [t, { tipo: t, total: 0, transacciones: 0 }]));
   for (const t of txs) {
@@ -416,7 +416,7 @@ router.get('/tarjetas/dia/:fecha', async (req, res, next) => {
 });
 
 // GET /api/registro/tarjetas/mes/:mes — acumulado por tipo, comparativa con el mes
-// anterior y serie diaria apilada (una entrada por día con las 4 categorías).
+// anterior y serie diaria apilada (una entrada por día con las 5 categorías).
 router.get('/tarjetas/mes/:mes', async (req, res, next) => {
   try {
     const mes = parseMes(req.params.mes);

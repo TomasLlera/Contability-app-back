@@ -173,6 +173,17 @@ describe('Registro → Tarjetas', () => {
     // Los tipos sin movimiento vienen igual, en cero (el front dibuja 4 columnas fijas).
     expect(res.body.por_tipo.credito).toMatchObject({ total: 0, transacciones: 0 });
     expect(res.body.por_tipo.prepaga).toMatchObject({ total: 0, transacciones: 0 });
+    expect(res.body.por_tipo.mercado_pago).toMatchObject({ total: 0, transacciones: 0 });
+  });
+
+  it('acepta Mercado Pago como quinto tipo y lo suma al total y al empleado', async () => {
+    const r = await crearTarjeta({ tipo: 'mercado_pago', fecha: '2024-03-06', monto: 300, empleado: 'Ana' });
+    expect(r.status).toBe(200);
+    await crearTarjeta({ tipo: 'qr', fecha: '2024-03-06', monto: 100, empleado: 'Ana' });
+    const res = await auth(request(app).get('/api/registro/tarjetas/dia/2024-03-06'));
+    expect(res.body.total).toBe(400);
+    expect(res.body.por_tipo.mercado_pago).toMatchObject({ total: 300, transacciones: 1 });
+    expect(res.body.por_empleado.find(e => e.empleado === 'Ana')).toMatchObject({ mercado_pago: 300, qr: 100, total: 400 });
   });
 
   it('agrupa por empleado y manda los sin empleado a "Sin asignar"', async () => {

@@ -76,6 +76,7 @@ app.use('/api/categorias', require('./routes/categorias'));
 app.use('/api/subrubros', require('./routes/subrubros'));
 app.use('/api/movimientos', require('./routes/movimientos'));
 app.use('/api/sumatorias', require('./routes/sumatorias'));
+app.use('/api/bancos', require('./routes/bancos'));
 app.use('/api/caja', require('./routes/caja'));
 app.use('/api/config', require('./routes/config'));
 app.use('/api/cotizaciones', require('./routes/cotizaciones'));
@@ -101,9 +102,9 @@ async function start() {
     // parciales de idempotencia (Movimiento / CajaMovimiento), que son el backstop
     // ante altas concurrentes con la misma idempotency_key.
     try {
-      const { Movimiento, CajaMovimiento, MovimientoSumatoria, ConceptoSumatoria, migrarIndicesCaja } = require('./models');
+      const { Movimiento, CajaMovimiento, MovimientoSumatoria, ConceptoSumatoria, Banco, MovimientoBanco, migrarIndicesCaja } = require('./models');
       if (await migrarIndicesCaja()) logger.info('Índice único viejo de caja (movimiento_id_1) reemplazado');
-      await Promise.all([Movimiento.createIndexes(), CajaMovimiento.createIndexes(), MovimientoSumatoria.createIndexes(), ConceptoSumatoria.createIndexes()]);
+      await Promise.all([Movimiento.createIndexes(), CajaMovimiento.createIndexes(), MovimientoSumatoria.createIndexes(), ConceptoSumatoria.createIndexes(), Banco.createIndexes(), MovimientoBanco.createIndexes()]);
     } catch (err) {
       logger.warn({ err: err.message }, 'No se pudieron crear todos los índices');
     }

@@ -11,6 +11,8 @@ const MODEL_MAP = {
   movimiento: models.Movimiento,
   sumatoria_movimiento: models.MovimientoSumatoria,
   sumatoria_concepto: models.ConceptoSumatoria,
+  banco: models.Banco,
+  movimiento_banco: models.MovimientoBanco,
   caja: models.CajaMovimiento,
   campo: models.Campo,
   categoria: models.Categoria,

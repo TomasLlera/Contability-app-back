@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { asyncHandler } = require('../middleware/errorHandler');
 const db = require('../db');
-const { CajaMovimiento, VentaSistema, TarjetaTransaccion } = require('../models');
+const { CajaMovimiento, VentaSistema, TarjetaTransaccion, Banco, MovimientoBanco } = require('../models');
 const {
   MONEDA, nombreMes, nuevoWorkbook, escribirTitulo, escribirHeader,
   agregarDataBar, colorearSigno, zebra, flechaTendencia, COLORS,
@@ -181,6 +181,26 @@ router.get('/caja-mensual', asyncHandler(async (req, res) => {
 
   const resActual = resumenCaja(movsActual);
   const resAnterior = resumenCaja(movsAnterior);
+
+  // Multi-banco: nombre de cada banco, gastos por transferencia por banco y los
+  // movimientos entre bancos del mes (no son gasto ni ingreso: hoja aparte).
+  const [bancos, movsBanco] = await Promise.all([
+    Banco.find().sort({ orden: 1, _id: 1 }).lean(),
+    MovimientoBanco.find({ fecha: { $gte: `${mes}-01`, $lte: finMesActual } }).sort({ fecha: 1, _id: 1 }).lean(),
+  ]);
+  const nombreBanco = new Map(bancos.map(b => [b._id, b.nombre]));
+  const transPorBanco = (movs) => {
+    const out = new Map();
+    for (const mv of movs) {
+      if (mv.confirmado === false || mv.tipo !== 'gasto' || mv.metodo === 'efectivo') continue;
+      const k = mv.banco_id ?? null;
+      out.set(k, (out.get(k) || 0) + (mv.monto || 0));
+    }
+    return out;
+  };
+  const transActual = transPorBanco(movsActual);
+  const transAnterior = transPorBanco(movsAnterior);
+  const clavesBanco = [...new Set([...transActual.keys(), ...transAnterior.keys()])];
   const resQ15Actual = resumenCaja(q15Actual);
   const resQ15Anterior = resumenCaja(q15Anterior);
 
@@ -195,6 +215,12 @@ router.get('/caja-mensual', asyncHandler(async (req, res) => {
   filaComparativa(wsR, r++, 'Total egresos (gastos)', resActual.egresos, resAnterior.egresos);
   filaComparativa(wsR, r++, 'Gastos en efectivo', resActual.gastosEfvo, resAnterior.gastosEfvo);
   filaComparativa(wsR, r++, 'Gastos por transferencia', resActual.gastosTrans, resAnterior.gastosTrans);
+  // Desglose por banco (solo si hay más de una cuenta en juego).
+  if (clavesBanco.length > 1) {
+    for (const k of clavesBanco) {
+      filaComparativa(wsR, r++, `   · ${k == null ? 'Sin banco' : nombreBanco.get(k) || `Banco #${k}`}`, transActual.get(k) || 0, transAnterior.get(k) || 0);
+    }
+  }
   filaComparativa(wsR, r++, 'Gastos especiales', resActual.especiales, resAnterior.especiales);
   filaComparativa(wsR, r++, 'Saldo neto (ingresos − egresos)', resActual.neto, resAnterior.neto);
   wsR.getColumn(1).width = 32;
@@ -204,7 +230,7 @@ router.get('/caja-mensual', asyncHandler(async (req, res) => {
   // ── Hoja 2: Detalle día a día ──
   const wsD = wb.addWorksheet('Detalle');
   let d = escribirTitulo(wsD, `Caja — Detalle de ${nombreMes(mes)}`, 'Movimientos día a día con saldo acumulado', 6);
-  escribirHeader(wsD, d, ['Fecha', 'Concepto', 'Tipo', 'Método', 'Ingreso', 'Egreso', 'Saldo acumulado']);
+  escribirHeader(wsD, d, ['Fecha', 'Concepto', 'Tipo', 'Método', 'Ingreso', 'Egreso', 'Saldo acumulado', 'Banco']);
   d++;
   const detStart = d;
   let acum = 0;
@@ -223,6 +249,7 @@ router.get('/caja-mensual', asyncHandler(async (req, res) => {
     row.getCell(5).value = esIngreso ? mv.monto || 0 : null;
     row.getCell(6).value = esGasto ? mv.monto || 0 : null;
     row.getCell(7).value = acum;
+    row.getCell(8).value = mv.banco_id != null ? (nombreBanco.get(mv.banco_id) || `#${mv.banco_id}`) : '';
     [5, 6, 7].forEach(c => { row.getCell(c).numFmt = MONEDA; });
     if (esGasto) row.getCell(6).font = { color: { argb: COLORS.red } };
     if (esIngreso) row.getCell(5).font = { color: { argb: COLORS.green } };
@@ -237,6 +264,26 @@ router.get('/caja-mensual', asyncHandler(async (req, res) => {
   }
   wsD.getColumn(1).width = 12; wsD.getColumn(2).width = 30; wsD.getColumn(3).width = 14;
   wsD.getColumn(4).width = 14; [5, 6, 7].forEach(c => { wsD.getColumn(c).width = 16; });
+  wsD.getColumn(8).width = 18;
+
+  // ── Hoja: Movimientos entre bancos (solo si hubo alguno en el mes) ──
+  if (movsBanco.length) {
+    const wsB = wb.addWorksheet('Entre bancos');
+    let b = escribirTitulo(wsB, `Movimientos entre bancos — ${nombreMes(mes)}`, 'No son gasto ni ingreso: pasan plata de una cuenta propia a otra', 5);
+    escribirHeader(wsB, b, ['Fecha', 'Origen', 'Destino', 'Monto', 'Descripción']);
+    b++;
+    for (const mb of movsBanco) {
+      const row = wsB.getRow(b++);
+      row.getCell(1).value = mb.fecha;
+      row.getCell(2).value = nombreBanco.get(mb.banco_origen_id) || `#${mb.banco_origen_id}`;
+      row.getCell(3).value = nombreBanco.get(mb.banco_destino_id) || `#${mb.banco_destino_id}`;
+      row.getCell(4).value = mb.monto;
+      row.getCell(4).numFmt = MONEDA;
+      row.getCell(5).value = mb.descripcion || '';
+    }
+    wsB.getColumn(1).width = 12; [2, 3].forEach(c => { wsB.getColumn(c).width = 20; });
+    wsB.getColumn(4).width = 16; wsB.getColumn(5).width = 36;
+  }
 
   // ── Hoja 3: Comparativas (quincena y mes) ──
   const wsC = wb.addWorksheet('Comparativas');
@@ -391,10 +438,11 @@ const TARJETA_TIPOS = [
   { key: 'debito', label: 'Tarjeta Débito' },
   { key: 'credito', label: 'Tarjeta Crédito' },
   { key: 'prepaga', label: 'Tarjeta Prepaga' },
+  { key: 'mercado_pago', label: 'Mercado Pago' },
 ];
 
 // GET /api/reportes/tarjetas?desde=YYYY-MM&hasta=YYYY-MM
-// Resumen mensual por tipo (QR/débito/crédito/prepaga) + acumulado por empleado + detalle.
+// Resumen mensual por tipo (QR/débito/crédito/prepaga/Mercado Pago) + acumulado por empleado + detalle.
 router.get('/tarjetas', asyncHandler(async (req, res) => {
   const { desde, hasta } = rangoMeses(req);
   const meses = mesesRango(desde, hasta);
