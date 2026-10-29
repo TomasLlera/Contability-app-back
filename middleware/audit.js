@@ -2,7 +2,7 @@ const models = require('../models');
 const { Audit, Counter } = models;
 const logger = require('../logger');
 
-const SENSITIVE_KEYS = new Set(['password', 'password_hash', 'token', 'jwt_secret']);
+const SENSITIVE_KEYS = new Set(['password', 'password_hash', 'password_actual', 'password_nueva', 'token', 'jwt_secret']);
 
 // Mapa recurso → modelo para capturar el estado "antes" en updates/deletes.
 // Solo recursos de documento único con :id numérico estándar; los bulk/import/config

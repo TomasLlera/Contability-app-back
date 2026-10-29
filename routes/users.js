@@ -7,7 +7,8 @@ const requireSuperAdmin = require('../middleware/requireSuperAdmin');
 const { audit } = require('../middleware/audit');
 // Cambiar rol/estado, contraseña o borrar invalida la caché de sesiones: el cambio
 // rige desde la próxima request de ese usuario, no cuando venza su token.
-const { invalidarUsuario } = require('../middleware/authJwt');
+const { invalidarUsuario, payloadToken } = require('../middleware/authJwt');
+const jwt = require('jsonwebtoken');
 
 const ROLES = ['superadmin', 'admin', 'viewer'];
 
@@ -87,7 +88,36 @@ router.delete('/:id', requireSuperAdmin, audit('user'), async (req, res, next) =
   } catch (err) { next(err); }
 });
 
-// PUT /api/users/:id/password — cambiar contraseña (solo superadmin)
+// Roles que pueden cambiar SU PROPIA contraseña. El superadmin, además, cambia la de
+// cualquiera (PUT /:id/password); un viewer la pide al superadmin.
+const ROLES_CAMBIO_PROPIO = ['superadmin', 'admin'];
+
+// PUT /api/users/me/password — cambiar la propia contraseña
+// body: { password_actual, password_nueva }. Exige la actual. Como cambiar la
+// contraseña cierra las sesiones abiertas (token_version), devuelve un token nuevo
+// para que quien la cambió siga adentro en este dispositivo.
+router.put('/me/password', audit('user_password_propia', { idFromBody: (req) => req.user?.userId }), async (req, res, next) => {
+  try {
+    const id = Number(req.user?.userId);
+    if (!ROLES_CAMBIO_PROPIO.includes(req.user?.role)) {
+      return res.status(403).json({ error: 'Tu usuario no puede cambiar su contraseña: pedíselo al Super Administrador' });
+    }
+    const { password_actual, password_nueva } = req.body || {};
+    if (typeof password_actual !== 'string' || !password_actual) return res.status(400).json({ error: 'Ingresá tu contraseña actual' });
+    if (typeof password_nueva !== 'string' || password_nueva.length < 6) return res.status(400).json({ error: 'La contraseña nueva debe tener al menos 6 caracteres' });
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ error: 'No encontrado' });
+    if (!(await bcrypt.compare(password_actual, user.password_hash))) return res.status(400).json({ error: 'La contraseña actual no es correcta' });
+    if (await bcrypt.compare(password_nueva, user.password_hash)) return res.status(400).json({ error: 'La contraseña nueva tiene que ser distinta de la actual' });
+    const hash = await bcrypt.hash(password_nueva, 10);
+    const actualizado = await User.findByIdAndUpdate(id, { password_hash: hash, $inc: { token_version: 1 } }, { returnDocument: 'after' }).lean();
+    invalidarUsuario(id);
+    const token = jwt.sign(payloadToken(actualizado), process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ ok: true, token, role: actualizado.role });
+  } catch (err) { next(err); }
+});
+
+// PUT /api/users/:id/password — cambiar contraseña de cualquier usuario (solo superadmin)
 router.put('/:id/password', requireSuperAdmin, audit('user_password'), async (req, res, next) => {
   try {
     const { password } = req.body;
